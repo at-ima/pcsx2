@@ -335,3 +335,88 @@ app remained running for 20 seconds and shut down with exit code 0. This does
 not validate visual correctness, long gameplay or an x64 runtime build.
 Logs: `scheduled-production-{build,ctest,state,state-console}.log` in the ignored
 build directory.
+
+
+## Instruction-level investigation after reboot
+
+The unchanged `66a8d49da` comparison app measured 4.09 VPS before a host reboot
+and 34.43 VPS afterwards, in the same frames 850–1100. The slow run spent about
+212 CPU ms and 20 GS ms per frame; the reboot run returned to 29.02 and 2.88 ms.
+AC power was active and `pmset -g therm` reported no recorded warning. A CPU
+stack capture primarily showed executing emulator code rather than a wait.
+These observations establish a host-state-dependent slowdown, but do not
+identify its cause: frequency, core placement, App Nap and contention were not
+measured directly. No global power/QoS changes were made. Logs:
+`diagnostic-lowlevel-{baseline,reboot-baseline}.log`, `lowlevel-slow.sample.txt`.
+
+On `71c36f4e3`, temporary compile-time markers associated generated ARM64 address
+ranges with preparation, upper/lower execution, FMAC insertion, budget checks
+and block entry/exit. A separate five-second capture at frame 900 collected
+3,123 CPU-thread samples. No per-instruction runtime instrumentation was added.
+The mapping and diagnostic logging are excluded from production.
+
+| Sample location | Samples | CPU sample share |
+| --- | ---: | ---: |
+| Shared VU pipeline helper | 386 | 12.4% |
+| In-block VU preparation | 157 | 5.0% |
+| VU upper arithmetic, flags and stores | 343 | 11.0% |
+| VU lower execution | 71 | 2.3% |
+| VU FMAC queue insertion | 309 | 9.9% |
+| VU cycle-budget checks | 270 | 8.6% |
+| VU block entry/exit | 54 | 1.7% |
+| EE dispatch and generated execution | 553 | 17.7% |
+| IOP execution/events | 301 | 9.6% |
+
+The remaining samples include VU dispatch/fallback, GIF and other CPU work.
+This is instruction-pointer sampling, not a measurement of instruction latency,
+cache misses, branch misses or hardware stall cycles. The budget region is only
+a few instructions, including a cycle load immediately consumed by subtraction
+and comparison. Queue insertion also reloads that cycle. The high sample share
+motivates removing this memory dependency, but does not prove a cache miss.
+The sampled run's FPS is excluded from throughput comparisons.
+Artifacts in the ignored build directory: `lowlevel-code.map`,
+`diagnostic-sample-lowlevel-reboot.sample.txt`, `analyze-lowlevel-reboot.py` and
+`lowlevel-reboot-breakdown.json`.
+
+The adopted change retains cycles in x26 across native pairs. It eliminates the
+insertion/budget reloads and the scheduled path's cycle store/reload chain.
+Generic preparation remains the authoritative boundary for incoming pipelines
+and callbacks: publish a potentially dirty cycle before entry and reload after
+return. Every block exit publishes it, including one-pair XGKICK limits and
+partial budgets. Counter width/wrap and interpreter timing are unchanged.
+
+This leaves substantial structural work. FMAC insertion still builds full
+48-byte interpreter-compatible records per pair, and the generic prefix still
+checks incoming queue state. microVU instead propagates pipeline state during
+compilation. A larger redesign should first give block boundaries an explicit
+pipeline-state contract and materialize state on fallback, callbacks and every
+budget exit; merely suppressing queue writes would break those boundaries.
+Arithmetic/flag work is another target, but its measured share alone cannot
+explain the gap to 60 FPS. EE dispatch/source validation and the IOP interpreter
+must also be accounted for. Hardware counter analysis would help distinguish
+load dependencies from cache and branch effects before choosing more invasive
+instruction-layout changes.
+
+Serial new/old/old/new throughput runs after reboot, without stack sampling:
+
+| Build | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| Cycle register A | 36.68 | 27.17 | 2.97 |
+| Previous A | 35.78 | 27.90 | 2.98 |
+| Previous B | 35.29 | 28.25 | 3.00 |
+| Cycle register B | 35.91 | 27.74 | 3.00 |
+
+The two-run means are **35.53 → 36.30 VPS, approximately 2.1%**, with CPU time
+28.07 → 27.45 ms/frame. There is visible run-to-run variation; these measurements
+support a small gain, not a claim that memory dependencies were the only
+bottleneck. This remains well below 60 FPS. The baseline is `71c36f4e3`, unlike
+the unchanged `66a8d49da` app used solely for the reboot comparison above.
+Logs: `diagnostic-lowlevel-cycle-{new,old}-{a,b}.log`.
+
+Production validation: all 178 existing tests passed after removing diagnostic
+logging and address markers. These include full VU-state comparisons at every
+budget prefix, incoming/stalled pipelines, cycle wrap, XGKICK boundaries and
+pipeline callback ABI tests. The ARM64 app rebuilt, passed deep signature
+verification, loaded the SCPS-15025 state, ran for 20 seconds without early exit,
+and shut down with exit code 0. No visual, long-gameplay or x64 runtime test was
+performed. Logs: `lowlevel-production-{build,ctest,state,state-console}.log`.

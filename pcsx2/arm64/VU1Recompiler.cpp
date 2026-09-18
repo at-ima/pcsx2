@@ -640,8 +640,7 @@ namespace
 		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, flagreg)));
 		a.Mov(x9, lower ? ins.lregs.VFwxyzw : 0);
 		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, xyzwlower))); // also clear padding
-		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
-		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, sCycle)));
+		a.Str(x26, MemOperand(x0, offsetof(fmacPipe, sCycle)));
 		a.Mov(w9, 4);
 		a.Ldr(w10, Field(offsetof(VURegs, macflag)));
 		a.Stp(w9, w10, MemOperand(x0, offsetof(fmacPipe, Cycle)));
@@ -787,9 +786,7 @@ namespace
 	void EmitScheduledPrepare(MacroAssembler& a, const Block& block, u32 index)
 	{
 		const auto& plan = block.schedule[index];
-		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
-		a.Add(x9, x9, plan.cycles);
-		a.Str(x9, Field(offsetof(VURegs, cycle)));
+		a.Add(x26, x26, plan.cycles);
 		StoreWord(a, block.instructions[index].pc + 8, VI(REG_TPC));
 		if (plan.retired)
 		{
@@ -912,14 +909,15 @@ namespace
 			HostSys::BeginCodeWrite();
 			MacroAssembler a(s_write, s_end - s_write);
 			Label exit;
-			const int frame_size = cache.count ? 128 : 64;
+			const int frame_size = cache.count ? 144 : 80;
 			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
 			a.Stp(x23, x24, MemOperand(sp, 32));
-			a.Stp(x25, lr, MemOperand(sp, 48));
+			a.Stp(x25, x26, MemOperand(sp, 48));
+			a.Str(lr, MemOperand(sp, 64));
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
-					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
+					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 80 + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			u32 scheduled_pairs = 0;
 			for (u32 i = 7; i < block->count; i++)
@@ -928,6 +926,8 @@ namespace
 			const bool scheduled = scheduled_pairs >= 4;
 			if (scheduled)
 				EmitScheduleGuard(a);
+			// Keep queue insertion and budget checks off the cycle store/load chain.
+			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
@@ -945,6 +945,7 @@ namespace
 			const u32 shared_prepare = std::max_element(uses.begin(), uses.end()) - uses.begin();
 			a.Mov(x22, reinterpret_cast<uintptr_t>(prepare[shared_prepare]));
 			a.Mov(x23, reinterpret_cast<uintptr_t>(block->instructions.data()));
+			bool cycle_dirty = false;
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
@@ -957,6 +958,10 @@ namespace
 					a.B(&prepared);
 					a.Bind(&generic_prepare);
 				}
+				// Publish the cached cycle only when a preceding scheduled pair may
+				// have changed it. Generic preparation/callbacks use architectural state.
+				if (cycle_dirty)
+					a.Str(x26, Field(offsetof(VURegs, cycle)));
 				const u32 selected_prepare = ins.readsVF ? ins.dependency + 2 : 0;
 				a.Add(x0, x23, i * sizeof(Instruction));
 				if (selected_prepare == shared_prepare)
@@ -966,8 +971,10 @@ namespace
 					a.Mov(x16, reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
 					a.Blr(x16);
 				}
+				a.Ldr(x26, Field(offsetof(VURegs, cycle)));
 				if (schedule_pair)
 					a.Bind(&prepared);
+				cycle_dirty = schedule_pair;
 				const bool immediate = ins.upper & 0x80000000;
 				const bool discard = !immediate && ins.uregs.VFwrite && ins.uregs.VFwrite == ins.lregs.VFwrite;
 				const u32 backup = !immediate && !discard && ins.uregs.VFwrite &&
@@ -993,18 +1000,19 @@ namespace
 						StoreVector(a, cache, q26, backup);
 				}
 				EmitFinish(a, ins);
-				a.Ldr(x9, Field(offsetof(VURegs, cycle)));
-				a.Sub(x9, x9, x20);
+				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
 				a.B(hs, &exit);
 			}
 			a.Bind(&exit);
+			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
-					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
-			a.Ldp(x25, lr, MemOperand(sp, 48));
+					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 80 + slot * 8));
+			a.Ldr(lr, MemOperand(sp, 64));
+			a.Ldp(x25, x26, MemOperand(sp, 48));
 			a.Ldp(x23, x24, MemOperand(sp, 32));
 			a.Ldp(x21, x22, MemOperand(sp, 16));
 			a.Ldp(x19, x20, MemOperand(sp, frame_size, PostIndex));

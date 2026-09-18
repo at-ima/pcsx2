@@ -177,6 +177,12 @@ timing keeps the generic preparation path. Every queue entry remains materialize
 including at budget exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored. This is a limited first step
 toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
+The generated block retains the current cycle in x26. Scheduled preparation
+updates it directly; queue insertion and budget checks consume it without
+reloading architectural memory. Before generic preparation after a scheduled
+pair, and at every block exit, it is published to VURegs. Generic preparation
+reloads it afterwards so callback changes remain visible. x26 is saved/restored
+by the block and preserved by the private pipeline ABI.
 Runtime profiles should distinguish these management costs from arithmetic throughput.
 
 ## Validation
