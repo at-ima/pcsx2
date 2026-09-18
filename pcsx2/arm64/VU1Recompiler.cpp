@@ -374,29 +374,26 @@ namespace
 			a.Orr(v21.V16B(), v18.V16B(), v19.V16B());
 		}
 		a.Cmeq(v20.V4S(), v17.V4S(), v16.V4S()); // overflow
-		a.Movi(v22.V4S(), 1);
+		// Weight each enabled lane by its architectural MAC bit before the
+		// horizontal sum. The four bit groups do not overlap or carry.
+		const auto weight = [mask](u32 lane) -> u64 { return mask & (8 >> lane); };
+		a.Ldr(q22, weight(2) | (weight(3) << 32), weight(0) | (weight(1) << 32));
 		a.And(v21.V16B(), flush ? v18.V16B() : v21.V16B(), v22.V16B());
-		a.Ushr(v23.V4S(), v0.V4S(), 31);
+		a.Sshr(v23.V4S(), v0.V4S(), 31);
+		a.And(v23.V16B(), v23.V16B(), v22.V16B());
 		a.Shl(v23.V4S(), v23.V4S(), 4);
 		a.Orr(v21.V16B(), v21.V16B(), v23.V16B());
 		if (!flush)
 		{
-			a.Movi(v22.V4S(), 0x100);
-			a.And(v22.V16B(), v19.V16B(), v22.V16B());
-			a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
+			a.And(v23.V16B(), v19.V16B(), v22.V16B());
+			a.Shl(v23.V4S(), v23.V4S(), 8);
+			a.Orr(v21.V16B(), v21.V16B(), v23.V16B());
 		}
-		a.Movi(v22.V4S(), 0x1000);
+		a.Shl(v22.V4S(), v22.V4S(), 12);
 		a.And(v22.V16B(), v20.V16B(), v22.V16B());
 		a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
-		// Each lane contributes four non-overlapping flag bits.
-		a.Mov(w10, 0);
-		for (u32 i = 0; i < 4; i++)
-		{
-			if (!(mask & (8 >> i)))
-				continue;
-			a.Umov(w9, v21.V4S(), i);
-			a.Orr(w10, w10, Operand(w9, LSL, 3 - i));
-		}
+		a.Addv(s22, v21.V4S());
+		a.Fmov(w10, s22);
 		a.Ldr(w9, Field(offsetof(VURegs, macflag)));
 		a.And(w9, w9, 0xffff0000);
 		a.Orr(w9, w9, w10);

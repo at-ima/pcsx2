@@ -210,6 +210,12 @@ existing GIF arbitration and 16 KiB wrap handling, including buffering when the
 GIF cannot run. Save-state layouts are unchanged. This adopts microVU's ordinary
 transfer policy, not cycle-exact GIF timing; wider game coverage is still needed.
 
+MAC generation weights each enabled NEON lane by its architectural bit position
+before reducing zero/sign/underflow/overflow groups with a horizontal sum. This
+replaces per-lane vector-to-integer extraction. Disabled lanes contribute zero,
+and the four flag groups do not overlap or carry into one another. Input/output
+clamping and the reference zero test are unchanged.
+
 FMAC/FDIV/EFU/IALU queues and arithmetic flags remain interpreter-compatible.
 For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls.
 After a generic prefix drains incoming entries, it emits known retirement counts

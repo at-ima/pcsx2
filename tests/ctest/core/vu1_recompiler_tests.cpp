@@ -1317,6 +1317,71 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 	}
 }
 
+TEST_F(VU1RecompilerTest, DeferredProducerFlagsSurviveNonArithmeticPairs)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 mask = 0; mask < 16; mask++)
+		for (u32 pattern = 0; pattern < 4; pattern++)
+		{
+			for (u32 i = 0; i < 64; i++)
+			{
+				const bool arithmetic = pattern == 3 || (pattern == 1 && i == 0) || (pattern == 2 && i % 5 == 0);
+				const u32 upper = arithmetic ? (mask << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x2a : 0x2ff;
+				Put(i * 8, upper, 0x8000033c | (mask << 21) | (4 << 16) | (3 << 11));
+			}
+			Put(64 * 8, 0xc00002ff, 0x3f800000);
+			for (u32 budget : {7u, 8u, 15u, 16u, 31u, 32u, 63u, 64u, 65u, 256u})
+			{
+				SCOPED_TRACE(testing::Message() << mask << "/" << pattern << "/" << budget);
+				VU1 = initial;
+				VU0 = initial0;
+				VU1.macflag = 0xa5a5ffff;
+				VU1.statusflag = 0x89abcdef;
+				VU1.clipflag = 0x76543210;
+				const u32 values[] = {0, 0x80000000, 0x7f7fffff, 0x80800000};
+				const u32 factors[] = {0x3f800000, 0x40000000, 0x40000000, 0x3f000000};
+				std::memcpy(&VU1.VF[1], values, sizeof(values));
+				std::memcpy(&VU1.VF[2], factors, sizeof(factors));
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+}
+
+TEST_F(VU1RecompilerTest, MacFlagLaneWeightsMatchEveryMask)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 inputs[] = {0, 0x80000000, 0x00800000, 0x80800000,
+		0x7f7fffff, 0xff7fffff, 0x7fc12345, 0xff800000};
+	constexpr u32 factors[] = {0x3f000000, 0x40000000, 0xbf800000, 0};
+	for (u32 options = 0; options < 32; options++)
+	{
+		EmuConfig.Cpu.VU1FPCR = FPControlRegister::GetDefault().DisableExceptions().SetRoundMode(static_cast<FPRoundMode>(options & 3)).SetFlushToZero(options & 4);
+		EmuConfig.Cpu.Recompiler.vu0Overflow = (options & 8) != 0;
+		EmuConfig.Cpu.Recompiler.vu1Overflow = (options & 16) != 0;
+		for (u32 mask = 0; mask < 16; mask++)
+			for (u32 rotation = 0; rotation < std::size(inputs); rotation++)
+				for (u32 budget : {1u, 8u})
+				{
+					SCOPED_TRACE(testing::Message() << options << "/" << mask << "/" << rotation << "/" << budget);
+					VU1 = initial;
+					VU0 = initial0;
+					VU1.macflag = 0xa5a5ffff;
+					VU1.statusflag = 0xffffffff;
+					for (u32 lane = 0; lane < 4; lane++)
+					{
+						VU1.VF[1].UL[lane] = inputs[(rotation + lane) % std::size(inputs)];
+						VU1.VF[2].UL[lane] = factors[lane];
+					}
+					Put(0, 0x80000000 | (mask << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x2a, 0x3f800000);
+					Compare(budget); // Inspect both freshly issued and retired flag records.
+					if (HasFatalFailure())
+						return;
+				}
+	}
+}
+
 TEST_F(VU1RecompilerTest, SpecialFloatsAndChangedFloatingPointOptions)
 {
 	const VURegs initial = VU1;

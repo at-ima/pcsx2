@@ -987,3 +987,57 @@ The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `kick-production-{build,ctest,state,state-console}.log`.
+
+## NEON reduction of MAC flag lanes
+
+A fresh five-second sample at intro frame 900 still contains generated-code
+execution, GIF packet transfers and repeated `intExecuteBlock` frames from
+`R3000AInterpreter.cpp`. The JIT frames are not individually symbolized, so this
+sample does not establish a per-instruction bottleneck or a precise VU1/IOP time
+split. Its instrumented VPS value is not used in performance comparisons.
+Artifact: `diagnostic-sample-next.sample.txt`.
+
+The MAC emitter previously extracted each active NEON lane into a general
+register and combined its four flag bits there. It now applies the architectural
+lane weight (8, 4, 2, 1, or zero for an inactive lane) to the classification masks,
+then uses ADDV and one vector-to-integer transfer. Each lane contributes distinct
+bits within zero, sign, underflow and overflow groups, so addition introduces no
+carry between flags. A fully enabled mask removes six emitted instructions from
+this part of MAC generation, while adding a 16-byte literal. Input/output clamps,
+FPCR-dependent zero/underflow behavior, reserved MAC bits and STATUS reduction
+retain their existing semantics. This is a local code-generation change, not
+flag-liveness elimination or a new pipeline representation.
+
+An additional experiment retained current MAC/STATUS in a register across
+callback-free deferred regions to remove stores and reloads. It measured
+**53.04 VPS**, versus **54.22 VPS** in the subsequent baseline run, and was
+removed. No claim is made about the hardware cause of that regression. The final
+candidate retains only the NEON lane reduction.
+
+Focused differential tests cover every lane mask, all tested rounding/FZ and
+input/output-clamping combinations, signed zero, minimum normals, overflow,
+NaNs, preserved upper MAC bits, and both issued and retired records. Additional
+long-region tests interleave arithmetic with non-arithmetic pairs and compare
+complete flags and queues across partial/full budget exits.
+
+Serial final comparison against `738e3db34`, frames 850–1100, MTVU disabled:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| flags-new-a | 54.88 | 18.13 | 3.29 |
+| flags-old-a | 54.22 | 18.39 | 3.19 |
+| flags-old-b | 53.95 | 18.48 | 3.16 |
+| flags-new-b | 55.04 | 18.10 | 3.15 |
+
+Mean throughput is **54.08 → 54.96 VPS (+1.6%)**. This is a small improvement,
+not a resolution of the remaining 60-VPS gap. All four runs had identical
+metrics logging, no sampling, and no concurrent builds or tests. Logs:
+`diagnostic-flags-{new-a,old-a,old-b,new-b}.log`;
+the discarded register-caching run is `diagnostic-flags-cache-a.log`.
+
+Production validation: temporary metrics logging removed, ARM64 app rebuilt,
+**203 tests** (20 common, 183 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`flags-production-{build,ctest,state,state-console}.log`.
