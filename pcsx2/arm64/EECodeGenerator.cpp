@@ -21,9 +21,72 @@ namespace
 		       (op == 28 && (function == 0 || function == 1 || function == 32 || function == 33));
 	}
 
+	enum class PackedOp
+	{
+		None,
+		Add,
+		Subtract,
+		Greater,
+		Equal,
+		Maximum,
+		Minimum,
+		InterleaveLower,
+		InterleaveUpper,
+		PackEven,
+		CopyUpper,
+		And,
+		Or,
+		Xor,
+		Nor,
+	};
+
+	struct PackedInstruction
+	{
+		PackedOp op = PackedOp::None;
+		u32 lane_bytes = 1;
+	};
+
+	PackedInstruction DecodePacked(u32 code)
+	{
+		if ((code >> 26) != 28)
+			return {};
+		const u32 function = code & 63, selector = (code >> 6) & 31;
+		if (function == 8) // MMI0: wrapping arithmetic, signed comparisons, packing
+		{
+			if (selector <= 10)
+			{
+				constexpr PackedOp ops[] = {PackedOp::Add, PackedOp::Subtract, PackedOp::Greater, PackedOp::Maximum};
+				return {ops[selector & 3], 4u >> (selector / 4)};
+			}
+			if (selector == 18 || selector == 22 || selector == 26)
+				return {PackedOp::InterleaveLower, 4u >> ((selector - 18) / 4)};
+			if (selector == 19 || selector == 23 || selector == 27)
+				return {PackedOp::PackEven, 4u >> ((selector - 19) / 4)};
+		}
+		else if (function == 40) // MMI1
+		{
+			if (selector == 2 || selector == 6 || selector == 10)
+				return {PackedOp::Equal, 4u >> ((selector - 2) / 4)};
+			if (selector == 3 || selector == 7)
+				return {PackedOp::Minimum, selector == 3 ? 4u : 2u};
+			if (selector == 18 || selector == 22 || selector == 26)
+				return {PackedOp::InterleaveUpper, 4u >> ((selector - 18) / 4)};
+		}
+		else if (function == 9 || function == 41) // MMI2/MMI3
+		{
+			if (selector == 14)
+				return {function == 9 ? PackedOp::InterleaveLower : PackedOp::CopyUpper, 8};
+			if (selector == 18)
+				return {function == 9 ? PackedOp::And : PackedOp::Or};
+			if (selector == 19)
+				return {function == 9 ? PackedOp::Xor : PackedOp::Nor};
+		}
+		return {};
+	}
+
 	bool SupportsInteger(u32 code)
 	{
-		if (IsHiLo(code))
+		if (IsHiLo(code) || DecodePacked(code).op != PackedOp::None)
 			return true;
 		switch (code >> 26)
 		{
@@ -75,6 +138,83 @@ namespace
 	MemOperand GPR(u32 reg)
 	{
 		return MemOperand(x0, offsetof(cpuRegisters, GPR) + reg * sizeof(GPR_reg));
+	}
+
+	void EmitPacked(MacroAssembler& a, u32 code, PackedInstruction instruction)
+	{
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31;
+		if (!rd)
+			return;
+		// Read both full operands before writing rd, including rs/rt/rd aliases.
+		// Non-saturating integer NEON operations leave the host FPSR unchanged.
+		a.Ldr(q1, GPR(rs));
+		a.Ldr(q2, GPR(rt));
+		auto format = [&](VRegister reg) {
+			switch (instruction.lane_bytes)
+			{
+				case 8:
+					return reg.V2D();
+				case 4:
+					return reg.V4S();
+				case 2:
+					return reg.V8H();
+				default:
+					return reg.V16B();
+			}
+		};
+		const VRegister dst = format(v0), lhs = format(v1), rhs = format(v2);
+		switch (instruction.op)
+		{
+			case PackedOp::Add:
+				a.Add(dst, lhs, rhs);
+				break;
+			case PackedOp::Subtract:
+				a.Sub(dst, lhs, rhs);
+				break;
+			case PackedOp::Greater:
+				a.Cmgt(dst, lhs, rhs);
+				break;
+			case PackedOp::Equal:
+				a.Cmeq(dst, lhs, rhs);
+				break;
+			case PackedOp::Maximum:
+				a.Smax(dst, lhs, rhs);
+				break;
+			case PackedOp::Minimum:
+				a.Smin(dst, lhs, rhs);
+				break;
+			// PEXT/PPAC place rt's lanes before rs's lanes. PCPYUD reverses
+			// that order when selecting the upper 64 bits of both sources.
+			case PackedOp::InterleaveLower:
+				a.Zip1(dst, rhs, lhs);
+				break;
+			case PackedOp::InterleaveUpper:
+				a.Zip2(dst, rhs, lhs);
+				break;
+			case PackedOp::PackEven:
+				a.Uzp1(dst, rhs, lhs);
+				break;
+			case PackedOp::CopyUpper:
+				a.Zip2(dst, lhs, rhs);
+				break;
+			case PackedOp::And:
+				a.And(dst, lhs, rhs);
+				break;
+			case PackedOp::Or:
+				a.Orr(dst, lhs, rhs);
+				break;
+			case PackedOp::Xor:
+				a.Eor(dst, lhs, rhs);
+				break;
+			case PackedOp::Nor:
+				a.Orr(dst, lhs, rhs);
+				a.Mvn(dst, dst);
+				break;
+			case PackedOp::None:
+				pxFailRel("Invalid packed integer instruction");
+				break;
+		}
+		a.Str(q0, GPR(rd));
 	}
 
 	void EmitHiLo(MacroAssembler& a, u32 code)
@@ -152,6 +292,12 @@ namespace
 
 	void Emit(MacroAssembler& a, u32 code)
 	{
+		const PackedInstruction packed = DecodePacked(code);
+		if (packed.op != PackedOp::None)
+		{
+			EmitPacked(a, code, packed);
+			return;
+		}
 		if (IsHiLo(code))
 		{
 			EmitHiLo(a, code);

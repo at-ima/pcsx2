@@ -9,6 +9,7 @@
 #include "vtlb.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
 
 namespace
 {
@@ -24,6 +25,22 @@ namespace
 		(28u << 26) | 16, (28u << 26) | 17, (28u << 26) | 18, (28u << 26) | 19,
 		(28u << 26) | 24, (28u << 26) | 25, (28u << 26) | 26, (28u << 26) | 27,
 		(28u << 26), (28u << 26) | 1, (28u << 26) | 32, (28u << 26) | 33};
+
+	constexpr u32 PackedCode(u32 function, u32 selector)
+	{
+		return (28u << 26) | (selector << 6) | function;
+	}
+	constexpr u32 PackedInstructions[] = {
+		PackedCode(8, 0), PackedCode(8, 1), PackedCode(8, 2), PackedCode(8, 3), // PADDW, PSUBW, PCGTW, PMAXW
+		PackedCode(8, 4), PackedCode(8, 5), PackedCode(8, 6), PackedCode(8, 7), // PADDH, PSUBH, PCGTH, PMAXH
+		PackedCode(8, 8), PackedCode(8, 9), PackedCode(8, 10), // PADDB, PSUBB, PCGTB
+		PackedCode(8, 18), PackedCode(8, 22), PackedCode(8, 26), // PEXTLW/H/B
+		PackedCode(8, 19), PackedCode(8, 23), PackedCode(8, 27), // PPACW/H/B
+		PackedCode(40, 2), PackedCode(40, 6), PackedCode(40, 10), // PCEQW/H/B
+		PackedCode(40, 3), PackedCode(40, 7), // PMINW/H
+		PackedCode(40, 18), PackedCode(40, 22), PackedCode(40, 26), // PEXTUW/H/B
+		PackedCode(9, 14), PackedCode(41, 14), // PCPYLD/UD
+		PackedCode(9, 18), PackedCode(9, 19), PackedCode(41, 18), PackedCode(41, 19)}; // PAND, PXOR, POR, PNOR
 
 	class EERecompilerTest : public testing::Test
 	{
@@ -87,6 +104,23 @@ namespace
 			cpuRegs.LO.UD[0] = 0x76543210fedcba98ULL ^ seed;
 			cpuRegs.HI.UD[1] = 0xa5a5a5a580000001ULL ^ seed;
 			cpuRegs.LO.UD[1] = 0x5a5a5a5affffffffULL ^ (u64(seed) << 32);
+		}
+
+		void InitPacked(u32 seed)
+		{
+			InitHiLo(seed);
+			constexpr u32 values[] = {0, 1, 0xffffffff, 0x7fffffff, 0x80000000,
+				0x7fff8000, 0x80007fff, 0x007f80ff, 0xff807f00, 0x01020304,
+				0x7fa12345, 0xffc54321};
+			u32 random = seed;
+			for (u32 reg = 1; reg < 32; reg++)
+			{
+				for (u32 lane = 0; lane < 4; lane++)
+				{
+					random = random * 1664525 + 1013904223;
+					cpuRegs.GPR.r[reg].UL[lane] = seed < 64 ? values[(seed + reg * 5 + lane * 7) % std::size(values)] : random;
+				}
+			}
 		}
 
 		void Compare(u32 count)
@@ -694,6 +728,126 @@ TEST_F(EERecompilerTest, HiLoDelaySlotsPreserveTargetsLinksAndAnnulment)
 			CompareBranch(0, false, true, true, Base + 4);
 			if (HasFailure())
 				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, PackedIntegersMatchInterpreterWithFullWidthAliases)
+{
+	constexpr u32 operands[][3] = {{1, 2, 3}, {1, 2, 1}, {1, 2, 2}, {1, 1, 1},
+		{0, 2, 3}, {1, 0, 3}, {1, 2, 0}, {0, 0, 31}};
+	for (u32 code : PackedInstructions)
+	{
+		for (const auto& regs : operands)
+		{
+			program[0] = code | (regs[0] << 21) | (regs[1] << 16) | (regs[2] << 11);
+			for (u32 seed = 0; seed < 128; seed++)
+			{
+				SCOPED_TRACE(testing::Message() << "code=" << program[0] << " seed=" << seed);
+				InitPacked(seed);
+				Compare(1);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, PackedIntegerDependenciesAndQuadwordTransfers)
+{
+	for (u32 seed = 0; seed < 128; seed++)
+	{
+		InitPacked(seed);
+		for (u32 i = 0; i < 32; i++)
+		{
+			const u32 rs = 1 + i % 3, rt = 1 + (i + 1) % 3, rd = 1 + (i + 2) % 3;
+			program[i] = PackedInstructions[(i + seed) % std::size(PackedInstructions)] | (rs << 21) | (rt << 16) | (rd << 11);
+			if (i % 5 == 4)
+				program[i] = (9u << 26) | (rs << 21) | (rd << 16) | 0xffef;
+		}
+		Compare(32);
+		if (HasFailure())
+			return;
+	}
+	for (u32 code : PackedInstructions)
+	{
+		InitPacked(100);
+		program.fill(Stop);
+		cpuRegs.GPR.r[4].UD[0] = Data;
+		std::memcpy(memory.data(), &cpuRegs.GPR.r[1], sizeof(GPR_reg) * 2);
+		program[0] = (30u << 26) | (4 << 21) | (1 << 16) | 3; // LQ aligns down
+		program[1] = (30u << 26) | (4 << 21) | (2 << 16) | 16;
+		program[2] = code | (1 << 21) | (2 << 16) | (1 << 11);
+		program[3] = (31u << 26) | (4 << 21) | (1 << 16) | 32; // SQ stores full packed result
+		Compare(4);
+		if (HasFailure())
+			return;
+	}
+}
+
+TEST_F(EERecompilerTest, PackedDelaySlotsPreserveRegisterTargetsAndAnnulment)
+{
+	for (u32 code : PackedInstructions)
+	{
+		for (u32 seed = 0; seed < 64; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "code=" << code << " seed=" << seed);
+			InitPacked(seed);
+			program[0] = (1 << 21) | (1 << 11) | 9; // JALR must capture target before full-width slot write
+			program[1] = code | (1 << 21) | (2 << 16) | (1 << 11);
+			CompareBranch(0, true, false, false, cpuRegs.GPR.r[1].UL[0], 1);
+			if (HasFailure())
+				return;
+			InitPacked(seed);
+			cpuRegs.GPR.r[1].UD[0] = 1;
+			program[0] = (20u << 26) | (1 << 16); // untaken BEQL annuls the packed operation
+			CompareBranch(0, false, true, true, Base + 4);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, UnsupportedPackedSelectorsRemainInterpreted)
+{
+	for (u32 function : {8u, 9u, 40u, 41u})
+	{
+		for (u32 selector = 0; selector < 32; selector++)
+		{
+			const u32 code = PackedCode(function, selector);
+			if (std::find(std::begin(PackedInstructions), std::end(PackedInstructions), code) != std::end(PackedInstructions))
+				continue;
+			SCOPED_TRACE(testing::Message() << "function=" << function << " selector=" << selector);
+			InitPacked(0);
+			program[0] = code | (1 << 21) | (2 << 16) | (3 << 11);
+			const cpuRegisters before = cpuRegs;
+			u32 cycles = 123;
+			EXPECT_FALSE(Arm64EE::TryExecute(cycles));
+			EXPECT_EQ(cycles, 123u);
+			EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, PackedNativeExecutionPreservesHostFloatingPointStatus)
+{
+	for (u32 code : PackedInstructions)
+	{
+		InitPacked(0);
+		program[0] = code | (1 << 21) | (2 << 16) | (3 << 11);
+		u32 cycles = 0;
+		ASSERT_TRUE(Arm64EE::TryExecute(cycles)); // compile before setting host status
+		for (u64 status : {0ULL, 0x0800009fULL})
+		{
+			cpuRegs.pc = Base;
+			u64 saved, actual;
+			asm volatile("mrs %0, fpsr" : "=r"(saved));
+			asm volatile("msr fpsr, %0" : : "r"(status));
+			const EEBlockResult result = Arm64EE::TryExecute(cycles);
+			asm volatile("mrs %0, fpsr" : "=r"(actual));
+			asm volatile("msr fpsr, %0" : : "r"(saved));
+			EXPECT_TRUE(result);
+			EXPECT_EQ(actual, status);
 		}
 	}
 }

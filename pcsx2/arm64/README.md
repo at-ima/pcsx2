@@ -29,7 +29,13 @@ separately even for unsigned operations. Divide-by-zero and signed division
 overflow retain EE results without a host exception. Multiply-add reconstructs
 the accumulator from the low words of HI/LO and wraps at 64 bits; moves copy the
 full 64 bits. These operations can also execute in nontrapping delay slots.
-Packed MMI arithmetic and floating-point arithmetic remain outside this coverage.
+Packed MMI integers use NEON for wrapping byte/halfword/word addition and
+subtraction, signed greater-than/min/max, equality masks, 128-bit logic,
+PEXT/PPAC lane rearrangement and PCPYLD/PCPYUD. Both source vectors are loaded
+before the full destination is written, including aliased source/destination
+registers. These non-saturating operations preserve host floating-point status
+and are eligible in native delay slots. Saturating arithmetic, other packed
+operations and floating-point arithmetic remain interpreted.
 
 Supported integer branches and jumps terminate the block. Their delay slot must
 be a supported, nontrapping integer instruction in the same page and block.
@@ -88,6 +94,10 @@ check targets, link/source aliases, delay-slot arithmetic, annulment, cycle
 charges and the event actions requested from the shared driver. HI/LO tests cover
 both banks, preserved register halves, input/output aliases, division edge cases,
 accumulator wraparound, mixed-block dependencies and annulled delay slots.
+Packed-integer tests compare complete CPU state across edge/random lane values,
+all source/destination alias patterns, dependent instruction blocks, quadword
+transfers and delay slots. They also check unchanged host FPSR and fallback for
+unsupported packed selectors. Broader game coverage still needs proper testing.
 `vu1_recompiler_tests.cpp` compares complete VU state and memory, including live
 pipeline entries and execution-budget boundaries. Synthetic timing results are
 kept under the ignored build directory; they are not game-performance guarantees.
