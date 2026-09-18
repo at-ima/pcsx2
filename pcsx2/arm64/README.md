@@ -119,7 +119,7 @@ emits native instructions; the existing x86 recompiler keeps its own behavior.
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
 queues. Static unconditional B edges can connect the branch, supported delay
-pair and destination within one bounded native trace. Taken IBGTZ edges also
+pair and destination within one bounded native trace. Taken IBEQ/IBNE/IBGTZ edges also
 connect their supported delay pair and destination, including integer-load waits
 and VI backup selection. Not-taken edges exit with complete architectural state. Other conditional/indirect branches,
 nested branches and end-bit delay slots retain interpreter fallback. Pipeline
@@ -129,7 +129,7 @@ XGKICK follows microVU's delayed whole-packet policy; the interpreter and
 
 Connected regions share the VF/ACC cache assignment and the pipeline schedule in
 execution order. They do not publish/reload cached vectors or restart preparation
-at an internal B or taken IBGTZ edge. Before entry, source validation checks each range the remaining cycle budget
+at an internal B or taken integer-branch edge. Before entry, source validation checks each range the remaining cycle budget
 can reach, including destination edits. Each pair advances at least one cycle;
 bytes beyond that bound are checked on a later call before they can execute. Per-pair budget exits publish the correct branch,
 delay and TPC state; a complete deferred region publishes its final state as
@@ -151,6 +151,14 @@ and one shared ARM64 retirement body per code-cache generation. It mirrors the
 reference retirement order in `VUPipeline.h`; generated blocks do not each contain
 a copy of the retirement routine. Native retirement omits interpreter trace logs.
 
+LQI/SQI and LQD/SQD execute vector transfers and VI address updates natively.
+They wrap data-memory addresses at 16 KiB and VI updates at 16 bits, preserving
+upper VI bits, component masks and the interpreter's encoded-register guards.
+The VI backup is created even when VF0, VI0 or a zero mask suppresses a transfer
+or update. Upper/lower destination conflicts still suppress the whole lower
+operation, including its address update. FMAC issue and VI backup retirement
+use the existing shared pipeline machinery, including deferred regions.
+
 ILW reads the low halfword of the final selected component, wraps VU1 data memory,
 and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic
@@ -161,7 +169,7 @@ It publishes its queues and checks the remaining budget before returning to the
 ordinary generated path, keeping VF/ACC cached across branch preparation. Branch
 preparation combines upper FMAC stalls with matching IALU waits, then retires
 pipelines before testing the signed VI value or its applicable backup. Since
-integer waits can change FMAC ages, analysis forgets uncertain ages at IBGTZ
+integer waits can change FMAC ages, analysis forgets uncertain ages at integer branches
 and resumes static retirement only when subsequent pairs establish known timing.
 
 Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
@@ -248,7 +256,7 @@ packet completion, the full guard runs again against the current
 state; the generic prefix still drains incoming work before scheduled execution. Pending FDIV,
 EFU and IALU work initially keeps the generic path, but readiness is checked again
 at the first scheduled pair and at the deferred region boundary. Once these
-queues drain, the validated block may use scheduled execution. ILW issues integer work and clears readiness; IBGTZ waits for matching loads
+queues drain, the validated block may use scheduled execution. ILW issues integer work and clears readiness; integer branches wait for matching loads
 and breaks the static schedule. Other supported integer operations have zero
 pipeline latency. Unknown timing keeps the
 generic preparation path. Every queue entry is materialized

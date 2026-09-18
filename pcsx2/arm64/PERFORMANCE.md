@@ -1189,3 +1189,82 @@ normal device shutdown and host-memory release. The process exit code was not
 captured after the tool session ended. The existing optional patches.zip warning
 remains. No visual, long-gameplay or x64 runtime validation was performed. Logs:
 `poll-production-{build,ctest,state,state-console}.log`.
+
+## Outdoor gameplay state: VU1 instruction coverage
+
+The user supplied an outdoor gameplay state (`saved_state/AGENTS.p2s`) for
+SCPS-15025. Its screenshot is an interactive scene, unlike the earlier opening
+movie. The state, screenshot and extracted memory are not included in commits.
+`build-arm64/investigate-scene.py` loads that state with the same private runtime
+configuration (1x resolution, MTVU disabled), then compares frames 120–420 with
+no controller input. Every run starts from the same state.
+
+Before sampling began, metrics showed about 25 VPS, roughly 40 ms CPU time per
+frame, and only 1–2 ms GS/GPU time. The five-second sample contains extensive
+`Arm64VU1Recompiler::Execute` → `vu1Exec` fallback, including FMAC/IALU stall and
+queue processing. This is evidence of CPU-side overhead, not a rendering
+resolution bottleneck. The sample's own perturbed VPS is excluded from all
+comparisons. Artifact: `scene-sample-baseline.sample.txt`.
+
+A separate temporary counter run recorded 355 million interpreter steps and
+about 180 million native entries over the state run. Native entries advanced
+only about 4.44 VU cycles on average. The unsupported lower-opcode histogram
+included about 57.6 million LQI, 53.5 million SQI, 53.5 million IBNE and 26.6 million
+IBEQ occurrences. Unsupported upper instructions also included CLIP and
+OPMULA/OPMSUB. Counts include fallback delay slots and warmup; upper/lower counts
+can overlap on the same pair and are not percentages of elapsed CPU time.
+No timing result from this instrumented run is used as a benchmark.
+Artifact: `scene-vu-counts.log`.
+
+The implementation extends the existing VU1 emitter instead of increasing block
+size or changing emulated cycle budgets:
+
+- LQI/SQI/LQD/SQD transfer selected vector components and update the low 16 bits
+  of the address VI. Memory wrapping, VF0/VI0 behavior, full encoded-register
+  guards and VI backup creation match the interpreter. A conflicting upper
+  destination still suppresses the entire lower operation.
+- IBEQ/IBNE reuse the existing taken-edge trace, pipeline preparation, delay-slot
+  handling and shared exit machinery. Each operand independently selects its
+  current or backed-up VI value. Matching IALU hazards are retired before the
+  comparison. Nested branches retain fallback, and a back edge to the trace
+  entry can reuse the native frame and cached vectors.
+
+Four differential tests cover every transfer lane mask, address and VI wrapping,
+zero and extended register encodings, VI backup state, upper/lower conflicts,
+deferred regions, both equality operands, pending IALU work, partial budgets,
+cycle wrap, nested branches, native loops and source-code edits. Comparisons
+include both VUs' complete register/queue state and VU1 data memory; native-code
+allocation is checked to avoid passing through silent fallback alone.
+
+Serial unsampled comparison against `7c26e3402`:
+
+| State run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| old-a | 25.38 | 39.25 | 1.24 |
+| new-a (transfers only) | 29.02 | 34.47 | 1.22 |
+| combined-a | 31.58 | 31.64 | 1.19 |
+| old-b | 25.82 | 38.70 | 1.21 |
+| combined-b | 31.66 | 31.55 | 1.19 |
+
+The final two-run means are **25.60 → 31.62 VPS (+23.5%)**. The intermediate
+transfer-only result is shown separately and excluded from those means. Both
+final comparisons improved consistently. All runs used identical temporary
+metrics logging, without instruction counters, sampling or concurrent builds
+or tests. Logs: `scene-{old-a,new-a,combined-a,old-b,combined-b}.log`.
+
+An opening-movie regression check on frames 850–1100 measured **57.85 → 57.62
+VPS (-0.4%)**, a small difference from a single pair rather than a precise
+regression bound. Logs: `diagnostic-scene-{old,new}.log`.
+
+The supplied state still runs well below 60 VPS. CLIP, outer-product operations,
+DIV, flag-test instructions and other unsupported instructions continue to
+fragment execution. Their recorded frequency identifies further candidates;
+it does not establish the remaining speedup available from each one. The
+installed `/Applications/PCSX2.app` was not replaced during this investigation.
+
+Production validation: temporary metrics and VU counters removed, ARM64 app
+rebuilt, **218 tests** (20 common, 198 core) passed, and deep signature verification
+passed. The supplied outdoor state loaded SPU2/GS, ran for 20 seconds and exited
+with code 0. The existing optional patches.zip warning remains. No visual,
+long-gameplay or x64 runtime validation was performed. Logs:
+`scene-production-{build,ctest,state,state-console}.log`.

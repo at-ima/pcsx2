@@ -187,6 +187,10 @@ namespace
 	{
 		Lq,
 		Sq,
+		Lqi,
+		Sqi,
+		Lqd,
+		Sqd,
 		Iaddiu,
 		Isubiu,
 		Iadd,
@@ -199,6 +203,8 @@ namespace
 		Mfir,
 		Mtir,
 		Ilw,
+		Ibeq,
+		Ibne,
 		Ibgtz,
 		Xgkick,
 		Branch,
@@ -214,6 +220,10 @@ namespace
 				return Lower::Sq;
 			case 4:
 				return Lower::Ilw;
+			case 0x28:
+				return Lower::Ibeq;
+			case 0x29:
+				return Lower::Ibne;
 			case 0x2d:
 				return Lower::Ibgtz;
 			case 8:
@@ -238,6 +248,14 @@ namespace
 				}
 				switch (code & 0x7ff)
 				{
+					case 0x37c:
+						return Lower::Lqi;
+					case 0x37d:
+						return Lower::Sqi;
+					case 0x37e:
+						return Lower::Lqd;
+					case 0x37f:
+						return Lower::Sqd;
 					case 0x33c:
 						return Lower::Move;
 					case 0x33d:
@@ -254,6 +272,11 @@ namespace
 		return Lower::Unsupported;
 	}
 
+
+	bool IsIntegerBranch(Lower op)
+	{
+		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz;
+	}
 
 	void StoreWord(MacroAssembler& a, u32 value, size_t offset)
 	{
@@ -585,6 +608,42 @@ namespace
 			StoreVector(a, cache, v0, ft, mask);
 			return;
 		}
+		if (op == Lower::Lqi || op == Lower::Sqi || op == Lower::Lqd || op == Lower::Sqd)
+		{
+			const bool load = op == Lower::Lqi || op == Lower::Lqd;
+			const bool decrement = op == Lower::Lqd || op == Lower::Sqd;
+			const u32 base = load ? is : it;
+			// Preserve the interpreter's guards, including the full encoded register
+			// fields used by LQI/SQI/SQD. Even a suppressed update creates a backup.
+			const bool update = (load ? (decrement ? is : fs) : ft) != 0;
+			BackupVI(a, base);
+			a.Ldrh(w2, Field(VI(base)));
+			if (decrement && update)
+				a.Sub(w2, w2, 1);
+			if (!load || ft)
+			{
+				a.And(w0, w2, 0x3ff);
+				a.Ldr(x1, Field(offsetof(VURegs, Mem)));
+				a.Add(x1, x1, Operand(x0, LSL, 4));
+				if (load)
+				{
+					a.Ldr(q0, MemOperand(x1));
+					StoreVector(a, cache, v0, ft, mask);
+				}
+				else
+				{
+					LoadVector(a, cache, q0, fs);
+					StoreMasked(a, v0, MemOperand(x1), mask);
+				}
+			}
+			if (update)
+			{
+				if (!decrement)
+					a.Add(w2, w2, 1);
+				a.Strh(w2, Field(VI(base)));
+			}
+			return;
+		}
 		if (op == Lower::Lq || op == Lower::Sq)
 		{
 			if (op == Lower::Lq && !ft)
@@ -680,7 +739,7 @@ namespace
 			}
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
-			if (DecodeLower(ins.lower) != Lower::Branch && DecodeLower(ins.lower) != Lower::Ibgtz &&
+			if (DecodeLower(ins.lower) != Lower::Branch && !IsIntegerBranch(DecodeLower(ins.lower)) &&
 				DecodeLower(ins.lower) != Lower::Xgkick)
 				EmitLower(a, cache, ins.lower);
 			if (backup)
@@ -697,20 +756,33 @@ namespace
 			StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
 			StoreWord(a, 1, offsetof(VURegs, branch));
 		}
-		else if (!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Ibgtz)
+		else if (!(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower)))
 		{
-			Label current, done;
-			const u32 src = (ins.lower >> 11) & 15;
-			a.Ldrsh(w0, Field(VI(src)));
-			a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
-			a.Cbz(w9, &current);
-			a.Ldr(w9, Field(offsetof(VURegs, VIRegNumber)));
-			a.Cmp(w9, src);
-			a.B(ne, &current);
-			a.Ldrsh(w0, Field(offsetof(VURegs, VIOldValue)));
-			a.Bind(&current);
-			a.Cmp(w0, 0);
-			a.B(le, &done);
+			Label done;
+			const auto load_operand = [&](const Register& dest, u32 reg) {
+				Label current;
+				a.Ldrsh(dest, Field(VI(reg)));
+				a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+				a.Cbz(w9, &current);
+				a.Ldr(w9, Field(offsetof(VURegs, VIRegNumber)));
+				a.Cmp(w9, reg);
+				a.B(ne, &current);
+				a.Ldrsh(dest, Field(offsetof(VURegs, VIOldValue)));
+				a.Bind(&current);
+			};
+			load_operand(w0, (ins.lower >> 11) & 15);
+			const Lower op = DecodeLower(ins.lower);
+			if (op == Lower::Ibgtz)
+			{
+				a.Cmp(w0, 0);
+				a.B(le, &done);
+			}
+			else
+			{
+				load_operand(w1, (ins.lower >> 16) & 15);
+				a.Cmp(w0, w1);
+				a.B(op == Lower::Ibeq ? ne : eq, &done);
+			}
 			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
 			StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
 			StoreWord(a, 1, offsetof(VURegs, branch));
@@ -1137,7 +1209,7 @@ namespace
 			InvalidateAll();
 		auto block = std::make_unique<Block>();
 		const u32 saved_code = VU1.code;
-		// Decode static B and taken IBGTZ edges with one vector-cache and
+		// Decode static B and taken integer-branch edges with one vector-cache and
 		// pipeline schedule. Reachable source bytes are validated before entry.
 		// A repeated entry can loop natively; other repeated PCs, unsupported
 		// pairs and the size limit end the trace.
@@ -1162,7 +1234,7 @@ namespace
 			if (DecodeUpper(ins.upper).op == Op::Unsupported ||
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
 				break;
-			const bool conditional = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Ibgtz;
+			const bool conditional = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 			// Follow the taken edge; the generated guard exits on the other path.
 			if (conditional && pending_branch)
 				break;

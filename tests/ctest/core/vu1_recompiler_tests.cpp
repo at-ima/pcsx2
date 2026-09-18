@@ -1875,4 +1875,150 @@ TEST_F(VU1PacketXgkickTest, RestoredIncrementalRequestStaysIncrementalBetweenTag
 	EXPECT_FALSE(VU1.xgkickenable);
 }
 
+TEST_F(VU1RecompilerTest, AutoIndexedTransfersPreserveWrappingMasksAndBranchBackup)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 op : {0x37cu, 0x37du, 0x37eu, 0x37fu})
+		for (u32 mask = 0; mask < 16; mask++)
+			for (u32 base : {0u, 1u, 16u, 17u})
+				for (u32 value : {0u, 0x3ffu, 0x400u, 0x8000u, 0xffffu})
+					for (u32 vector : {0u, 2u})
+						for (u32 budget : {1u, 2u, 3u, 9u})
+						{
+							SCOPED_TRACE(testing::Message() << op << "/" << mask << "/" << base << "/" << value << "/" << vector << "/" << budget);
+							VU0 = initial0;
+							VU1 = initial;
+							VU1.VI[base & 15].UL = 0xabcd0000 | value;
+							VU1.VIBackupCycles = value & 3;
+							VU1.VIRegNumber = base & 15;
+							VU1.VIOldValue = 0x8000;
+							for (u32 word = 0; word < VU1_MEMSIZE / 4; word++)
+								reinterpret_cast<u32*>(VU1.Mem)[word] = 0x3e000000 | (word * 73);
+							const bool load = !(op & 1);
+							const u32 fs = load ? base : vector, ft = load ? vector : base;
+							Put(0, 0x2ff, 0x80000000 | (mask << 21) | (ft << 16) | (fs << 11) | op);
+							Put(8, 0x2ff, 0x5a000000 | ((base & 15) << 11) | 2); // IBGTZ observes the VI backup.
+							Put(16, 0x800002ff, 0x40000000);
+							Put(24, 0xc00002ff, 0x40400000);
+							Put(32, 0xc00002ff, 0x40800000);
+							Put(40, 0x800002ff, 0x41000000);
+							CpuArm64VU1.Reserve();
+							Compare(budget);
+							if (HasFatalFailure())
+								return;
+							if (budget == 1)
+								ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+						}
+}
+
+TEST_F(VU1RecompilerTest, AutoIndexedTransfersAcrossDeferredRegionsAndUpperConflicts)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 variant = 0; variant < 8; variant++)
+	{
+		for (u32 i = 0; i < 80; i++)
+		{
+			const u32 op = 0x37c + (i + variant) % 4;
+			const bool load = !(op & 1);
+			const u32 base = (i % 7 == 0) ? 0 : 1;
+			const u32 vector = 2 + i % 7;
+			const u32 fs = load ? base : vector, ft = load ? vector : base;
+			const u32 dest = (variant & 1) ? vector : 12;
+			const u32 upper = (15 << 21) | (3 << 16) | (2 << 11) | (dest << 6) | 0x28;
+			Put(i * 8, upper, 0x80000000 | (((i + variant) % 16) << 21) | (ft << 16) | (fs << 11) | op);
+		}
+		Put(80 * 8, 0xc00002ff, 0x3f800000);
+		Put(81 * 8, 0x800002ff, 0x3f800000);
+		for (u32 budget : {1u, 7u, 15u, 31u, 79u, 160u, 512u})
+		{
+			SCOPED_TRACE(testing::Message() << variant << "/" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VI[1].UL = (variant & 2) ? 0xffffffff : 0xabcd03ff;
+			VU1.VIBackupCycles = 2;
+			VU1.VIRegNumber = 1;
+			VU1.VIOldValue = 13;
+			for (u32 word = 0; word < VU1_MEMSIZE / 4; word++)
+				reinterpret_cast<u32*>(VU1.Mem)[word] = 0x3e000000 | (word * 73);
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, EqualityBranchesUseBothBackupsAndIncomingIaluHazards)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 op : {0x50u, 0x52u})
+		for (u32 target_reg : {0u, 1u, 2u})
+			for (u32 value : {0u, 1u, 0x7fffu, 0x8000u, 0xffffu})
+				for (u32 backup : {0u, 1u, 2u, 0x10001u})
+					for (u32 latency : {0u, 1u, 4u, 260u})
+						for (u32 budget : {1u, 2u, 3u, 12u})
+						{
+							SCOPED_TRACE(testing::Message() << op << "/" << target_reg << "/" << value << "/" << backup << "/" << latency << "/" << budget);
+							VU0 = initial0;
+							VU1 = initial;
+							VU1.cycle = (value & 1) ? ~u64(0) - 2 : 100;
+							VU1.VI[1].UL = 0xabcd0000 | value;
+							VU1.VI[2].UL = 0x12340000 | value;
+							VU1.VIRegNumber = backup;
+							VU1.VIOldValue = value ? 0 : 1;
+							VU1.VIBackupCycles = 2;
+							if (latency)
+							{
+								VU1.ialucount = 2;
+								VU1.ialuwritepos = 2;
+								VU1.ialu[0].sCycle = VU1.cycle;
+								VU1.ialu[0].Cycle = latency;
+								VU1.ialu[0].reg = 1 << target_reg;
+								VU1.ialu[1].sCycle = VU1.cycle;
+								VU1.ialu[1].Cycle = latency + 1;
+								VU1.ialu[1].reg = 1 << 1;
+							}
+							Put(0, 0x2ff, (op << 24) | (target_reg << 16) | (1 << 11) | 3);
+							Put(8, 0x800002ff, 0x40000000);
+							Put(16, 0x800002ff, 0x40400000);
+							Put(24, 0xc00002ff, 0x40800000);
+							Put(32, 0xc00002ff, 0x41000000);
+							Put(40, 0x800002ff, 0x41800000);
+							CpuArm64VU1.Reserve();
+							Compare(budget);
+							if (HasFatalFailure())
+								return;
+							ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+						}
+}
+
+TEST_F(VU1RecompilerTest, EqualityBranchLoopsRetainTransfersAcrossBudgetsAndSourceEdits)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 op : {0x50u, 0x52u})
+		for (bool nested : {false, true})
+		{
+			for (u32 i = 0; i < 30; i++)
+				Put(i * 8, 0x2ff, 0x8000037d | (15 << 21) | (1 << 16) | (2 << 11)); // SQI
+			const u32 target = op == 0x50 ? 1 : 0;
+			Put(240, 0x2ff, (op << 24) | (target << 16) | (1 << 11) | 0x7e1);
+			Put(248, nested ? 0x2ff : 0x800002ff, nested ? 0x52000800 : 0x3f800000);
+			for (u32 budget : {1u, 29u, 30u, 31u, 32u, 33u, 64u, 255u, 512u})
+			{
+				SCOPED_TRACE(testing::Message() << op << "/" << nested << "/" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.VI[1].UL = 0xabcd03ff;
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+			VU0 = initial0;
+			VU1 = initial;
+			Put(80, 0x2ff, 0x8000037f | (15 << 21) | (1 << 16) | (2 << 11)); // SQD replaces SQI.
+			Compare(160);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
 #endif
