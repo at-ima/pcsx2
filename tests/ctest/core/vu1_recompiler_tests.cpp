@@ -426,6 +426,131 @@ TEST_F(VU1RecompilerTest, NativePreparationRetiresRandomizedIncomingPipelines)
 	}
 }
 
+
+TEST_F(VU1RecompilerTest, ScheduledRetirementPreservesEveryBudgetPrefix)
+{
+	const float lhs[] = {-2.0f, 0.0f, 1.0f, 0.0f};
+	const float rhs[] = {1.0f, 0.0f, -2.0f, 1.0f};
+	std::memcpy(VU1.VF[1].F, lhs, sizeof(lhs));
+	std::memcpy(VU1.VF[2].F, rhs, sizeof(rhs));
+	const VURegs initial = VU1;
+	for (u32 pattern = 0; pattern < 7; pattern++)
+	{
+		for (u32 i = 0; i < 64; i++)
+		{
+			u32 upper = 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | ((3 + i % 5) << 6) | 0x28;
+			u32 lower = 0x3f800000;
+			if (pattern == 1 && i % 3 == 0)
+				upper = 0x800002ff; // Gaps in the FMAC queue.
+			if (pattern == 2)
+			{
+				upper = 0x2ff;
+				lower = 0x8000033c | (15 << 21) | ((3 + i % 5) << 16) | (1 << 11);
+			}
+			if (pattern == 3 && i % 16 == 11)
+				upper = (upper & ~(31 << 11)) | ((3 + (i - 1) % 5) << 11);
+			if (pattern == 4)
+			{
+				upper &= ~0x80000000u;
+				lower = 0x10000003 | ((2 + i % 3) << 16) | (1 << 11); // IADDIU
+			}
+			if (pattern == 5)
+				upper = 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+			if (pattern == 6)
+			{
+				const bool stall = i % 8 == 7;
+				const u32 mask = stall ? 15 : 1 << (i % 4);
+				const u32 source = stall ? 3 + (i - 1) % 5 : 1;
+				upper = 0x80000000 | (mask << 21) | (2 << 16) | (source << 11) | ((3 + i % 5) << 6) | 0x28;
+			}
+			Put(i * 8, upper, lower);
+		}
+		for (u32 budget = 1; budget <= 64; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "pattern=" << pattern << " budget=" << budget);
+			VU1 = initial;
+			VU1.cycle = 100;
+			VU1.VIBackupCycles = 2;
+			VU1.fmacreadpos = 3;
+			VU1.fmacwritepos = 2;
+			VU1.fmaccount = 3;
+			for (u32 j = 0; j < 3; j++)
+			{
+				auto& pipe = VU1.fmac[(3 + j) & 3];
+				pipe.sCycle = 97 + j;
+				pipe.Cycle = 4;
+				pipe.regupper = 1;
+				pipe.xyzwupper = 15;
+				pipe.flagreg = j == 0 ? (1 << REG_CLIP_FLAG) : (1 << REG_STATUS_FLAG);
+				pipe.statusflag = 0x135 + j;
+				pipe.macflag = 0x2468 + j;
+				pipe.clipflag = 0xabc + j;
+			}
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ScheduledRetirementFallsBackForSpecialAndIncomingState)
+{
+	const VURegs initial = VU1;
+	for (u32 i = 0; i < 64; i++)
+		Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x3f800000);
+	for (u32 variant = 0; variant < 7; variant++)
+	{
+		for (u32 budget : {8u, 9u, 16u, 31u, 40u})
+		{
+			SCOPED_TRACE(testing::Message() << "variant=" << variant << " budget=" << budget);
+			VU1 = initial;
+			VU1.cycle = variant == 5 ? ~u64(0) - 16 : 100;
+			if (variant == 0)
+			{
+				VU1.fdiv.enable = 1;
+				VU1.fdiv.sCycle = 100;
+				VU1.fdiv.Cycle = 12;
+				VU1.fdiv.statusflag = 0xc30;
+			}
+			else if (variant == 1)
+			{
+				VU1.efu.enable = 1;
+				VU1.efu.sCycle = 100;
+				VU1.efu.Cycle = 20;
+			}
+			else if (variant == 2)
+			{
+				VU1.ialucount = 1;
+				VU1.ialuwritepos = 1;
+				VU1.ialu[0].sCycle = 100;
+				VU1.ialu[0].Cycle = 2;
+			}
+			else if (variant == 3 || variant == 4)
+			{
+				VU1.fmaccount = 1;
+				VU1.fmacwritepos = 1;
+				VU1.fmac[0].sCycle = variant == 3 ? 100 : 102;
+				VU1.fmac[0].Cycle = variant == 3 ? 8 : 4;
+				VU1.fmac[0].regupper = 1;
+				VU1.fmac[0].xyzwupper = 15;
+			}
+			if (variant == 6)
+			{
+				VU1.fmaccount = 2;
+				VU1.fmacwritepos = 2;
+				for (u32 i = 0; i < 2; i++)
+				{
+					VU1.fmac[i].sCycle = 100;
+					VU1.fmac[i].Cycle = 4;
+				}
+			}
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, XgkickCreditTicksPreserveCycleWrapAndCachedValues)
 {
 	const VURegs initial = VU1;

@@ -288,3 +288,50 @@ SCPS-15025 save state, ran for 20 seconds without early exit, and shut down with
 exit code 0. No visual or long-gameplay compatibility validation was performed.
 Logs: `root-packet-production-{build,ctest,state,state-console}.log` and
 `root-packet-x64-*.log` under the ignored build directory.
+
+
+## Compile-time FMAC retirement schedules
+
+The next change targets the remaining per-pair pipeline management. Like
+microVU's dependency analysis, compilation tracks producer ages and stalls.
+Starting after seven generic pairs, known timing allows emitting the exact
+number of FMAC retirements. Incoming special pipelines, XGKICK, irregular FMAC
+queues and counter wrap fail an entry guard and use the generic helper. At least
+four scheduled pairs are required to amortize that guard. Queue slots remain
+fully materialized so partial-budget execution remains interpreter-compatible.
+Arithmetic flags are still calculated; only intermediate retirement writes that
+cannot be observed between slots are combined, preserving every sticky bit.
+
+Serial new/old/old/new runs, using the same frames 850–1100 and setup above:
+
+| Build | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| Scheduled A | 35.84 | 27.87 | 2.99 |
+| Previous A | 34.82 | 28.64 | 3.00 |
+| Previous B | 34.58 | 28.81 | 3.01 |
+| Scheduled B | 35.46 | 28.13 | 3.02 |
+
+Mean throughput increased approximately **2.7%**, from 34.70 to 35.65 VPS.
+These are modest same-fork gains, not a resolution of the gap to 60 FPS or a
+Rosetta comparison. Logs: `diagnostic-scheduled-stalls-{new,old}-{a,b}.log`.
+
+Later measurements became unusable for comparison with these rows: both a
+further cycle-register-cache experiment and the unchanged baseline fell to
+roughly 4–5 VPS, with GS time increasing from about 3 to 20 ms. The baseline's
+startup MultiPause calibration also rose from about 65 to 208 ns. The cause of
+this environment-wide change was not established. The cycle-cache experiment
+was therefore excluded from the adopted change; none of those later timings
+are used to claim a gain or regression here.
+
+Two differential tests cover every budget prefix across seven instruction
+patterns, plus pending special pipelines, irregular incoming timing and wrap.
+They compare complete VU state and memory, not just final arithmetic results.
+Broader gameplay compatibility still needs proper testing.
+
+Final validation: the production ARM64 app and test binaries rebuilt without
+benchmark logging; all 178 tests (20 common, 158 core) passed. Deep application
+signature verification passed. The existing SCPS-15025 save state loaded, the
+app remained running for 20 seconds and shut down with exit code 0. This does
+not validate visual correctness, long gameplay or an x64 runtime build.
+Logs: `scheduled-production-{build,ctest,state,state-console}.log` in the ignored
+build directory.

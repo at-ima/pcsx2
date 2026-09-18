@@ -169,9 +169,15 @@ GIF cannot run. Save-state layouts are unchanged. This adopts microVU's ordinary
 transfer policy, not cycle-exact GIF timing; wider game coverage is still needed.
 
 FMAC/FDIV/EFU/IALU queues and arithmetic flags remain interpreter-compatible.
-Moving their scheduling and flag liveness into compilation is a separate change
-which must preserve state at budget exits, fallback and callbacks. Runtime
-profiles should distinguish these management costs from arithmetic throughput.
+For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls.
+After a generic prefix drains incoming entries, it emits known retirement counts
+instead of checking every queue at every pair. An entry guard rejects pending
+special pipelines or XGKICK, irregular incoming queues and cycle wrap. Unknown
+timing keeps the generic preparation path. Every queue entry remains materialized,
+including at budget exits; sticky flags include all retired entries even when
+only the final MAC/non-sticky result is stored. This is a limited first step
+toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
+Runtime profiles should distinguish these management costs from arithmetic throughput.
 
 ## Validation
 

@@ -38,10 +38,18 @@ namespace
 		VRegister Host(u32 reg) const { return VRegister(8 + slots[reg], 128); }
 	};
 
+	struct RetirementSchedule
+	{
+		u8 cycles = 0; // Zero means that incoming timing is still unknown.
+		u8 retired = 0;
+		u8 remaining = 0;
+	};
+
 	struct Block
 	{
 		using Function = void (*)(u64 start, u64 cycles);
 		std::array<Instruction, MaxInstructions> instructions{};
+		std::array<RetirementSchedule, MaxInstructions> schedule{};
 		std::array<u32, MaxInstructions * 2> words{};
 		u32 count = 0;
 		VectorCache cache;
@@ -649,6 +657,186 @@ namespace
 		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
 	}
 
+	bool HasFmac(const Instruction& ins)
+	{
+		return ins.uregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_FMAC;
+	}
+
+	void AnalyzeRetirement(Block& block)
+	{
+		// Ages saturate at four (already retired). -1 represents an age which
+		// still depends on incoming timing. Every pair advances at least one cycle.
+		std::array<int, MaxInstructions> ages{};
+		ages.fill(-1);
+		for (u32 i = 0; i < block.count; i++)
+		{
+			const auto& ins = block.instructions[i];
+			int cycles = -1;
+			if (i >= 3)
+			{
+				if (!ins.readsVF || ins.dependency == 0)
+					cycles = 1;
+				else
+				{
+					int slots = ins.dependency;
+					for (u32 distance = 1; distance <= 3; distance++)
+					{
+						if (HasFmac(block.instructions[i - distance]) && --slots == 0)
+						{
+							const int age = ages[i - distance];
+							if (age >= 0)
+								cycles = std::max(1, 4 - age);
+							break;
+						}
+					}
+				}
+			}
+			if (i >= 7 && cycles > 0)
+			{
+				RetirementSchedule plan{static_cast<u8>(cycles)};
+				for (u32 j = i - 4; j < i; j++)
+				{
+					const auto& producer = block.instructions[j];
+					if (!HasFmac(producer))
+						continue;
+					if (ages[j] < 0)
+					{
+						plan.cycles = 0;
+						break;
+					}
+					if (ages[j] >= 4)
+						continue;
+					if (ages[j] + cycles < 4)
+						plan.remaining++;
+					else
+					{
+						if ((producer.uregs.VIwrite | producer.lregs.VIwrite) &
+							((1 << REG_STATUS_FLAG) | (1 << REG_CLIP_FLAG)))
+							plan.cycles = 0;
+						plan.retired++;
+					}
+				}
+				block.schedule[i] = plan;
+			}
+			for (u32 j = 0; j < i; j++)
+			{
+				if (cycles > 0 && ages[j] >= 0)
+					ages[j] = std::min(4, ages[j] + cycles);
+				else if (static_cast<int>(i - j - 1) + std::max(1, cycles) >= 4 ||
+						 (ages[j] >= 0 && ages[j] + std::max(1, cycles) >= 4))
+					ages[j] = 4;
+				else
+					ages[j] = -1;
+			}
+			ages[i] = 0;
+		}
+	}
+
+	void EmitScheduleGuard(MacroAssembler& a)
+	{
+		Label done, loop, ready;
+		a.Mov(w25, 0);
+		for (size_t offset : {offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable),
+				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount),
+				 offsetof(VURegs, xgkickenable)})
+		{
+			a.Ldr(w9, Field(offset));
+			a.Cbnz(w9, &done);
+		}
+		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
+		// A block issues at most 32 pairs, each with at most three stall cycles.
+		a.Cmn(x9, 256);
+		a.B(hs, &done);
+		a.Ldr(w10, Field(offsetof(VURegs, fmaccount)));
+		a.Cmp(w10, 4);
+		a.B(hi, &done);
+		a.Ldr(w11, Field(offsetof(VURegs, fmacreadpos)));
+		a.Cmp(w11, 3);
+		a.B(hi, &done);
+		a.Ldr(w12, Field(offsetof(VURegs, fmacwritepos)));
+		a.Add(w13, w11, w10);
+		a.And(w13, w13, 3);
+		a.Cmp(w12, w13);
+		a.B(ne, &done);
+		a.Cbz(w10, &ready);
+		a.Mov(x14, 0);
+		a.Bind(&loop);
+		a.Mov(w12, sizeof(fmacPipe));
+		a.Madd(x12, x11, x12, x19);
+		a.Add(x12, x12, offsetof(VURegs, fmac));
+		a.Ldr(x13, MemOperand(x12, offsetof(fmacPipe, sCycle)));
+		a.Cmp(x13, x9);
+		a.B(hi, &done);
+		// At most one entry is issued per cycle. This also prevents a queue
+		// overflow in the generic prefix before incoming entries have matured.
+		a.Cmp(x13, x14);
+		a.B(lo, &done);
+		a.Add(x14, x13, 1);
+		a.Ldr(w13, MemOperand(x12, offsetof(fmacPipe, Cycle)));
+		a.Cmp(w13, 4);
+		a.B(hi, &done);
+		a.Add(w11, w11, 1);
+		a.And(w11, w11, 3);
+		a.Subs(w10, w10, 1);
+		a.B(ne, &loop);
+		a.Bind(&ready);
+		a.Mov(w25, 1);
+		a.Bind(&done);
+	}
+
+	void EmitScheduledPrepare(MacroAssembler& a, const Block& block, u32 index)
+	{
+		const auto& plan = block.schedule[index];
+		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
+		a.Add(x9, x9, plan.cycles);
+		a.Str(x9, Field(offsetof(VURegs, cycle)));
+		StoreWord(a, block.instructions[index].pc + 8, VI(REG_TPC));
+		if (plan.retired)
+		{
+			a.Ldr(w10, Field(offsetof(VURegs, fmacreadpos)));
+			a.Ldr(w13, Field(VI(REG_STATUS_FLAG)));
+			a.And(w13, w13, 0xff0);
+			for (u32 i = 0; i < plan.retired; i++)
+			{
+				a.Mov(w11, sizeof(fmacPipe));
+				a.Madd(x12, x10, x11, x19);
+				a.Add(x12, x12, offsetof(VURegs, fmac));
+				a.Ldr(w11, MemOperand(x12, offsetof(fmacPipe, statusflag)));
+				a.And(w11, w11, 15);
+				// All sticky bits survive, but only the last MAC/non-sticky flags
+				// are observable after retirement. No flag readers run between slots.
+				a.Orr(w13, w13, Operand(w11, LSL, 6));
+				if (i + 1 == plan.retired)
+				{
+					a.Orr(w13, w13, w11);
+					a.Str(w13, Field(VI(REG_STATUS_FLAG)));
+					a.Ldr(w11, MemOperand(x12, offsetof(fmacPipe, macflag)));
+					a.Str(w11, Field(VI(REG_MAC_FLAG)));
+				}
+				a.Add(w10, w10, 1);
+				a.And(w10, w10, 3);
+			}
+			a.Str(w10, Field(offsetof(VURegs, fmacreadpos)));
+			StoreWord(a, plan.remaining, offsetof(VURegs, fmaccount));
+		}
+		// No division/EFU/IALU or GIF work can arise inside a supported block
+		// admitted by the entry guard. Broader game coverage still needs proper testing.
+		a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+		if (plan.cycles == 1)
+		{
+			a.Cmp(w9, 0);
+			a.Cset(w10, ne);
+		}
+		else
+		{
+			a.Mov(w10, plan.cycles);
+			a.Cmp(w9, w10);
+			a.Csel(w10, w9, w10, lo);
+		}
+		a.Sub(w9, w9, w10);
+		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+	}
+
 	Block& Compile(u32 pc)
 	{
 		if (static_cast<size_t>(s_end - s_write) < MaxBlockBytes)
@@ -710,6 +898,7 @@ namespace
 		VU1.code = saved_code;
 		if (block->count)
 		{
+			AnalyzeRetirement(*block);
 			AssignVectorCache(*block);
 			const VectorCache& cache = block->cache;
 			if (!s_pipeline.prepare[0])
@@ -727,11 +916,18 @@ namespace
 			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
 			a.Stp(x23, x24, MemOperand(sp, 32));
-			a.Str(lr, MemOperand(sp, 48));
+			a.Stp(x25, lr, MemOperand(sp, 48));
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
 					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
+			u32 scheduled_pairs = 0;
+			for (u32 i = 7; i < block->count; i++)
+				scheduled_pairs += block->schedule[i].cycles != 0;
+			// Amortize the entry guard over several scheduled pairs.
+			const bool scheduled = scheduled_pairs >= 4;
+			if (scheduled)
+				EmitScheduleGuard(a);
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
@@ -752,6 +948,15 @@ namespace
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
+				Label generic_prepare, prepared;
+				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
+				if (schedule_pair)
+				{
+					a.Cbz(w25, &generic_prepare);
+					EmitScheduledPrepare(a, *block, i);
+					a.B(&prepared);
+					a.Bind(&generic_prepare);
+				}
 				const u32 selected_prepare = ins.readsVF ? ins.dependency + 2 : 0;
 				a.Add(x0, x23, i * sizeof(Instruction));
 				if (selected_prepare == shared_prepare)
@@ -761,6 +966,8 @@ namespace
 					a.Mov(x16, reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
 					a.Blr(x16);
 				}
+				if (schedule_pair)
+					a.Bind(&prepared);
 				const bool immediate = ins.upper & 0x80000000;
 				const bool discard = !immediate && ins.uregs.VFwrite && ins.uregs.VFwrite == ins.lregs.VFwrite;
 				const u32 backup = !immediate && !discard && ins.uregs.VFwrite &&
@@ -797,7 +1004,7 @@ namespace
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
 					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
-			a.Ldr(lr, MemOperand(sp, 48));
+			a.Ldp(x25, lr, MemOperand(sp, 48));
 			a.Ldp(x23, x24, MemOperand(sp, 32));
 			a.Ldp(x21, x22, MemOperand(sp, 16));
 			a.Ldp(x19, x20, MemOperand(sp, frame_size, PostIndex));
