@@ -166,6 +166,9 @@ struct alignas(16) VURegs
 	u32 xgkicksizeremaining;
 	u64 xgkicklastcycle;
 	u32 xgkickcyclecount;
+	// Bit 0 stays the legacy enable bit. Bit 1 distinguishes a delayed native
+	// packet request from an incremental transfer restored from a save state.
+	static constexpr u32 XgkickPacket = 3;
 	u32 xgkickenable;
 	u32 xgkickendpacket;
 

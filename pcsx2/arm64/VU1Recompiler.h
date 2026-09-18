@@ -5,7 +5,8 @@
 
 #include "VUmicro.h"
 
-// Uses the interpreter's architectural/pipeline state and XGKICK timing.
+// Uses the interpreter's architectural/pipeline state. Normal XGKICK uses
+// microVU's delayed packet policy; XgKickHack retains cycle-based transfers.
 // This provider does not implement microVU's separate-thread execution protocol.
 class Arm64VU1Recompiler final : public BaseVUmicroCPU
 {

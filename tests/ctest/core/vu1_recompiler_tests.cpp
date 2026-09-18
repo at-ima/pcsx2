@@ -6,6 +6,7 @@
 #if defined(ARCH_ARM64)
 #include "arm64/VU1Recompiler.h"
 #include "arm64/VU1Pipeline.h"
+#include "Gif_Unit.h"
 #include "common/HostSys.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
 #include <gtest/gtest.h>
@@ -567,4 +568,265 @@ TEST_F(VU1RecompilerTest, SpecialFloatsAndChangedFloatingPointOptions)
 		}
 	}
 }
+
+namespace
+{
+	class VU1PacketXgkickTest : public VU1RecompilerTest
+	{
+	protected:
+		void SetUp() override
+		{
+			VU1RecompilerTest::SetUp();
+			m_provider = CpuVU1;
+			m_gamefixes = EmuConfig.Gamefixes;
+			m_cpu_regs = cpuRegs;
+			m_vifstat = vif1Regs.stat._u32;
+			CpuVU1 = &CpuArm64VU1;
+			EmuConfig.Gamefixes.XgKickHack = false;
+			vif1Regs.stat.VGW = false;
+			gifUnit.Reset();
+			// Buffer packets while the GIF is paused, avoiding an MTGS thread.
+			gifRegs.ctrl.PSE = 1;
+		}
+
+		void TearDown() override
+		{
+			vif1Regs.stat.VGW = false;
+			gifUnit.Reset();
+			vif1Regs.stat._u32 = m_vifstat;
+			cpuRegs = m_cpu_regs;
+			EmuConfig.Gamefixes = m_gamefixes;
+			CpuVU1 = m_provider;
+			VU1RecompilerTest::TearDown();
+		}
+
+		void Tag(u32 addr, u32 loops, bool eop)
+		{
+			Gif_Tag::HW_Gif_Tag tag{};
+			tag.NLOOP = loops;
+			tag.EOP = eop;
+			tag.FLG = GIF_FLG_PACKED;
+			tag.NREG = 1;
+			tag.REGS[0] = GIF_REG_RGBA;
+			std::memcpy(VU1.Mem + addr, &tag, sizeof(tag));
+		}
+
+		void Kick(u32 addr = 0)
+		{
+			VU1.VI[1].UL = addr / 16;
+			Put(0, 0x2ff, 0x800006fc | (1 << 11));
+			CpuVU1->Execute(1);
+			ASSERT_TRUE(VU1.xgkickenable);
+			ASSERT_EQ(gifUnit.gifPath[0].curSize, 0u);
+		}
+
+		BaseVUmicroCPU* m_provider;
+		Pcsx2Config::GamefixOptions m_gamefixes;
+		cpuRegisters m_cpu_regs;
+		u32 m_vifstat;
+	};
+} // namespace
+
+TEST_F(VU1PacketXgkickTest, DelaysThroughNextInstructionAndObservesItsStore)
+{
+	Tag(0, 2, true);
+	Kick();
+	// The instruction immediately after XGKICK can still populate its data.
+	VU1.VI[2].UL = 1;
+	Put(8, 0x2ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	vif1Regs.stat.VGW = true;
+	const u64 cycle = VU1.cycle;
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.cycle, cycle + 1);
+	EXPECT_FALSE(VU1.xgkickenable);
+	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & (1 << 12), 0u);
+	EXPECT_FALSE(vif1Regs.stat.VGW);
+	EXPECT_NE(cpuRegs.interrupt & (1 << DMAC_VIF1), 0u);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 48u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, VU1.Mem, 48), 0);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, WrapsMemoryAndTransfersAllTagsThroughEop)
+{
+	Tag(0x3ff0, 1, false);
+	Tag(16, 2, true);
+	Kick(0x3ff0);
+	CpuArm64VU1.Execute(2);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 80u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, VU1.Mem + 0x3ff0, 16), 0);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, VU1.Mem, 64), 0);
+	EXPECT_EQ(VU1.xgkickaddr, 64u);
+	EXPECT_FALSE(VU1.xgkickenable);
+}
+
+TEST_F(VU1PacketXgkickTest, FlushDoesNotChargePerQwordVuCycles)
+{
+	Tag(0, 32, true);
+	Kick();
+	const u64 cycle = VU1.cycle;
+	_vuXGKICKTransfer(0, true);
+	EXPECT_EQ(VU1.cycle, cycle);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 33u * 16);
+	EXPECT_FALSE(VU1.xgkickenable);
+}
+
+TEST_F(VU1PacketXgkickTest, InterpreterAndGamefixRetainIncrementalTransfers)
+{
+	for (bool interpreter : {false, true})
+	{
+		SCOPED_TRACE(interpreter);
+		VU1.VI[REG_TPC].UL = 0;
+		gifUnit.Reset();
+		gifRegs.ctrl.PSE = 1;
+		CpuVU1 = interpreter ? static_cast<BaseVUmicroCPU*>(&CpuIntVU1) : &CpuArm64VU1;
+		EmuConfig.Gamefixes.XgKickHack = !interpreter;
+		Tag(0, 2, true);
+		Kick();
+		CpuVU1->Execute(2);
+		EXPECT_EQ(gifUnit.gifPath[0].curSize, 16u);
+		EXPECT_EQ(VU1.xgkicksizeremaining, 32u);
+		EXPECT_TRUE(VU1.xgkickenable);
+		_vuXGKICKTransfer(0, true);
+	}
+}
+
+TEST_F(VU1PacketXgkickTest, RestoredPartialTagFinishesWithoutReparsingPayload)
+{
+	Tag(0, 2, true);
+	Kick();
+	EmuConfig.Gamefixes.XgKickHack = true;
+	_vuXGKICKTransfer(1, false);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 16u);
+	ASSERT_EQ(VU1.xgkicksizeremaining, 32u);
+	EmuConfig.Gamefixes.XgKickHack = false;
+	_vuXGKICKTransfer(2, false);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	EXPECT_TRUE(VU1.xgkickenable);
+	_vuXGKICKTransfer(2, false);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 48u);
+	EXPECT_FALSE(VU1.xgkickenable);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, VU1.Mem, 48), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, OversizedPacketCancelsWithoutCopying)
+{
+	Tag(0, 1023, true);
+	Kick();
+	CpuArm64VU1.Execute(2);
+	EXPECT_FALSE(VU1.xgkickenable);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 0u);
+	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & (1 << 12), 0u);
+}
+
+
+TEST_F(VU1PacketXgkickTest, StalledFollowingStoreCompletesBeforePacketCopy)
+{
+	Tag(0, 1, true);
+	Kick();
+	VU1.fmac[0] = {};
+	VU1.fmac[0].regupper = 3;
+	VU1.fmac[0].xyzwupper = 15;
+	VU1.fmac[0].sCycle = VU1.cycle;
+	VU1.fmac[0].Cycle = 4;
+	VU1.fmacreadpos = 0;
+	VU1.fmacwritepos = 1;
+	VU1.fmaccount = 1;
+	VU1.VI[2].UL = 1;
+	Put(8, 0x2ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	const u64 cycle = VU1.cycle;
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.cycle, cycle + 4);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, FollowingStoreInInterpreterFallbackCompletesBeforeCopy)
+{
+	Tag(0, 1, true);
+	Kick();
+	VU1.VI[2].UL = 1;
+	Put(8, 0x400002ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	CpuArm64VU1.Execute(1); // E-bit pair is interpreted.
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
+	EXPECT_FALSE(VU1.xgkickenable);
+}
+
+TEST_F(VU1PacketXgkickTest, ConsecutiveKicksFlushOldRequestAndDelayNewRequest)
+{
+	Tag(0, 1, true);
+	Tag(64, 2, true);
+	Kick();
+	VU1.VI[2].UL = 4;
+	Put(8, 0x2ff, 0x800006fc | (2 << 11));
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	EXPECT_TRUE(VU1.xgkickenable);
+	EXPECT_EQ(VU1.xgkickaddr, 64u);
+	CpuArm64VU1.Execute(1);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 80u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 32, VU1.Mem + 64, 48), 0);
+	EXPECT_FALSE(VU1.xgkickenable);
+}
+
+TEST_F(VU1PacketXgkickTest, PendingDelaySurvivesCycleCounterWrap)
+{
+	for (u64 cycle : {u64(0xffffffff) - 1, ~u64(0) - 1})
+	{
+		SCOPED_TRACE(cycle);
+		gifUnit.Reset();
+		gifRegs.ctrl.PSE = 1;
+		VU1.VI[REG_TPC].UL = 0;
+		VU1.cycle = cycle;
+		Tag(0, 1, true);
+		Kick();
+		CpuArm64VU1.Execute(1);
+		EXPECT_EQ(gifUnit.gifPath[0].curSize, 32u);
+		EXPECT_FALSE(VU1.xgkickenable);
+		EXPECT_EQ(VU1.cycle, cycle + 2);
+	}
+}
+
+
+TEST_F(VU1PacketXgkickTest, EndBitDelayFlushesPacketWithoutChargingTransferCycles)
+{
+	Tag(0, 16, true);
+	VU1.VI[1].UL = 0;
+	Put(0, 0x400002ff, 0x800006fc | (1 << 11));
+	CpuArm64VU1.Execute(1);
+	ASSERT_TRUE(VU1.xgkickenable);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 0u);
+	const u64 cycle = VU1.cycle;
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.cycle, cycle + 1);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 17u * 16);
+	EXPECT_FALSE(VU1.xgkickenable);
+	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x1100, 0u);
+}
+
+
+TEST_F(VU1PacketXgkickTest, RestoredIncrementalRequestStaysIncrementalBetweenTags)
+{
+	Tag(0, 1, false);
+	Tag(32, 2, true);
+	Kick();
+	// Old save states use enable=1, including at a tag boundary with no
+	// remaining bytes. Such a request must not become a delayed native kick.
+	VU1.xgkickenable = 1;
+	_vuXGKICKTransfer(3, false);
+	VU1.cycle += 3;
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	ASSERT_EQ(VU1.xgkicksizeremaining, 0u);
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 32u);
+	EXPECT_EQ(VU1.xgkickenable, 1u);
+	_vuXGKICKTransfer(2, false);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 48u);
+	EXPECT_EQ(VU1.xgkicksizeremaining, 32u);
+	_vuXGKICKTransfer(0, true);
+	EXPECT_EQ(gifUnit.gifPath[0].curSize, 80u);
+	EXPECT_FALSE(VU1.xgkickenable);
+}
+
 #endif

@@ -814,6 +814,12 @@ namespace
 		return *result;
 	}
 
+	bool PacketXgkickPending()
+	{
+		return CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK &&
+		       VU1.xgkickenable == VURegs::XgkickPacket && VU1.xgkicksizeremaining == 0;
+	}
+
 	bool Matches(const Block& block, u32 pc)
 	{
 		return std::memcmp(block.words.data(), VU1.Micro + pc, std::max(1u, block.count) * 8) == 0;
@@ -848,7 +854,22 @@ void Arm64VU1Recompiler::Reset()
 }
 
 void Arm64VU1Recompiler::SetStartPC(u32 pc) { VU1.start_pc = pc; }
-void Arm64VU1Recompiler::Step() { CpuIntVU1.Step(); }
+void Arm64VU1Recompiler::Step()
+{
+	const bool pending = PacketXgkickPending();
+	if (!pending)
+	{
+		CpuIntVU1.Step();
+		return;
+	}
+	u32 words[2];
+	std::memcpy(words, VU1.Micro + (VU1.VI[REG_TPC].UL & VU1_PROGMASK), sizeof(words));
+	const bool new_kick = !(words[1] & 0x80000000) && (words[0] & 0xfe0007ff) == 0x800006fc;
+	CpuIntVU1.Step();
+	// A second XGKICK flushes the old request itself and starts a new delay.
+	if (!new_kick && PacketXgkickPending())
+		_vuXGKICKTransfer(0, true);
+}
 void Arm64VU1Recompiler::Clear(u32, u32)
 {
 	// Entries validate their complete source bytes before execution, including
@@ -882,16 +903,24 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		// Pending branch/E-bit delay slots must be retired by the original path.
 		if (VU1.branch || VU1.ebit || (pc & 7))
 		{
-			CpuIntVU1.Step();
+			Step();
 			continue;
 		}
 		Block* block = s_blocks[pc / 8].get();
 		if (!block || !Matches(*block, pc))
 			block = &Compile(pc);
 		if (block->function)
-			block->function(start, cycles);
+		{
+			// microVU transfers after the pair following XGKICK, including its
+			// lower store. Exit after that pair so the complete architectural state
+			// is published before GIF callbacks, even at a cycle-budget boundary.
+			const bool pending = PacketXgkickPending();
+			block->function(start, pending ? VU1.cycle - start + 1 : cycles);
+			if (pending && PacketXgkickPending())
+				_vuXGKICKTransfer(0, true);
+		}
 		else
-			CpuIntVU1.Step();
+			Step();
 	}
 	VU1.VI[REG_TPC].UL >>= 3;
 	VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;

@@ -96,7 +96,9 @@ emits native instructions; the existing x86 recompiler keeps its own behavior.
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
 queues. Unsupported pairs, branches and end-bit delay slots fall back as whole
-instruction pairs. Pipeline retirement and XGKICK retain the reference timing.
+instruction pairs. Pipeline retirement retains the interpreter timing. Normal
+XGKICK follows microVU's delayed whole-packet policy; the interpreter and
+`XgKickHack` keep incremental transfers.
 
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
 pairs can use a dependency calculated during compilation: incoming four-cycle
@@ -144,18 +146,32 @@ The x86 backend provides architectural references beyond instruction selection:
   not merely finding no flag reader in the current block.
 - `x86/microVU_Lower.inl` (`mVU_XGKICK_`) normally transfers a complete packet
   at the scheduled kick. The separate `CHECK_XGKICKHACK` path accumulates cycles
-  and synchronizes at memory writes and block boundaries. ARM64 instead calls
-  the interpreter transfer path during retirement, which can repeatedly copy
-  small chunks and enter GIF arbitration within a native block.
+  and synchronizes at memory writes and block boundaries. ARM64 now shares the
+  whole-packet copy helper with microVU for ordinary native execution. The
+  cycle-based interpreter path remains available for `XgKickHack`.
 
 These are different execution contracts, not just different SIMD encodings.
-ARM64's native blocks and interpreter fallback currently share the same queues
-and XGKICK state. Adopting microVU-style scheduling or transfer batching needs
-an explicit boundary-state design covering cycle budgets, pending flags,
-VU-memory writes, wraparound, GIF arbitration and completion interrupts.
-A wholesale switch to microVU transfer timing cannot be made by replacing its
-transfer call alone. Runtime profiles should distinguish these management costs
-from arithmetic throughput when selecting the next optimization.
+The native packet policy keeps a pending kick in the existing architectural
+XGKICK fields. It completes after the following instruction pair, including its
+lower store, as microVU does. A pending kick limits the next native block call
+to one pair; block exit publishes the complete architectural state before GIF
+callbacks. Interpreter fallback observes the same boundary, while a second
+XGKICK flushes the old request and starts a new delay. A pipeline stall must not
+cause the transfer to move before the following store.
+
+Cycle-budget exits retain an unexecuted delay, and completion clears the busy
+bit and wakes VIF when required. Forced completion does not charge per-qword VU
+cycles in packet mode. Restored incremental packets keep their mode through all tags. Bit 1 of the
+existing enable word marks a native packet request; bit 0 remains the legacy
+enable bit, so old states and pending native delays remain distinguishable. Packet copies use the
+existing GIF arbitration and 16 KiB wrap handling, including buffering when the
+GIF cannot run. Save-state layouts are unchanged. This adopts microVU's ordinary
+transfer policy, not cycle-exact GIF timing; wider game coverage is still needed.
+
+FMAC/FDIV/EFU/IALU queues and arithmetic flags remain interpreter-compatible.
+Moving their scheduling and flag liveness into compilation is a separate change
+which must preserve state at budget exits, fallback and callbacks. Runtime
+profiles should distinguish these management costs from arithmetic throughput.
 
 ## Validation
 

@@ -1697,20 +1697,7 @@ mVUop(mVU_XITOP)
 
 void mVU_XGKICK_(u32 addr)
 {
-	addr = (addr & 0x3ff) * 16;
-	u32 diff = 0x4000 - addr;
-	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, vuRegs[1].Mem, addr, ~0u, true);
-
-	if (size > diff)
-	{
-		//DevCon.WriteLn(Color_Green, "microVU1: XGkick Wrap!");
-		gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&vuRegs[1].Mem[addr], diff, true);
-		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[0], size - diff, true);
-	}
-	else
-	{
-		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[addr], size, true);
-	}
+	gifUnit.TransferXgkickPacket(vuRegs[1].Mem, (addr & 0x3ff) * 16);
 }
 
 void _vuXGKICKTransfermVU(bool flush)

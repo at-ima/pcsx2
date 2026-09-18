@@ -213,3 +213,78 @@ verification, and all 164 unit tests passed. The existing SCPS-15025 save state
 loaded and ran for 20 seconds without early process exit, then shut down with
 exit code 0 (`ee-lookup-state*.log`). No cross-platform or long-gameplay validation
 was performed for this change.
+
+## Root-cause follow-up: native XGKICK execution policy
+
+The ARM64 provider was inheriting the interpreter's incremental GIF transfer
+policy even when running native VU blocks. This differs from ordinary microVU:
+`microVU_Analyze.inl::mVUanalyzeXGkick` schedules the kick with a one-cycle delay,
+and `microVU_Compile.inl` emits the packet transfer after the following pair.
+`microVU_Lower.inl::mVU_XGKICK_` then copies the whole packet. Only its separate
+`XgKickHack` path uses incremental transfers. This is an execution-policy
+mismatch, not a missing NEON arithmetic instruction.
+
+The earlier counter run recorded 124 million transfer calls, 99.8% carrying
+only 16 bytes. Each could cross from generated VU code into C++, publish/reload
+cached vectors, and enter GIF parsing/arbitration. A temporary immediate-flush
+probe measured 35.10 VPS against 29.33 VPS, but changed timing and was not adopted.
+
+The adopted implementation shares the whole-packet copy helper with microVU and
+makes the ARM64 dispatch boundary explicit: a pending kick permits one following
+pair, publishes architectural state, then transfers its packet. This includes
+that pair's lower store even if the pair stalls. Interpreter fallback, consecutive
+kicks, E-bit termination and budget exits follow the same boundary. Completion
+clears the busy bit and wakes VIF; forced packet completion does not charge VU
+cycles per transferred qword. The interpreter and `XgKickHack` retain incremental
+transfers. An already incremental packet finishes through the old path, including gaps
+between tags; the existing enable word distinguishes its mode from a newly
+scheduled native request.
+Save-state layouts are unchanged. This follows microVU's normal timing policy;
+it is not a claim of cycle-exact GIF timing or compatibility with every game.
+
+With the existing setup and frames selected within 850–1100:
+
+| Build | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| Previous implementation A | 29.02 | 34.38 | 3.36 |
+| Previous implementation B | 29.14 | 34.22 | 3.36 |
+| Final packet implementation A | 34.62 | 28.84 | 2.90 |
+| Final packet implementation B | 34.57 | 28.85 | 2.96 |
+
+This is approximately **19% higher throughput**, with CPU time falling from
+34.30 to 28.84 ms/frame. An initial delayed-transfer prototype measured 34.53 VPS;
+review then moved completion after the following pair to handle stalled stores
+correctly. The final rows above use that corrected boundary and the explicit save-state
+mode marker. Logs are `diagnostic-root-packet-{old,mode}-{a,b}.log` in the
+ignored build directory.
+This remains below 60 FPS. The measurements compare this fork before/after;
+they are not a same-revision x64-versus-ARM64 benchmark.
+
+A separate five-second capture at frame 900 collected 2,783 CPU samples after
+the packet-policy change (before the final save-state mode marker): XGKICK/GIF accounted for 1.8%, generated VU pipeline management 27.7%,
+generated VU blocks 23.9%, EE dispatch/generated execution 17.0%, and IOP
+execution/events 9.6%. The prior post-event capture classified 13.0% in XGKICK/GIF.
+These are sample shares from separate captures, not directly measured per-frame
+costs. Sampling slows execution; its FPS is excluded from the table. Artifacts:
+`diagnostic-sample-root-packet-final.sample.txt`, `analyze-root-packet.py`, and
+`root-packet-sample-breakdown.json`.
+
+The remaining large architectural gap is VU pipeline/flag management. ARM64
+still constructs and retires interpreter FMAC queues and computes arithmetic
+flags per pair. microVU carries compiler pipeline state between blocks and
+analyzes flag liveness. Replacing those runtime operations requires materializing
+correct state at budget exits and fallback; widening SIMD or adding threads
+alone does not address that difference.
+
+Final validation: production ARM64 app and core tests rebuilt without diagnostic
+logging; all **176 tests** passed, including 12 new packet-policy tests covering
+store visibility with/without stalls, fallback, pending budgets, consecutive
+kicks, E-bit completion, counter/memory wrap, multiple tags, partial legacy
+transfers, malformed size and interpreter/gamefix behavior. Deep application
+signature verification passed. `Gif_Unit.cpp`, `VUops.cpp` and `x86/microVU.cpp`
+also passed x86_64 syntax checks with the x64 build's `_M_X86=1` definition;
+this is not an x64 runtime or full-link test. Production loaded the existing
+SCPS-15025 save state, ran for 20 seconds without early exit, and shut down with
+exit code 0. No visual or long-gameplay compatibility validation was performed.
+Logs: `root-packet-production-{build,ctest,state,state-console}.log` and
+`root-packet-x64-*.log` under the ignored build directory.

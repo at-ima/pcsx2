@@ -1827,6 +1827,39 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 
 	VUM_LOG("Adding %d cycles, total XGKick cycles to run now %d flush %d enabled %d", cycles, VU1.xgkickcyclecount, flush, VU1.xgkickenable);
 
+#if defined(ARCH_ARM64)
+	// Match microVU's ordinary packet transfer after the XGKICK delay. The
+	// interpreter and XgKickHack retain cycle-by-cycle transfers. A restored
+	// incremental packet must finish through the original path, even between tags.
+	if (VU1.xgkickenable == VURegs::XgkickPacket && CpuVU1 &&
+		!CpuVU1->IsInterpreter && !CHECK_XGKICKHACK && VU1.xgkicksizeremaining == 0)
+	{
+		// The native dispatcher completes this after the following instruction
+		// pair, including its stores. Preparation can stall that pair, so a cycle
+		// threshold here would copy its data too early.
+		if (!flush)
+			return;
+		// This matches microVU's policy but still needs proper testing across games.
+		const u32 size = gifUnit.TransferXgkickPacket(VU1.Mem, VU1.xgkickaddr);
+		VU1.xgkickaddr = (VU1.xgkickaddr + size) & 0x3fff;
+		VU1.xgkickdiff = 0x4000 - VU1.xgkickaddr;
+		VU1.xgkickendpacket = size != 0;
+		VU1.xgkickcyclecount = 0;
+		VU1.xgkickenable = false;
+		VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
+		if (vif1Regs.stat.VGW)
+		{
+			vif1Regs.stat.VGW = false;
+			CPU_INT(DMAC_VIF1, 8);
+		}
+		_vuTestPipes(&VU1);
+		return;
+	}
+	// A configuration/provider change can downgrade a pending packet request.
+	// Once incremental transfer starts, do not reinterpret payload as a new tag.
+	VU1.xgkickenable = 1;
+#endif
+
 	while (VU1.xgkickenable && (flush || VU1.xgkickcyclecount >= 2))
 	{
 		u32 transfersize = 0;
@@ -1917,6 +1950,10 @@ static __ri void _vuXGKICK(VURegs* VU)
 	u32 diff = 0x4000 - addr;
 
 	VU->xgkickenable = true;
+#if defined(ARCH_ARM64)
+	if (CpuVU1 && !CpuVU1->IsInterpreter && !CHECK_XGKICKHACK)
+		VU->xgkickenable = VURegs::XgkickPacket;
+#endif
 	VU->xgkickaddr = addr;
 	VU->xgkickdiff = diff;
 	VU->xgkicksizeremaining = 0;
