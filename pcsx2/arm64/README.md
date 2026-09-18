@@ -185,9 +185,11 @@ The x86 backend provides architectural references beyond instruction selection:
 These are different execution contracts, not just different SIMD encodings.
 The native packet policy keeps a pending kick in the existing architectural
 XGKICK fields. It completes after the following instruction pair, including its
-lower store, as microVU does. A pending kick limits the next native block call
-to one pair; block exit publishes the complete architectural state before GIF
-callbacks. Interpreter fallback observes the same boundary, while a second
+lower store, as microVU does. The next native call carries a pending-packet flag.
+After its first pair commits, a shared private-ABI entry publishes VF/ACC, calls
+the existing packet transfer and reloads the cache. Execution then continues in
+the same native frame if budget remains. Interpreter fallback observes the same
+transfer boundary, while a second
 XGKICK flushes the old request and starts a new delay. A pipeline stall must not
 cause the transfer to move before the following store.
 
@@ -203,8 +205,10 @@ transfer policy, not cycle-exact GIF timing; wider game coverage is still needed
 FMAC/FDIV/EFU/IALU queues and arithmetic flags remain interpreter-compatible.
 For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls.
 After a generic prefix drains incoming entries, it emits known retirement counts
-instead of checking every queue at every pair. An entry guard permanently rejects
-pending XGKICK, irregular incoming FMAC queues and cycle wrap. Pending FDIV,
+instead of checking every queue at every pair. An entry guard rejects pending
+XGKICK, irregular incoming FMAC queues and cycle wrap. After the explicit
+first-pair packet completion, the full guard runs again against the current
+state; the generic prefix still drains incoming work before scheduled execution. Pending FDIV,
 EFU and IALU work initially keeps the generic path, but readiness is checked again
 at the first scheduled pair and at the deferred region boundary. Once these
 queues drain, the validated block may use scheduled execution. ILW issues integer work and clears readiness; IBGTZ waits for matching loads

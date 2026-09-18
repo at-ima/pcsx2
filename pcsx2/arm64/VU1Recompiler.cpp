@@ -51,7 +51,7 @@ namespace
 
 	struct Block
 	{
-		using Function = void (*)(u64 start, u64 cycles);
+		using Function = void (*)(u64 start, u64 cycles, u32 packet_pending);
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<RetirementSchedule, MaxInstructions> schedule{};
 		std::array<u32, MaxInstructions * 2> words{};
@@ -893,8 +893,8 @@ namespace
 	{
 		Label done, loop, ready;
 		a.Mov(w25, 0);
-		// XGKICK may call C++ and change state during the prefix. Never promote
-		// those blocks, even if the pending transfer finishes before the region.
+		// XGKICK may call C++ and change state during the prefix. Promotion
+		// requires a fresh guard after the explicit first-pair packet boundary.
 		a.Ldr(w9, Field(offsetof(VURegs, xgkickenable)));
 		a.Cbnz(w9, &done);
 		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
@@ -1240,6 +1240,7 @@ namespace
 			a.Stp(x23, x24, MemOperand(sp, 32));
 			a.Stp(x25, x26, MemOperand(sp, 48));
 			a.Str(lr, MemOperand(sp, 64));
+			a.Str(w2, MemOperand(sp, 72));
 			if (deferred)
 				a.Stp(x27, x28, MemOperand(sp, 80));
 			if (cache.count)
@@ -1337,6 +1338,23 @@ namespace
 				if (scheduled && ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 					a.And(w25, w25, 1);
 				EmitControlFlow(a, *block, i);
+				if (i == 0)
+				{
+					Label no_packet;
+					a.Ldr(w9, MemOperand(sp, 72));
+					a.Cbz(w9, &no_packet);
+					// Commit the delayed pair before GIF observes VU state, then
+					// continue with the same cache assignment and host frame.
+					a.Str(x26, Field(offsetof(VURegs, cycle)));
+					a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.finish_packet));
+					a.Blr(x16);
+					a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+					// Entry rejected scheduling while the packet was pending. Recheck
+					// after the callback; the generic prefix still drains incoming work.
+					if (scheduled)
+						EmitScheduleGuard(a);
+					a.Bind(&no_packet);
+				}
 				if (integer_branch && i + 1 < block->count)
 				{
 					// The fallthrough path has no pending branch. Publish the common
@@ -1501,19 +1519,16 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			continue;
 		}
 		const bool pending = PacketXgkickPending();
-		const u64 remaining = pending ? 1 : cycles - (VU1.cycle - start);
+		const u64 remaining = cycles - (VU1.cycle - start);
 		Block* block = s_blocks[pc / 8].get();
 		if (!block || !Matches(*block, pc, remaining))
 			block = &Compile(pc);
 		// A restored chained-delay state still requires interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU1.takedelaybranch))
 		{
-			// microVU transfers after the pair following XGKICK, including its
-			// lower store. Exit after that pair so the complete architectural state
-			// is published before GIF callbacks, even at a cycle-budget boundary.
-			block->function(start, pending ? VU1.cycle - start + 1 : cycles);
-			if (pending && PacketXgkickPending())
-				_vuXGKICKTransfer(0, true);
+			// The generated first-pair boundary publishes the delayed transfer,
+			// including its lower store, even when that pair exhausts the budget.
+			block->function(start, cycles, pending);
 		}
 		else
 			Step();

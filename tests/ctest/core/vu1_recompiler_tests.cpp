@@ -1233,7 +1233,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 {
 	using namespace vixl::aarch64;
 	using Wrapper = void (*)(VURegs*, const Arm64VU1::Instruction*, const u32*, const VECTOR*, VECTOR*);
-	std::array<Wrapper, 7> wrappers;
+	std::array<Wrapper, 8> wrappers;
 	u8* const base = SysMemory::GetVU1Rec();
 	HostSys::BeginCodeWrite();
 	const auto pipeline = Arm64VU1::CompilePipeline(base, SysMemory::GetVU1RecEnd() - base, &ObservePipelineCallout);
@@ -1252,7 +1252,10 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 		a.Mov(x25, x4);
 		for (u32 slot = 0; slot < 8; slot++)
 			a.Ldr(VRegister(8 + slot, 128), MemOperand(x3, sizeof(VECTOR) * slot));
-		a.Mov(x16, reinterpret_cast<uintptr_t>(entry == 6 ? pipeline.branch_prepare : pipeline.prepare[entry]));
+		const void* target = entry == 7 ? pipeline.finish_packet : pipeline.branch_prepare;
+		if (entry < pipeline.prepare.size())
+			target = pipeline.prepare[entry];
+		a.Mov(x16, reinterpret_cast<uintptr_t>(target));
 		a.Blr(x16);
 		for (u32 slot = 0; slot < 8; slot++)
 			a.Str(VRegister(8 + slot, 128), MemOperand(x25, sizeof(VECTOR) * slot));
@@ -1281,7 +1284,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 			VU1 = initial;
 			VU1.cycle = 100;
 			VU1.VIBackupCycles = 3;
-			VU1.xgkickenable = 1;
+			VU1.xgkickenable = entry == 7 ? VURegs::XgkickPacket : 1;
 			VU1.xgkicklastcycle = 98;
 			s_transfer_calls = 0;
 			std::array<u32, 8> offsets;
@@ -1296,12 +1299,12 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 			}
 			wrappers[entry](&VU1, &ins, offsets.data(), cached.data(), output.data());
 			ASSERT_EQ(s_transfer_calls, 1u);
-			EXPECT_EQ(s_transfer_cycles, 2);
-			EXPECT_FALSE(s_transfer_flush);
-			EXPECT_EQ(VU1.cycle, 358u);
-			EXPECT_EQ(VU1.VIBackupCycles, 1u);
-			EXPECT_EQ(VU1.VI[REG_TPC].UL, 48u);
-			EXPECT_EQ(VU1.code, ins.upper);
+			EXPECT_EQ(s_transfer_cycles, entry == 7 ? 0 : 2);
+			EXPECT_EQ(s_transfer_flush, entry == 7);
+			EXPECT_EQ(VU1.cycle, entry == 7 ? 357u : 358u);
+			EXPECT_EQ(VU1.VIBackupCycles, entry == 7 ? 3u : 1u);
+			EXPECT_EQ(VU1.VI[REG_TPC].UL, entry == 7 ? initial.VI[REG_TPC].UL : 48u);
+			EXPECT_EQ(VU1.code, entry == 7 ? initial.code : ins.upper);
 			for (u32 slot = 0; slot < count; slot++)
 			{
 				EXPECT_EQ(std::memcmp(&s_seen_vectors[slot], &cached[slot], sizeof(VECTOR)), 0);
@@ -1480,6 +1483,53 @@ TEST_F(VU1PacketXgkickTest, ConditionalConnectionPublishesBeforePendingTransfer)
 	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
 	EXPECT_EQ(std::memcmp(VU1.Mem + 16, &VU1.VF[3], 16), 0);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, NativePacketContinuationMatchesSplitExecution)
+{
+	Tag(0, 2, true);
+	Kick();
+	VU1.VI[2].UL = 1;
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+	for (u32 i = 1; i < 80; i++)
+		Put(i * 8, 0x80000000 | add, 0x3f800000);
+	Put(8, add, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	Put(16, add, 0x02000000 | (15 << 21) | (2 << 16) | (4 << 11));
+	Put(24 * 8, add, 0x5a000000 | (2 << 11) | (48 - 25));
+	Put(72 * 8, 0xc00002ff, 0x3f800000);
+	const VURegs initial = VU1, initial0 = VU0;
+	std::array<u8, VU1_MEMSIZE> memory;
+	std::memcpy(memory.data(), VU1.Mem, memory.size());
+	auto reset = [&]() {
+		VU1 = initial;
+		VU0 = initial0;
+		std::memcpy(VU1.Mem, memory.data(), memory.size());
+		gifUnit.Reset();
+		gifRegs.ctrl.PSE = 1;
+		vif1Regs.stat.VGW = false;
+	};
+	for (u32 budget = 1; budget <= 260; budget++)
+	{
+		SCOPED_TRACE(budget);
+		reset();
+		CpuArm64VU1.Execute(1);
+		const u64 elapsed = VU1.cycle - initial.cycle;
+		if (elapsed < budget)
+			CpuArm64VU1.Execute(budget - elapsed);
+		const VURegs expected = VU1, expected0 = VU0;
+		std::array<u8, VU1_MEMSIZE> expected_memory;
+		std::memcpy(expected_memory.data(), VU1.Mem, expected_memory.size());
+		ASSERT_EQ(gifUnit.gifPath[0].curSize, 48u);
+		std::array<u8, 48> packet;
+		std::memcpy(packet.data(), gifUnit.gifPath[0].buffer, packet.size());
+		reset();
+		CpuArm64VU1.Execute(budget);
+		EXPECT_EQ(std::memcmp(&VU1, &expected, sizeof(VU1)), 0);
+		EXPECT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
+		EXPECT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
+		ASSERT_EQ(gifUnit.gifPath[0].curSize, packet.size());
+		EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, packet.data(), packet.size()), 0);
+	}
 }
 
 TEST_F(VU1PacketXgkickTest, WrapsMemoryAndTransfersAllTagsThroughEop)

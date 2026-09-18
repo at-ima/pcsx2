@@ -32,6 +32,8 @@ namespace Arm64VU1
 		std::array<const void*, 6> prepare{};
 		// Same ABI; also waits for lregs.VIread in the incoming IALU queue.
 		const void* branch_prepare = nullptr;
+		// Same cache ABI; finish a delayed packet after the pair has committed.
+		const void* finish_packet = nullptr;
 		size_t size = 0;
 	};
 

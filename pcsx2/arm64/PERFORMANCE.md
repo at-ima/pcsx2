@@ -862,3 +862,64 @@ passed. The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited norma
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `taken-production-{build,ctest,state,state-console}.log`.
+
+## Continue natively across an incoming XGKICK packet boundary
+
+Follow-up counters resolve the short-entry ambiguity above. In the sampled
+million-call windows, byte PC 4128 had approximately 470,573 calls: every call
+was marked `PacketXgkickPending()`, had an artificially limited one-cycle
+budget, executed one cycle and returned at byte PC 4136. None exhausted the
+original caller budget. Calls at 4136 had roughly three million cycles available
+on average and no pending packet. This is a transfer-publication boundary, not
+frequent exhaustion of EE catch-up budgets. `BaseVUmicroCPU::ExecuteBlock()`
+already uses a minimum of 16 cycles for ordinary catch-up. Diagnostic log:
+`diagnostic-reentry-diag.log`; its instrumented throughput is not a benchmark.
+
+Native entry now receives a pending-packet flag. After the first pair, including
+its lower store and branch retirement, a shared private-ABI helper publishes
+VF/ACC, completes the existing packet transfer, reloads the cache and returns to
+the same generated frame. The cycle budget is checked after this boundary, so
+exact-budget exits still complete the due transfer. The compiler rechecks its
+full scheduling guard after the callback instead of permanently disabling
+scheduled regions because a packet was pending on entry. Architectural queues
+remain materialized at the callback. Source validation uses the actual caller
+budget, since the same entry may now execute the connected destination.
+
+This preserves the established delayed whole-packet policy and GIF arbitration;
+it changes neither the caller's cycle allowance nor the interpreter/gamefix
+transfer behavior. XGKICK issuance itself still uses interpreter fallback, and
+native loop back-edge linking remains future work. In particular this removes
+one redundant entry/exit at a transfer boundary, not the transfer itself.
+
+Tests retain existing store-order, stalls, conditional delay, nested-kick,
+wrap, gamefix and state-restoration coverage. The private-ABI test now exercises
+packet completion with zero, one and eight cached vectors, callback mutations
+and host upper-vector clobbers. A new test compares continuous execution with
+execution split at the packet boundary for every budget from 1 through 260,
+including subsequent stores, scheduled FMAC regions and a conditional edge;
+full VU states, data memory and the copied GIF packet must agree.
+
+Serial measurements against `b13631068`, same frames 850–1100, MTVU disabled:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| reentry-new-a | 53.10 | 18.78 | 3.10 |
+| reentry-old-a | 52.41 | 19.01 | 3.10 |
+| reentry-old-b | 42.76 | 22.47 | 4.09 |
+| reentry-new-b | 51.29 | 19.31 | 3.22 |
+| reentry-old-c | 51.74 | 19.24 | 3.16 |
+| reentry-new-c | 52.35 | 19.01 | 3.17 |
+
+Pairs a and c suggest a small **1.3% and 1.2%** gain respectively. Run old-b has
+substantial variation in both CPU and GS timing; its cause was not established,
+so it is retained here but not treated as evidence of a large speedup. This is
+not a dramatic throughput improvement or proof of video decoding as the main
+cost. All benchmark runs used identical temporary metrics logging and no
+reentry counters. Logs: `diagnostic-reentry-{new-a,old-a,old-b,new-b,old-c,new-c}.log`.
+
+Production validation: counters and metrics logging removed, ARM64 app rebuilt,
+**200 tests** (20 common, 180 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`reentry-production-{build,ctest,state,state-console}.log`.
