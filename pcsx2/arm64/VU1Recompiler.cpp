@@ -615,6 +615,51 @@ namespace
 		a.Strh(w0, Field(VI(dest)));
 	}
 
+	// q28..q31 and x25..x28 are reserved for deferred pipeline state.
+	void EmitPair(MacroAssembler& a, const VectorCache& cache, const Instruction& ins, bool publish_code)
+	{
+		const bool immediate = ins.upper & 0x80000000;
+		const bool discard = !immediate && ins.uregs.VFwrite && ins.uregs.VFwrite == ins.lregs.VFwrite;
+		const u32 backup = !immediate && !discard && ins.uregs.VFwrite &&
+		                           (ins.uregs.VFwrite == ins.lregs.VFread0 || ins.uregs.VFwrite == ins.lregs.VFread1) ?
+		                       ins.uregs.VFwrite :
+		                       0;
+		if (backup)
+			LoadVector(a, cache, q27, backup);
+		if (publish_code)
+			StoreWord(a, ins.upper, offsetof(VURegs, code));
+		EmitUpper(a, cache, ins.upper);
+		if (immediate)
+			StoreWord(a, ins.lower, VI(REG_I));
+		else if (!discard)
+		{
+			if (backup)
+			{
+				LoadVector(a, cache, q26, backup);
+				StoreVector(a, cache, q27, backup);
+			}
+			if (publish_code)
+				StoreWord(a, ins.lower, offsetof(VURegs, code));
+			EmitLower(a, cache, ins.lower);
+			if (backup)
+				StoreVector(a, cache, q26, backup);
+		}
+	}
+
+	void EmitFmacMetadata(MacroAssembler& a, const Instruction& ins)
+	{
+		const bool upper = ins.uregs.pipe == VUPIPE_FMAC;
+		const bool lower = ins.lregs.pipe == VUPIPE_FMAC;
+		const u64 regs = (upper ? ins.uregs.VFwrite : 0) | (u64(lower ? ins.lregs.VFwrite : 0) << 32);
+		const u64 flags = (upper ? ins.uregs.VIwrite : 0) | (lower ? ins.lregs.VIwrite : 0);
+		a.Mov(x9, regs);
+		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, regupper)));
+		a.Mov(x9, flags | (u64(upper ? ins.uregs.VFwxyzw : 0) << 32));
+		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, flagreg)));
+		a.Mov(x9, lower ? ins.lregs.VFwxyzw : 0);
+		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, xyzwlower))); // also clear padding
+	}
+
 	void EmitFinish(MacroAssembler& a, const Instruction& ins)
 	{
 		static_assert(sizeof(fmacPipe) == 48 && offsetof(fmacPipe, reglower) == 4 &&
@@ -632,14 +677,7 @@ namespace
 		a.Mov(w1, sizeof(fmacPipe));
 		a.Madd(x0, x0, x1, x19);
 		a.Add(x0, x0, offsetof(VURegs, fmac));
-		const u64 regs = (upper ? ins.uregs.VFwrite : 0) | (u64(lower ? ins.lregs.VFwrite : 0) << 32);
-		const u64 flags = (upper ? ins.uregs.VIwrite : 0) | (lower ? ins.lregs.VIwrite : 0);
-		a.Mov(x9, regs);
-		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, regupper)));
-		a.Mov(x9, flags | (u64(upper ? ins.uregs.VFwxyzw : 0) << 32));
-		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, flagreg)));
-		a.Mov(x9, lower ? ins.lregs.VFwxyzw : 0);
-		a.Str(x9, MemOperand(x0, offsetof(fmacPipe, xyzwlower))); // also clear padding
+		EmitFmacMetadata(a, ins);
 		a.Str(x26, MemOperand(x0, offsetof(fmacPipe, sCycle)));
 		a.Mov(w9, 4);
 		a.Ldr(w10, Field(offsetof(VURegs, macflag)));
@@ -783,6 +821,24 @@ namespace
 		a.Bind(&done);
 	}
 
+	void EmitBackupCountdown(MacroAssembler& a, u32 cycles)
+	{
+		a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+		if (cycles == 1)
+		{
+			a.Cmp(w9, 0);
+			a.Cset(w10, ne);
+		}
+		else
+		{
+			a.Mov(w10, cycles);
+			a.Cmp(w9, w10);
+			a.Csel(w10, w9, w10, lo);
+		}
+		a.Sub(w9, w9, w10);
+		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+	}
+
 	void EmitScheduledPrepare(MacroAssembler& a, const Block& block, u32 index)
 	{
 		const auto& plan = block.schedule[index];
@@ -818,20 +874,100 @@ namespace
 		}
 		// No division/EFU/IALU or GIF work can arise inside a supported block
 		// admitted by the entry guard. Broader game coverage still needs proper testing.
-		a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
-		if (plan.cycles == 1)
+		EmitBackupCountdown(a, plan.cycles);
+	}
+
+	// A fully budgeted, callback-free suffix can keep its four FMAC flag
+	// snapshots in q28..q31. Queue metadata and cycle stamps are compile-time
+	// facts and only need materializing when returning to the dispatcher.
+	void EmitDeferredSuffix(MacroAssembler& a, const Block& block, u32 first)
+	{
+		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
+					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
+		a.Ldr(w27, Field(offsetof(VURegs, fmacwritepos)));
+		a.Ldr(w25, Field(VI(REG_STATUS_FLAG)));
+		a.Ldr(w28, Field(VI(REG_MAC_FLAG)));
+		auto slot_address = [&](u32 relative) {
+			a.Add(w0, w27, relative & 3);
+			a.And(w0, w0, 3);
+			a.Mov(w1, sizeof(fmacPipe));
+			a.Madd(x0, x0, x1, x19);
+			a.Add(x0, x0, offsetof(VURegs, fmac));
+		};
+		for (u32 slot = 0; slot < 4; slot++)
 		{
-			a.Cmp(w9, 0);
-			a.Cset(w10, ne);
+			slot_address(slot);
+			a.Ldr(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
+			a.Ldr(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
+			a.Ins(VRegister(28 + slot, 128).V4S(), 2, w9);
 		}
-		else
+		struct Slot
 		{
-			a.Mov(w10, plan.cycles);
-			a.Cmp(w9, w10);
-			a.Csel(w10, w9, w10, lo);
+			int writer = -1;
+			u32 issue_cycle = 0;
+		};
+		std::array<Slot, 4> slots{};
+		u32 issued = 0, elapsed = 0;
+		for (u32 i = first; i < block.count; i++)
+		{
+			const auto& plan = block.schedule[i];
+			const auto& ins = block.instructions[i];
+			elapsed += plan.cycles;
+			a.Add(x26, x26, plan.cycles);
+			for (u32 j = 0; j < plan.retired; j++)
+			{
+				const u32 slot = (issued - plan.remaining - plan.retired + j) & 3;
+				const VRegister flags(28 + slot, 128);
+				a.Umov(w9, flags.V4S(), 1);
+				a.And(w9, w9, 15);
+				a.And(w25, w25, 0xff0);
+				a.Orr(w25, w25, w9);
+				a.Orr(w25, w25, Operand(w9, LSL, 6));
+				if (j + 1 == plan.retired)
+					a.Umov(w28, flags.V4S(), 0);
+			}
+			EmitBackupCountdown(a, plan.cycles);
+			EmitPair(a, block.cache, ins, false);
+			if (HasFmac(ins))
+			{
+				const u32 slot = issued++ & 3;
+				// Only the first three lanes are used; the fourth is ignored.
+				a.Ldr(VRegister(28 + slot, 128), Field(offsetof(VURegs, macflag)));
+				slots[slot].writer = i;
+				slots[slot].issue_cycle = elapsed;
+			}
 		}
-		a.Sub(w9, w9, w10);
-		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+		// Restore even inactive overwritten slots: save states and differential
+		// execution observe the complete architectural queue, not just live entries.
+		for (u32 slot = 0; slot < 4; slot++)
+		{
+			if (slots[slot].writer < 0)
+				continue;
+			slot_address(slot);
+			EmitFmacMetadata(a, block.instructions[slots[slot].writer]);
+			a.Sub(x9, x26, elapsed - slots[slot].issue_cycle);
+			a.Str(x9, MemOperand(x0, offsetof(fmacPipe, sCycle)));
+			a.Mov(w9, 4);
+			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, Cycle)));
+			a.Str(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
+			a.Umov(w9, VRegister(28 + slot, 128).V4S(), 2);
+			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
+		}
+		const auto& last = block.instructions[block.count - 1];
+		const u32 live = block.schedule[block.count - 1].remaining + HasFmac(last);
+		a.Add(w9, w27, issued & 3);
+		a.And(w9, w9, 3);
+		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
+		a.Sub(w9, w9, live);
+		a.And(w9, w9, 3);
+		a.Str(w9, Field(offsetof(VURegs, fmacreadpos)));
+		StoreWord(a, live, offsetof(VURegs, fmaccount));
+		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
+		a.Str(w28, Field(VI(REG_MAC_FLAG)));
+		StoreWord(a, last.pc + 8, VI(REG_TPC));
+		const bool upper_code = (last.upper & 0x80000000) ||
+		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
+		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
 	}
 
 	Block& Compile(u32 pc)
@@ -908,16 +1044,23 @@ namespace
 			}
 			HostSys::BeginCodeWrite();
 			MacroAssembler a(s_write, s_end - s_write);
-			Label exit;
-			const int frame_size = cache.count ? 144 : 80;
+			u32 suffix_start = block->count, suffix_cycles = 0;
+			while (suffix_start > 7 && block->schedule[suffix_start - 1].cycles)
+				suffix_cycles += block->schedule[--suffix_start].cycles;
+			const bool deferred = block->count - suffix_start >= 8;
+			Label exit, deferred_suffix;
+			const int saved_size = deferred ? 96 : 80;
+			const int frame_size = saved_size + (cache.count ? 64 : 0);
 			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
 			a.Stp(x23, x24, MemOperand(sp, 32));
 			a.Stp(x25, x26, MemOperand(sp, 48));
 			a.Str(lr, MemOperand(sp, 64));
+			if (deferred)
+				a.Stp(x27, x28, MemOperand(sp, 80));
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
-					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 80 + slot * 8));
+					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			u32 scheduled_pairs = 0;
 			for (u32 i = 7; i < block->count; i++)
@@ -949,6 +1092,16 @@ namespace
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
+				if (deferred && i == suffix_start)
+				{
+					Label partial;
+					a.Cbz(w25, &partial);
+					a.Sub(x9, x26, x20);
+					a.Sub(x9, x21, x9);
+					a.Cmp(x9, suffix_cycles);
+					a.B(hs, &deferred_suffix);
+					a.Bind(&partial);
+				}
 				Label generic_prepare, prepared;
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair)
@@ -975,34 +1128,17 @@ namespace
 				if (schedule_pair)
 					a.Bind(&prepared);
 				cycle_dirty = schedule_pair;
-				const bool immediate = ins.upper & 0x80000000;
-				const bool discard = !immediate && ins.uregs.VFwrite && ins.uregs.VFwrite == ins.lregs.VFwrite;
-				const u32 backup = !immediate && !discard && ins.uregs.VFwrite &&
-				                           (ins.uregs.VFwrite == ins.lregs.VFread0 || ins.uregs.VFwrite == ins.lregs.VFread1) ?
-				                       ins.uregs.VFwrite :
-				                       0;
-				if (backup)
-					LoadVector(a, cache, q27, backup);
-				StoreWord(a, ins.upper, offsetof(VURegs, code));
-				EmitUpper(a, cache, ins.upper);
-				if (immediate)
-					StoreWord(a, ins.lower, VI(REG_I));
-				else if (!discard)
-				{
-					if (backup)
-					{
-						LoadVector(a, cache, q26, backup);
-						StoreVector(a, cache, q27, backup);
-					}
-					StoreWord(a, ins.lower, offsetof(VURegs, code));
-					EmitLower(a, cache, ins.lower);
-					if (backup)
-						StoreVector(a, cache, q26, backup);
-				}
+				EmitPair(a, cache, ins, true);
 				EmitFinish(a, ins);
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
 				a.B(hs, &exit);
+			}
+			if (deferred)
+			{
+				a.B(&exit);
+				a.Bind(&deferred_suffix);
+				EmitDeferredSuffix(a, *block, suffix_start);
 			}
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
@@ -1010,7 +1146,9 @@ namespace
 				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			if (cache.count)
 				for (u32 slot = 0; slot < 8; slot += 2)
-					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 80 + slot * 8));
+					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
+			if (deferred)
+				a.Ldp(x27, x28, MemOperand(sp, 80));
 			a.Ldr(lr, MemOperand(sp, 64));
 			a.Ldp(x25, x26, MemOperand(sp, 48));
 			a.Ldp(x23, x24, MemOperand(sp, 32));

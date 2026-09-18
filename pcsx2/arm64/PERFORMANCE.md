@@ -420,3 +420,67 @@ pipeline callback ABI tests. The ARM64 app rebuilt, passed deep signature
 verification, loaded the SCPS-15025 state, ran for 20 seconds without early exit,
 and shut down with exit code 0. No visual, long-gameplay or x64 runtime test was
 performed. Logs: `lowlevel-production-{build,ctest,state,state-console}.log`.
+
+## Defer architectural queue construction within a complete suffix
+
+The per-pair queue representation was the next design constraint to remove.
+Rather than making each 48-byte record cheaper to write, the compiler now emits
+a separate path for a contiguous scheduled suffix of at least eight pairs.
+The entry guard establishes ordinary FMAC state with no pending FDIV, EFU,
+IALU or XGKICK work. After the generic prefix, one exact budget check determines
+whether the entire suffix can run without returning. Otherwise execution keeps
+the existing per-pair path and its precise partial-budget exits.
+
+On the complete path, q28..q31 retain MAC/status/clip snapshots for four logical
+ring slots. Retired architectural STATUS/MAC values remain in GPRs. Static
+producer fields and issue-cycle offsets are compiler state. At the end, the
+compiler emits each overwritten slot's final representation once, including
+inactive entries and cleared padding. Untouched slots retain their old bytes.
+Queue indices/count, TPC, code, flags and cycles are published before leaving;
+the common epilogue publishes VF/ACC. Arithmetic, lower memory accesses and VI
+backup timing retain their original order. No callback, branch, E/D/T bit or
+unsupported pair can occur in the deferred region. The general path shares the
+same pair emitter and queue metadata encoder.
+
+This removes repeated queue stores and dependent retirement loads, plus the
+per-pair budget/TPC/code updates, rather than only optimizing their instruction
+selection. It is the first deferred pipeline representation inside a block;
+blocks still publish full state to one another. It does not introduce threads,
+change guest timing or remove observable flags.
+
+Serial new/old/old/new runs, same movie frames 850–1100, baseline `bd53fcfbd`:
+
+| Build | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| Deferred suffix A | 40.93 | 24.36 | 2.92 |
+| Previous A | 36.50 | 27.36 | 3.00 |
+| Previous B | 36.73 | 27.18 | 3.00 |
+| Deferred suffix B | 40.88 | 24.38 | 2.92 |
+
+Mean throughput is **36.62 → 40.91 VPS, approximately 11.7% higher**; CPU time
+falls from 27.27 to 24.37 ms/frame. These are unsampled measurements with MTVU
+disabled. This is a larger gain than the earlier cycle-register change, but
+still below 60 FPS and not a same-revision Rosetta comparison. The second path
+increases generated code size, so broader workloads could have different gains.
+Logs: `diagnostic-deferred-{new,old}-{a,b}.log` in the ignored build directory.
+
+Two added differential tests cover all ring positions, zero-to-three overwritten
+slots, longer wraparound, mixed flag-preserving operations, paired old-value
+reads, VI backup, stalled chains, E-bit fallback and budgets on either side of
+completion. A deterministic set of 128 mixed 64-pair programs covers partial
+execution/resume, multiple blocks, arithmetic/conversions and data loads/stores.
+Comparisons include complete VU state, all queue bytes, VU0/VIF state and data
+memory; the tests have not relaxed checks for inactive pipeline entries.
+
+Further major work remains at block boundaries: explicit incoming/outgoing
+pipeline state, native control flow and linking could avoid repeatedly draining
+or publishing the queue and restarting the generic prefix. This should build on
+the materialization contract above, with separate validation for branch delays,
+callbacks, save states and budget exits, rather than simply omitting state writes.
+
+Final validation: the production ARM64 app and test binaries rebuilt without
+measurement logging; all **180 tests** (20 common, 160 core) passed. Deep signature
+verification passed. The existing SCPS-15025 state loaded, ran for 20 seconds
+without early exit, and shut down with exit code 0. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`deferred-production-{build,ctest,state,state-console}.log`.

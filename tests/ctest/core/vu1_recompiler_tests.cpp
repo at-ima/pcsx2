@@ -493,6 +493,107 @@ TEST_F(VU1RecompilerTest, ScheduledRetirementPreservesEveryBudgetPrefix)
 	}
 }
 
+TEST_F(VU1RecompilerTest, DeferredSuffixMaterializesCompleteQueues)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 length : {15u, 24u, 32u})
+	{
+		for (u32 pattern = 0; pattern < 8; pattern++)
+		{
+			for (u32 i = 0; i < length; i++)
+			{
+				u32 upper = 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | ((3 + i % 5) << 6) | 0x28;
+				u32 lower = 0x3f800000;
+				if (pattern <= 3 && i + pattern < length)
+					upper = 0x800002ff; // Zero to three writes: retain untouched inactive slots.
+				if (pattern == 4 && i % 3 == 0)
+					upper = 0x800002ff;
+				if (pattern == 5)
+					upper = 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+				if (pattern == 6)
+				{
+					upper &= ~0x80000000u;
+					lower = 0x8000033c | (15 << 21) | (9 << 16) | ((3 + i % 5) << 11); // Paired old-value read.
+				}
+				if (pattern == 7)
+				{
+					upper = (upper & ~0x8000003fu) | (i % 2 ? 0x2b : 0x2c); // MAX/SUB flag preservation.
+					lower = 0x10000003 | (2 << 16) | (1 << 11);
+				}
+				Put(i * 8, upper, lower);
+			}
+			Put(length * 8, 0xc00002ff, 0x3f800000); // Stop after a real E-bit delay pair.
+			Put((length + 1) * 8, 0x800002ff, 0x3f800000);
+			for (u32 ring = 0; ring < 4; ring++)
+			{
+				for (u32 budget : {length - 1, length, length + 1, 4 * length - 1, 4 * length, 4 * length + 1})
+				{
+					SCOPED_TRACE(testing::Message() << "length=" << length << " pattern=" << pattern << " ring=" << ring << " budget=" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 0xffffffffULL - 16;
+					VU1.fmacreadpos = VU1.fmacwritepos = ring;
+					VU1.fmaccount = 0;
+					std::memset(VU1.fmac, 0xa5, sizeof(VU1.fmac));
+					VU1.VI[REG_STATUS_FLAG].UL = 0xfedcba98;
+					VU1.VI[REG_MAC_FLAG].UL = 0x12345678;
+					VU1.macflag = 0xa5a51234;
+					VU1.statusflag = 0x65432109;
+					VU1.clipflag = 0x89abcdef;
+					VU1.VIBackupCycles = 3;
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, DeferredSuffixMixedInstructionsAndResume)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 ops[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18,
+		0x1c, 0x1d, 0x20, 0x21, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2f,
+		0x13c, 0x17d, 0x1fd, 0x2bc, 0x2bd, 0x2ff};
+	constexpr u32 lowers[] = {0x8000033c, 0x8000033d, 0x800003fc, 0x800003fd,
+		0x10000003, 0x12000003, 0x80000030, 0x80000034, 0, 0x02000000};
+	u32 random = 0x31415926;
+	auto next = [&]() { random = random * 1664525 + 1013904223; return random >> 16; };
+	for (u32 seed = 0; seed < 128; seed++)
+	{
+		SCOPED_TRACE(seed);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 100;
+		VU1.fmacreadpos = VU1.fmacwritepos = seed & 3;
+		std::memset(VU1.Mem, 0x3f, VU1_MEMSIZE);
+		for (u32 i = 0; i < 64; i++)
+		{
+			const u32 op = ops[next() % std::size(ops)];
+			const u32 dest = (op & 63) >= 60 ? 0 : (next() % 10) << 6;
+			u32 upper = (next() % 16) << 21 | (next() % 10) << 16 | (next() % 10) << 11 | dest | op;
+			u32 lower = (next() % 16) << 21 | (next() % 10) << 16 | (next() % 10) << 11 | lowers[next() % std::size(lowers)];
+			if (next() & 1)
+			{
+				upper |= 0x80000000;
+				lower = 0x3f800000;
+			}
+			Put(i * 8, upper, lower);
+		}
+		Put(64 * 8, 0xc00002ff, 0x3f800000);
+		Put(65 * 8, 0x800002ff, 0x3f800000);
+		// Partial execution followed by a full suffix, then continuation into
+		// another block and the E-bit fallback must expose identical state.
+		for (u32 budget : {1u, 7u, 31u, 128u, 128u})
+		{
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ScheduledRetirementFallsBackForSpecialAndIncomingState)
 {
 	const VURegs initial = VU1;

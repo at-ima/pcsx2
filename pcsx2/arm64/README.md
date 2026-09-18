@@ -138,8 +138,9 @@ The x86 backend provides architectural references beyond instruction selection:
 
 - `x86/microVU_Analyze.inl` and `microVU_Compile.inl` (`mVUincCycles`,
   `mVUsetCycles`) compute lane dependencies and stalls during compilation.
-  `microRegInfo` carries pipeline state between compiled blocks. ARM64 still
-  retires architectural pipeline queues at runtime for each instruction pair.
+  `microRegInfo` carries pipeline state between compiled blocks. ARM64 now
+  defers queue materialization inside fully budgeted suffixes, but still
+  publishes complete architectural state at every block boundary.
 - `x86/microVU_Flags.inl` (`mVUsetFlags`) selects flag instances and necessary
   updates, including flags needed by following blocks. Eliminating an ARM64
   update requires preserving the state visible at budget exits and fallback,
@@ -173,8 +174,8 @@ For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls
 After a generic prefix drains incoming entries, it emits known retirement counts
 instead of checking every queue at every pair. An entry guard rejects pending
 special pipelines or XGKICK, irregular incoming queues and cycle wrap. Unknown
-timing keeps the generic preparation path. Every queue entry remains materialized,
-including at budget exits; sticky flags include all retired entries even when
+timing keeps the generic preparation path. Every queue entry is materialized
+at observable exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored. This is a limited first step
 toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
 The generated block retains the current cycle in x26. Scheduled preparation
@@ -183,6 +184,23 @@ reloading architectural memory. Before generic preparation after a scheduled
 pair, and at every block exit, it is published to VURegs. Generic preparation
 reloads it afterwards so callback changes remain visible. x26 is saved/restored
 by the block and preserved by the private pipeline ABI.
+A contiguous scheduled suffix of at least eight pairs has a second execution
+path. It checks the whole remaining cycle budget once, after the generic prefix.
+Only the validated, callback-free case can enter; partial budgets and pending
+special pipelines keep the existing per-pair path. q28..q31 retain the four
+FMAC flag snapshots relative to the entry write position. x25/x28 retain retired
+STATUS/MAC values. Producer metadata and issue-cycle offsets are compiler facts,
+so the path restores only each slot's last writer at exit, including overwritten
+inactive entries and padding. It then publishes queue indices/count, flags,
+TPC, code and cycles. VF/ACC publication uses the common exit. VI backup timing
+and all arithmetic execute in their original order.
+
+This removes per-pair queue construction, retirement memory traffic and budget/
+TPC/code updates from that suffix. It shares pair emission and metadata encoding
+with the general path. EmitPair must preserve q28..q31 and x25..x28. There are no
+C++ callbacks or unsupported instructions inside the suffix; expanding supported
+operations must preserve that invariant. Wider gameplay still needs proper testing.
+This is an internal block-state contract, not yet cross-block linking or MTVU.
 Runtime profiles should distinguish these management costs from arithmetic throughput.
 
 ## Validation
