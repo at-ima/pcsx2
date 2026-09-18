@@ -122,6 +122,58 @@ namespace
 	};
 } // namespace
 
+TEST_F(VU1RecompilerTest, BlockBoundaryPreservesHostVectorRegisters)
+{
+	using namespace vixl::aarch64;
+	using Wrapper = void (*)(u64*, u32);
+	u8* const base = SysMemory::GetVU0Rec();
+	HostSys::BeginCodeWrite();
+	MacroAssembler a(base, 4096);
+	a.Stp(x19, lr, MemOperand(sp, -80, PreIndex));
+	for (u32 slot = 0; slot < 8; slot += 2)
+		a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 16 + slot * 8));
+	a.Mov(x19, x0);
+	for (u32 slot = 0; slot < 8; slot++)
+	{
+		a.Mov(x9, 0x0123456789abcde0ULL + slot);
+		a.Fmov(VRegister(8 + slot, 64), x9);
+	}
+	a.Mov(w0, w1);
+	a.Mov(x16, reinterpret_cast<uintptr_t>(+[](u32 cycles) { CpuArm64VU1.Execute(cycles); }));
+	a.Blr(x16);
+	for (u32 slot = 0; slot < 8; slot++)
+		a.Str(VRegister(8 + slot, 64), MemOperand(x19, slot * 8));
+	for (u32 slot = 0; slot < 8; slot += 2)
+		a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 16 + slot * 8));
+	a.Ldp(x19, lr, MemOperand(sp, 80, PostIndex));
+	a.Ret();
+	a.FinalizeCode();
+	HostSys::EndCodeWrite();
+	HostSys::FlushInstructionCache(base, static_cast<u32>(a.GetSizeOfCodeGenerated()));
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 count = 0; count <= 8; count++)
+	{
+		for (u32 i = 0; i < 16; i++)
+		{
+			const u32 reg = count ? 1 + i % count : 0;
+			Put(i * 8, count ? 0x80000000 | (15 << 21) | (reg << 16) | (reg << 11) | (reg << 6) | 0x28 : 0x800002ff,
+				0x3f800000);
+		}
+		Put(128, 0xc00002ff, 0x3f800000);
+		Put(136, 0x800002ff, 0x3f800000);
+		for (u32 budget : {1u, 16u, 64u})
+		{
+			SCOPED_TRACE(testing::Message() << "count=" << count << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			std::array<u64, 8> output{};
+			reinterpret_cast<Wrapper>(base)(output.data(), budget);
+			for (u32 slot = 0; slot < 8; slot++)
+				EXPECT_EQ(output[slot], 0x0123456789abcde0ULL + slot);
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ArithmeticTransfersAndIntegerOperations)
 {
 	constexpr u32 upper[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -166,6 +218,100 @@ TEST_F(VU1RecompilerTest, BranchEndBitAndSpecialInstructionFallback)
 	Put(40, 0x800002ff, 0x3f800000); // E-bit delay slot
 	Compare(100);
 	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x100, 0u);
+}
+
+TEST_F(VU1RecompilerTest, TerminalBranchPreservesEveryBudgetPrefix)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 length : {1u, 8u, 24u, 256u})
+	{
+		for (s32 displacement : {-1024, -2, -1, 0, 3, 1023})
+		{
+			for (u32 i = 0; i < length + 2; i++)
+				Put(i * 8, 0x800002ff, 0x3f800000);
+			Put((length - 1) * 8, (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28,
+				0x40000000 | (static_cast<u32>(displacement) & 0x7ff));
+			for (u32 budget : {length, length + 1, length + 2, length + 8})
+			{
+				SCOPED_TRACE(testing::Message() << "length=" << length << " displacement=" << displacement << " budget=" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, BranchDelayPreservesPipelineAndChainedTargets)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 variant = 0; variant < 7; variant++)
+	{
+		for (u32 budget : {1u, 2u, 3u, 4u, 8u, 32u})
+		{
+			for (bool wrap : {false, true})
+			{
+				SCOPED_TRACE(testing::Message() << "variant=" << variant << " budget=" << budget << " wrap=" << wrap);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = wrap ? ~u64(0) - 2 : 100;
+				VU1.branch = variant == 5 ? 2 : 1;
+				VU1.branchpc = 64;
+				VU1.takedelaybranch = variant == 3;
+				VU1.delaybranchpc = 96;
+				VU1.VIBackupCycles = 2;
+				VU1.ebit = variant == 6 ? 1 : 0;
+				Put(0, (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28,
+					0x02000000 | (15 << 21) | (3 << 11) | (2 << 16)); // SQ observes old VF3.
+				Put(8, 0x800002ff, 0x40000000);
+				Put(64, 0x800002ff, 0x40400000);
+				Put(96, 0xc00002ff, 0x3f800000);
+				Put(104, 0x800002ff, 0x3f800000);
+				if (variant == 1 || variant == 2)
+				{
+					VU1.fmaccount = 1;
+					VU1.fmacwritepos = 1;
+					VU1.fmac[0].sCycle = VU1.cycle;
+					VU1.fmac[0].Cycle = 4;
+					VU1.fmac[0].regupper = 1;
+					VU1.fmac[0].xyzwupper = 15;
+				}
+				if (variant == 2)
+				{
+					VU1.fdiv.enable = 1;
+					VU1.fdiv.sCycle = VU1.cycle;
+					VU1.fdiv.Cycle = 2;
+					VU1.fdiv.reg.UL = 0x40000000;
+				}
+				if (variant == 4)
+					Put(0, 0x2ff, 0x40000002); // Branch in delay slot must retain fallback.
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, BranchDelayValidationDoesNotHideEditedTail)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 pass = 0; pass < 4; pass++)
+	{
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.branch = pass == 3 ? 0 : 1;
+		VU1.branchpc = 64;
+		if (pass == 1)
+			Put(8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x40000000);
+		if (pass == 2)
+			Put(0, 0x800002ff, 0x40400000); // The executed first pair must always be checked.
+		Compare(pass == 3 ? 16 : 1);
+		if (HasFatalFailure())
+			return;
+	}
 }
 
 TEST_F(VU1RecompilerTest, DetectsOverwrittenCodeAndMemoryRestoration)
@@ -976,6 +1122,22 @@ TEST_F(VU1PacketXgkickTest, DelaysThroughNextInstructionAndObservesItsStore)
 	EXPECT_NE(cpuRegs.interrupt & (1 << DMAC_VIF1), 0u);
 	EXPECT_EQ(gifUnit.gifPath[0].curSize, 48u);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, VU1.Mem, 48), 0);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, BranchDelayStoresBeforePendingPacketTransfer)
+{
+	Tag(0, 2, true);
+	Kick();
+	VU1.VI[2].UL = 1;
+	VU1.branch = 1;
+	VU1.branchpc = 64;
+	Put(8, 0x2ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.branch, 0u);
+	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
+	EXPECT_FALSE(VU1.xgkickenable);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 48u);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
 }
 

@@ -1077,7 +1077,10 @@ namespace
 			const bool deferred = block->count - suffix_start >= 8;
 			Label exit, deferred_suffix;
 			const int saved_size = deferred ? 96 : 80;
-			const int frame_size = saved_size + (cache.count ? 64 : 0);
+			// Save only the d8..d15 registers this block modifies.
+			// Round paired saves up to retain 16-byte stack alignment.
+			const u32 saved_vectors = (cache.count + 1) & ~1u;
+			const int frame_size = saved_size + saved_vectors * 8;
 			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
 			a.Stp(x23, x24, MemOperand(sp, 32));
@@ -1086,7 +1089,7 @@ namespace
 			if (deferred)
 				a.Stp(x27, x28, MemOperand(sp, 80));
 			if (cache.count)
-				for (u32 slot = 0; slot < 8; slot += 2)
+				for (u32 slot = 0; slot < saved_vectors; slot += 2)
 					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			u32 scheduled_pairs = 0;
@@ -1178,7 +1181,7 @@ namespace
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			if (cache.count)
-				for (u32 slot = 0; slot < 8; slot += 2)
+				for (u32 slot = 0; slot < saved_vectors; slot += 2)
 					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			if (deferred)
 				a.Ldp(x27, x28, MemOperand(sp, 80));

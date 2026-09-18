@@ -113,7 +113,9 @@ a copy of the retirement routine. Native retirement omits interpreter trace logs
 Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
 The assignment is fixed for the block, including every budget exit. Entry loads
 these values; exit publishes them before returning to the shared driver or
-interpreter. The generated preparation routine preserves full cached vectors
+interpreter. Host d8..d15 preservation saves only the used cache registers,
+rounded up to an even count for paired stores and stack alignment. Unused host
+registers remain untouched; guest VF/ACC publication is unchanged. The generated preparation routine preserves full cached vectors
 through its private ABI. Actual XGKICK transfers publish the cache, call the
 original C++ transfer routine, then reload it; this also handles AAPCS64's
 caller-clobbered upper vector halves. Credit-only XGKICK ticks stay native.

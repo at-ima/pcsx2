@@ -608,3 +608,63 @@ SCPS-15025 state loaded SPU2/GS and ran for 20 seconds with normal shutdown.
 Logs: `limits-production-{build,ctest,state,state-console}.log`. The existing
 missing optional patches.zip warning remains; visual correctness, long gameplay
 and x64 execution were not validated in this experiment.
+
+
+## Boundary investigation after the 256-pair change
+
+A fresh 5-second CPU-thread sample contained 3,253 samples. Call-tree attribution
+estimated VU dispatcher work at 4.55% and interpreter fallback at 5.90%, with
+substantial EE/IOP work remaining. These are statistical software samples, not
+hardware stall or cache-miss measurements. The instrumented sample run is not a
+throughput result. Artifacts: `diagnostic-sample-boundaries.{sample.txt,log}` and
+`boundary-sample-breakdown.json` in the ignored build directory.
+
+Separate whole-boot counters recorded 12,961,762 native block calls, of which
+9,819,570 (75.8%) contained fewer than 15 pairs. Only 3,338,799 entered with all
+FMAC/FDIV/EFU/IALU/XGKICK queues empty. Thus the 256-pair maximum does not describe
+most boundary visits. This is a call count, not the fraction of CPU time or the
+movie-only interval. See `diagnostic-boundary-stats.log`.
+
+A prototype executed supported branch delay pairs natively, limited validation
+to the one pair that could execute, skipped unused schedule guards at forced
+single-pair entries, and added terminal unconditional B. Differential tests
+passed, but throughput did not improve convincingly: individual delay-only
+variants measured 51.05, 50.57 and 51.03 VPS; the complete B/delay prototype
+measured 50.26 and 49.62 VPS, versus interspersed baseline runs at 50.86 and
+50.55 VPS. The prototype was removed rather than adding control-flow complexity
+without a measured benefit. The tests remain as coverage for future branch work.
+Logs: `diagnostic-boundary-{delay-a,prefix-a,single-a,branch-a,branch-b,old-a,old-b}.log`.
+
+The x64 reference in `microVU_Branch.inl::normBranchCompile` searches for a target
+block with matching pipeline state and jumps directly to its native entry.
+Simply making an isolated delay pair native retains the ARM64 dispatch, register
+publication/reload and generic preparation boundaries. Full native control flow
+will need an explicit compatible entry/exit state contract; the measurements do
+not justify treating isolated native branch support as equivalent to linking.
+
+The selected smaller change removes unused host SIMD saves at existing native
+boundaries. Previously every block using any cached vector register saved and
+restored all eight d8..d15 registers. It now saves the used count rounded up to
+an even number for paired stores and 16-byte stack alignment. For one or two
+cached registers, the SIMD save area shrinks from 64 to 16 bytes, removing three
+STP/LDP pairs per invocation. Guest VF/ACC publication and pipeline timing are
+unchanged. An executable ABI test checks all eight host registers with zero to
+eight cached vectors, partial exits, complete execution and E-bit fallback.
+
+Serial save-reduction / baseline / save-reduction confirmation measured
+**50.65 / 50.55 / 50.56 VPS** (CPU **19.70 / 19.72 / 19.69 ms/frame**).
+There is **no demonstrated material throughput gain** in this movie. The change
+is retained for its smaller, directly verifiable boundary save/restore work and
+unchanged state/ABI behavior, not as a claimed FPS improvement. Logs:
+`diagnostic-boundary-save-{a,old,b}.log`. All temporary counters and metrics
+logging were removed. The next substantial optimization needs compatible
+pipeline/register state across native edges and precise publication at budget,
+callback, interpreter and save-state boundaries. EE and IOP costs also remain;
+M5 single-core capability alone cannot attribute the remaining slowdown to VU1.
+
+Final production validation: ARM64 app and test binaries rebuilt without
+instrumentation; **187 tests** (20 common, 167 core) passed. Deep signature
+verification passed. The SCPS-15025 save state loaded SPU2/GS, ran for 20 seconds
+and shut down with exit code 0. The existing optional patches.zip warning remains.
+No visual, long-gameplay or x64 runtime validation was performed. Logs:
+`boundary-production-{build,ctest,state,state-console}.log`.
