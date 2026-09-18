@@ -668,3 +668,76 @@ verification passed. The SCPS-15025 save state loaded SPU2/GS, ran for 20 second
 and shut down with exit code 0. The existing optional patches.zip warning remains.
 No visual, long-gameplay or x64 runtime validation was performed. Logs:
 `boundary-production-{build,ctest,state,state-console}.log`.
+
+
+## Connect static unconditional branches within a bounded native trace
+
+The first connection stage follows unconditional B through a supported delay
+pair into its destination while decoding a single native trace. Destination code
+is laid out next in the host instruction stream. All regions share the vector
+cache assignment and producer-age analysis, so internal edges need no VF/ACC
+publication/reload, host ABI exit/re-entry, or new generic scheduling prefix.
+The deferred queue representation can also span these edges when its existing
+readiness and whole-suffix budget conditions hold.
+
+Each instruction records its architectural successor and whether it completes a
+branch delay. Both ordinary and deferred emission update branch/TPC state, so
+partial budgets can return after B with a pending delay or after the delay with
+the destination selected. A resumed pending delay uses the existing interpreter
+path. Conditional/indirect branches, nested delay branches, E/D/T control and
+unsupported instructions retain their previous handling. Restored chained-delay
+state conservatively avoids traces containing B. An already-visited PC ends the
+trace; native loop back-edge linking and independent compiled-target patching
+are not implemented yet. This bounds compilation and avoids introducing mutable
+cross-cache code pointers in the first stage.
+
+Source checking now records contiguous ranges in execution order and validates
+all of them before entry. It covers destination changes and branch retargeting,
+not only the bytes adjacent to the original PC. The same 256-pair code-size and
+cycle-wrap limits apply. New tests compare every budget from 1 through 192 on a
+stalled, non-contiguous graph, including target edits, retargeting, nested branch
+fallback and micro-memory wrapping. All architectural queue bytes, VF/VI/ACC,
+VU0/VIF state and memory continue to be compared against the interpreter.
+
+
+Serial baseline/new/new/baseline runs on frames 850–1100, MTVU disabled:
+
+| Build | VPS | CPU ms/frame |
+| --- | ---: | ---: |
+| Baseline A (`10091df92`) | 50.88 | 19.61 |
+| Connected trace A | 50.98 | 19.55 |
+| Connected trace B | 50.88 | 19.59 |
+| Baseline B | 50.18 | 19.87 |
+
+This small difference is **not evidence of a movie speedup**. A separate
+diagnostic run recorded 12,961,762 native entries and **zero** entries into traces
+containing B by the last snapshot at 196,608 Execute calls. The newly supported
+connection is exercised by differential tests, not by this movie workload.
+Logs: `diagnostic-link-{old-a,new-a,new-b,old-b,stats}.log`. Counter runs are not
+included in the throughput table.
+
+A second diagnostic identified the lower opcode fields at ordinary fallback
+entries (excluding already-pending delay slots):
+
+| Lower opcode | Meaning | Count at final snapshot |
+| --- | --- | ---: |
+| 0x04 | ILW | 9,819,350 |
+| 0x2d | IBGTZ | 3,142,192 |
+| 0x40 | Extended lower opcode group | 3,536,506 |
+
+These are cumulative boot/intro call counts, not CPU-time percentages or counts
+restricted to frames 850–1100. ILW and IBGTZ account for about **78.6%** of these
+fallback entries. They identify the next useful extension: integer-load pipeline
+latency and VI backup semantics must be integrated with conditional branch
+decisions and delay-slot retirement before connecting those edges. The 0x40
+bucket has not yet been broken down into individual instructions. This corrects
+the earlier assumption that unconditional B would exercise the movie hot path.
+Artifact: `diagnostic-link-opcodes.log`; temporary diagnostics were removed.
+
+Final validation: the production ARM64 app rebuilt without diagnostic counters
+or metrics logging. **190 tests** (20 common, 170 core) passed, including the new
+pending-XGKICK test that ensures a connected branch cannot run its delay store
+before the packet transfer. Deep signature verification passed. The SCPS-15025
+state loaded SPU2/GS, ran for 20 seconds and shut down normally. The existing
+optional patches.zip warning remains. No visual, long-gameplay or x64 runtime
+validation was performed. Logs: `link-production-{build,ctest,state,state-console}.log`.

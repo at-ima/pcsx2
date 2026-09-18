@@ -95,10 +95,21 @@ emits native instructions; the existing x86 recompiler keeps its own behavior.
 ## VU1
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
-queues. Unsupported pairs, branches and end-bit delay slots fall back as whole
-instruction pairs. Pipeline retirement retains the interpreter timing. Normal
+queues. Static unconditional B edges can connect the branch, supported delay
+pair and destination within one bounded native trace. Conditional/indirect
+branches, nested branches and end-bit delay slots retain interpreter fallback. Pipeline retirement retains the interpreter timing. Normal
 XGKICK follows microVU's delayed whole-packet policy; the interpreter and
 `XgKickHack` keep incremental transfers.
+
+Connected regions share the VF/ACC cache assignment and the pipeline schedule in
+execution order. They do not publish/reload cached vectors or restart preparation
+at an internal B edge. Every non-contiguous source range is checked before entry,
+including destination edits. Per-pair budget exits publish the correct branch,
+delay and TPC state; a complete deferred suffix publishes its final state as
+before. Repeated PCs end the trace, so native loop back-edge linking is not yet
+implemented. The trace is bounded by the same 256-pair limit. Conditional branch
+VI hazards and independently cached target-state matching remain future work.
+Wider gameplay and callback combinations still need proper testing.
 
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
 pairs can use a dependency calculated during compilation: incoming four-cycle
@@ -180,7 +191,7 @@ EFU and IALU work initially keeps the generic path, but readiness is checked aga
 at the first scheduled pair and at the deferred suffix boundary. Once these
 queues drain, the validated block may use scheduled execution. Supported pairs
 cannot start special pipelines or stall on IALU: native integer operations have
-zero pipeline latency and branches end the block. Unknown timing keeps the
+zero pipeline latency, and supported unconditional B reads no VI operands. Unknown timing keeps the
 generic preparation path. Every queue entry is materialized
 at observable exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored. This is a limited first step
@@ -204,8 +215,8 @@ and all arithmetic execute in their original order. The VI backup countdown is
 accumulated until the next VI write or suffix exit, with byte saturation; this
 preserves the value seen by BackupVI without updating memory every pair.
 
-Linear blocks contain at most 256 pairs, bounded by micro-memory and supported
-instructions. Source validation covers the entire block. Generated-code space
+Compiled traces contain at most 256 pairs, with every source range bounded by
+micro-memory and supported instructions. Source validation covers the entire block. Generated-code space
 and cycle-wrap protection scale with this limit. This reduces artificial block
 boundaries without adding cross-block linking. A 512-pair limit did not improve
 the measured opening-movie workload; see PERFORMANCE.md for the comparison.

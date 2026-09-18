@@ -220,6 +220,63 @@ TEST_F(VU1RecompilerTest, BranchEndBitAndSpecialInstructionFallback)
 	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x100, 0u);
 }
 
+TEST_F(VU1RecompilerTest, ConnectedBranchRegionsPreserveEveryBudgetAndSourceEdit)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+	for (u32 i = 0; i < 24; i++)
+		Put(i * 8, 0x80000000 | add, 0x3f800000);
+	Put(24 * 8, add, 0x40000000 | (64 - 25)); // Connect to pair 64 after the delay.
+	Put(25 * 8, 0x80000000 | add, 0x40000000);
+	for (u32 i = 64; i < 80; i++)
+		Put(i * 8, 0x80000000 | add, 0x40400000);
+	Put(80 * 8, add, 0x40000000 | ((8 - 81) & 0x7ff)); // A back edge ends the trace.
+	Put(81 * 8, 0x80000000 | add, 0x40800000);
+	for (u32 budget = 1; budget <= 192; budget++)
+	{
+		SCOPED_TRACE(budget);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 100;
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+	// Both a destination edit and a changed edge must invalidate a cached trace.
+	for (u32 pass = 0; pass < 3; pass++)
+	{
+		VU0 = initial0;
+		VU1 = initial;
+		if (pass == 0)
+			Put(70 * 8, 0x80000000 | ((add & ~63u) | 0x2c), 0x41000000);
+		else if (pass == 1)
+			Put(24 * 8, add, 0x40000000 | (68 - 25));
+		else
+			Put(25 * 8, 0x2ff, 0x40000002); // A nested branch restores the fallback path.
+		Compare(192);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, ConnectedBranchDelayWrapsMicroMemory)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	Put(VU1_PROGSIZE - 8, 0x2ff, 0x40000002);
+	Put(0, 0x800002ff, 0x40000000);
+	Put(16, 0xc00002ff, 0x3f800000);
+	Put(24, 0x800002ff, 0x3f800000);
+	for (u32 budget : {1u, 2u, 3u, 4u, 16u})
+	{
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VI[REG_TPC].UL = (VU1_PROGSIZE - 8) / 8;
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, TerminalBranchPreservesEveryBudgetPrefix)
 {
 	const VURegs initial = VU1, initial0 = VU0;
@@ -1139,6 +1196,27 @@ TEST_F(VU1PacketXgkickTest, BranchDelayStoresBeforePendingPacketTransfer)
 	EXPECT_FALSE(VU1.xgkickenable);
 	ASSERT_EQ(gifUnit.gifPath[0].curSize, 48u);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, &VU1.VF[3], 16), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, ConnectedBranchDoesNotRunDelayBeforePendingTransfer)
+{
+	Tag(0, 2, true);
+	Kick();
+	VU1.VI[2].UL = 1;
+	Put(8, 0x2ff, 0x40000006); // B to byte 64.
+	Put(16, 0x2ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	std::array<u8, 16> previous{};
+	std::memcpy(previous.data(), VU1.Mem + 16, previous.size());
+	CpuArm64VU1.Execute(1);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 48u);
+	EXPECT_FALSE(VU1.xgkickenable);
+	EXPECT_EQ(VU1.branch, 1u);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
+	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.branch, 0u);
+	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
+	EXPECT_EQ(std::memcmp(VU1.Mem + 16, &VU1.VF[3], 16), 0);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
 }
 
 TEST_F(VU1PacketXgkickTest, WrapsMemoryAndTransfersAllTagsThroughEop)

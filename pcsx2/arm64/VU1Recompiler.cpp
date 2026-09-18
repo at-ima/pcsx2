@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <vector>
 
 namespace
 {
@@ -54,6 +55,14 @@ namespace
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<RetirementSchedule, MaxInstructions> schedule{};
 		std::array<u32, MaxInstructions * 2> words{};
+		struct SourceRange
+		{
+			u32 pc, first, count;
+		};
+		std::vector<SourceRange> ranges;
+		std::array<u32, MaxInstructions> next_pc{};
+		std::array<bool, MaxInstructions> delay{};
+		bool has_branches = false;
 		u32 count = 0;
 		VectorCache cache;
 		Function function = nullptr;
@@ -187,6 +196,7 @@ namespace
 		Mr32,
 		Mfir,
 		Mtir,
+		Branch,
 		Unsupported
 	};
 	Lower DecodeLower(u32 code)
@@ -201,6 +211,8 @@ namespace
 				return Lower::Iaddiu;
 			case 9:
 				return Lower::Isubiu;
+			case 0x20:
+				return Lower::Branch;
 			case 0x40:
 				switch (code & 0x3f)
 				{
@@ -643,9 +655,26 @@ namespace
 			}
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
-			EmitLower(a, cache, ins.lower);
+			if (DecodeLower(ins.lower) != Lower::Branch)
+				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
+		}
+	}
+
+	void EmitControlFlow(MacroAssembler& a, const Block& block, u32 index)
+	{
+		const auto& ins = block.instructions[index];
+		if (!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Branch)
+		{
+			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+			StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
+			StoreWord(a, 1, offsetof(VURegs, branch));
+		}
+		else if (block.delay[index])
+		{
+			StoreWord(a, 0, offsetof(VURegs, branch));
+			StoreWord(a, block.next_pc[index], VI(REG_TPC));
 		}
 	}
 
@@ -953,6 +982,7 @@ namespace
 				backup_cycles = 0;
 			}
 			EmitPair(a, block.cache, ins, false);
+			EmitControlFlow(a, block, i);
 			if (HasFmac(ins))
 			{
 				const u32 slot = issued++ & 3;
@@ -991,7 +1021,7 @@ namespace
 		StoreWord(a, live, offsetof(VURegs, fmaccount));
 		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Str(w28, Field(VI(REG_MAC_FLAG)));
-		StoreWord(a, last.pc + 8, VI(REG_TPC));
+		StoreWord(a, block.next_pc[block.count - 1], VI(REG_TPC));
 		const bool upper_code = (last.upper & 0x80000000) ||
 		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
 		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
@@ -1003,10 +1033,18 @@ namespace
 			InvalidateAll();
 		auto block = std::make_unique<Block>();
 		const u32 saved_code = VU1.code;
-		for (u32 i = 0; i < MaxInstructions && pc + i * 8 < VU1_PROGSIZE; i++)
+		// Decode static B edges in execution order with one vector-cache and
+		// pipeline schedule. Every source range is validated before entry.
+		// Repeated PCs, unsupported pairs and the size limit end the trace.
+		u32 next_pc = pc, branch_target = 0;
+		bool pending_branch = false;
+		std::array<bool, VU1_PROGSIZE / 8> visited{};
+		for (u32 i = 0; i < MaxInstructions && next_pc < VU1_PROGSIZE; i++)
 		{
 			auto& ins = block->instructions[i];
-			ins.pc = pc + i * 8;
+			if (visited[next_pc / 8])
+				break; // Back edges return with complete state until linking supports loops.
+			ins.pc = next_pc;
 			std::memcpy(&ins.lower, VU1.Micro + ins.pc, 4);
 			std::memcpy(&ins.upper, VU1.Micro + ins.pc + 4, 4);
 			block->words[i * 2] = ins.lower;
@@ -1014,6 +1052,28 @@ namespace
 			if (DecodeUpper(ins.upper).op == Op::Unsupported ||
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
 				break;
+			const bool branch = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Branch;
+			if (branch && (pending_branch || i + 1 == MaxInstructions))
+				break;
+			visited[ins.pc / 8] = true;
+			block->delay[i] = pending_branch;
+			block->next_pc[i] = pending_branch ? branch_target : ins.pc + 8;
+			if (pending_branch)
+				pending_branch = false;
+			if (branch)
+			{
+				const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+				branch_target = (ins.pc + 8 + displacement) & VU1_PROGMASK;
+				pending_branch = true;
+				block->has_branches = true;
+			}
+			next_pc = block->next_pc[i];
+			if (pending_branch)
+				next_pc &= VU1_PROGMASK; // A delay pair may wrap micro memory.
+			if (!block->ranges.empty() && block->ranges.back().pc + block->ranges.back().count * 8 == ins.pc)
+				block->ranges.back().count++;
+			else
+				block->ranges.push_back({ins.pc, i, 1});
 			VU1.code = ins.upper;
 			VU1regs_UPPER_OPCODE[ins.upper & 0x3f](&ins.uregs);
 			if (!(ins.upper & 0x80000000))
@@ -1166,6 +1226,7 @@ namespace
 				cycle_dirty = schedule_pair;
 				EmitPair(a, cache, ins, true);
 				EmitFinish(a, ins);
+				EmitControlFlow(a, *block, i);
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
 				a.B(hs, &exit);
@@ -1211,7 +1272,12 @@ namespace
 
 	bool Matches(const Block& block, u32 pc)
 	{
-		return std::memcmp(block.words.data(), VU1.Micro + pc, std::max(1u, block.count) * 8) == 0;
+		if (!block.count)
+			return std::memcmp(block.words.data(), VU1.Micro + pc, 8) == 0;
+		for (const auto& range : block.ranges)
+			if (std::memcmp(block.words.data() + range.first * 2, VU1.Micro + range.pc, range.count * 8) != 0)
+				return false;
+		return true;
 	}
 } // namespace
 
@@ -1298,7 +1364,8 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		Block* block = s_blocks[pc / 8].get();
 		if (!block || !Matches(*block, pc))
 			block = &Compile(pc);
-		if (block->function)
+		// A restored chained-delay state still requires interpreter branch retirement.
+		if (block->function && !(block->has_branches && VU1.takedelaybranch))
 		{
 			// microVU transfers after the pair following XGKICK, including its
 			// lower store. Exit after that pair so the complete architectural state
