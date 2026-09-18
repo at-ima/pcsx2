@@ -4,6 +4,9 @@ These backends are incomplete. Native instruction coverage should grow within
 the existing provider and block-execution contracts, with differential tests
 against the interpreters. Do not add game-specific execution shortcuts.
 
+See [the intro performance investigation](PERFORMANCE.md) for measured bottlenecks
+and the limits of the current x64 comparison.
+
 ## EE
 
 - `EERecompiler.cpp` owns the `R5900cpu` provider, block lookup, source validation,
