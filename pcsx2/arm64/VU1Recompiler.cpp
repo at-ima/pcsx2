@@ -3,6 +3,7 @@
 
 #include "Common.h"
 #include "arm64/VU1Recompiler.h"
+#include "VUPipeline.h"
 #include "common/HostSys.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
 
@@ -50,7 +51,8 @@ namespace
 
 	u32 Options()
 	{
-		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (CHECK_VU_OVERFLOW(1) ? 2 : 0) | (CHECK_VUADDSUBHACK ? 4 : 0);
+		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (CHECK_VU_OVERFLOW(1) ? 2 : 0) | (CHECK_VUADDSUBHACK ? 4 : 0) |
+		       (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero() ? 8 : 0);
 	}
 
 	void InvalidateAll()
@@ -63,19 +65,20 @@ namespace
 
 	// Keep pipeline retirement shared with the interpreter until static scheduling
 	// has differential coverage. Game-level XGKICK timing still needs proper testing.
-	template <bool ReadsVF>
+	// -2 skips VF hazards; -1 scans incoming entries; 0..3 are scheduled.
+	template <int Dependency>
 	void PrepareInstruction(const Instruction* ins)
 	{
 		VU1.cycle++;
 		VU1.VI[REG_TPC].UL = ins->pc + 8;
 		const u32 before = VU1.cycle - 1;
-		if constexpr (ReadsVF)
+		if constexpr (Dependency != -2)
 		{
-			if (ins->dependency >= 0 && VU1.cycle < ~u64(0) - 4)
+			if (Dependency >= 0 && VU1.cycle < ~u64(0) - 4)
 			{
-				if (ins->dependency)
+				if constexpr (Dependency > 0)
 				{
-					const fmacPipe& pipe = VU1.fmac[(VU1.fmacwritepos - ins->dependency) & 3];
+					const fmacPipe& pipe = VU1.fmac[(VU1.fmacwritepos - Dependency) & 3];
 					if ((VU1.cycle - pipe.sCycle) < pipe.Cycle)
 						VU1.cycle = std::max(VU1.cycle, pipe.sCycle + pipe.Cycle);
 				}
@@ -99,7 +102,7 @@ namespace
 			}
 		}
 		VU1.code = (ins->upper & 0x80000000) ? ins->upper : ins->lower;
-		_vuTestPipes(&VU1);
+		VUPipeline::Retire(&VU1);
 		if (VU1.VIBackupCycles)
 			VU1.VIBackupCycles -= std::min(static_cast<u8>(VU1.cycle - before), VU1.VIBackupCycles);
 	}
@@ -275,21 +278,26 @@ namespace
 
 	void ClampInput(MacroAssembler& a, VRegister reg)
 	{
-		// v16..v20 are scratch; v0..v2 contain the operands.
-		a.Movi(v16.V4S(), 0x7f800000);
-		a.And(v17.V16B(), reg.V16B(), v16.V16B());
-		a.Movi(v18.V4S(), 0x80000000);
-		a.And(v18.V16B(), reg.V16B(), v18.V16B());
-		a.Cmeq(v19.V4S(), v17.V4S(), 0);
-		a.Bsl(v19.V16B(), v18.V16B(), reg.V16B());
-		a.Mov(reg.V16B(), v19.V16B());
-		if (CHECK_VU_OVERFLOW(0))
+		// Arithmetic flushes signed denormal inputs in hardware when FPCR.FZ is
+		// enabled. Other FPCR modes still need the interpreter's explicit clamp.
+		if (!EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero())
 		{
-			a.Cmeq(v19.V4S(), v17.V4S(), v16.V4S());
-			a.Movi(v20.V4S(), 0x7f7fffff);
-			a.Orr(v18.V16B(), v18.V16B(), v20.V16B());
+			a.Movi(v16.V4S(), 0x7f800000);
+			a.And(v17.V16B(), reg.V16B(), v16.V16B());
+			a.Movi(v18.V4S(), 0x80000000);
+			a.And(v18.V16B(), reg.V16B(), v18.V16B());
+			a.Cmeq(v19.V4S(), v17.V4S(), 0);
 			a.Bsl(v19.V16B(), v18.V16B(), reg.V16B());
 			a.Mov(reg.V16B(), v19.V16B());
+		}
+		if (CHECK_VU_OVERFLOW(0))
+		{
+			// Signed min clamps positive infinities/NaNs; unsigned min clamps
+			// their negative encodings. Finite values and signed zeros are intact.
+			a.Movi(v16.V4S(), 0x7f7fffff);
+			a.Movi(v17.V4S(), 0xff7fffff);
+			a.Smin(reg.V4S(), reg.V4S(), v16.V4S());
+			a.Umin(reg.V4S(), reg.V4S(), v17.V4S());
 		}
 	}
 
@@ -671,23 +679,30 @@ namespace
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
-			// Specialize the preparation path using the dependencies already decoded
-			// by the compiler. Read-free pairs need no FMAC dependency machinery.
-			const bool shared_reads = std::count_if(block->instructions.begin(), block->instructions.begin() + block->count,
-										  [](const Instruction& ins) { return ins.readsVF; }) *
-			                              2 >=
-			                          block->count;
-			a.Mov(x22, reinterpret_cast<uintptr_t>(shared_reads ? &PrepareInstruction<true> : &PrepareInstruction<false>));
+			// Share the most frequent helper address in x22; keep preparation code
+			// outside the emitted instruction stream to avoid instruction-cache growth.
+			using PrepareFunction = void (*)(const Instruction*);
+			constexpr PrepareFunction prepare[] = {&PrepareInstruction<-2>, &PrepareInstruction<-1>,
+				&PrepareInstruction<0>, &PrepareInstruction<1>, &PrepareInstruction<2>, &PrepareInstruction<3>};
+			std::array<u32, std::size(prepare)> uses{};
+			for (u32 i = 0; i < block->count; i++)
+			{
+				const auto& ins = block->instructions[i];
+				uses[ins.readsVF ? ins.dependency + 2 : 0]++;
+			}
+			const u32 shared_prepare = std::max_element(uses.begin(), uses.end()) - uses.begin();
+			a.Mov(x22, reinterpret_cast<uintptr_t>(prepare[shared_prepare]));
 			a.Mov(x23, reinterpret_cast<uintptr_t>(block->instructions.data()));
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
+				const u32 selected_prepare = ins.readsVF ? ins.dependency + 2 : 0;
 				a.Add(x0, x23, i * sizeof(Instruction));
-				if (ins.readsVF == shared_reads)
+				if (selected_prepare == shared_prepare)
 					a.Blr(x22);
 				else
 				{
-					a.Mov(x16, reinterpret_cast<uintptr_t>(ins.readsVF ? &PrepareInstruction<true> : &PrepareInstruction<false>));
+					a.Mov(x16, reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
 					a.Blr(x16);
 				}
 				const bool immediate = ins.upper & 0x80000000;

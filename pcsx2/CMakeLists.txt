@@ -212,7 +212,8 @@ set(pcsx2Headers
 	vtlb.h
 	VUflags.h
 	VUmicro.h
-	VUops.h)
+	VUops.h
+	VUPipeline.h)
 
 # CDVD sources
 set(pcsx2CDVDSources

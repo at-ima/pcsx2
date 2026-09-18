@@ -235,6 +235,89 @@ TEST_F(VU1RecompilerTest, ScheduledDependenciesAcrossPipelineGapsAndBlockExits)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ScheduledPreparationRetiresMixedPipelines)
+{
+	const VURegs initial = VU1;
+	for (u64 cycle : {u64(0), u64(100), ~u64(0) - 8})
+	{
+		for (u32 distance = 1; distance <= 4; distance++)
+		{
+			for (u32 budget : {1u, 3u, 8u, 32u, 128u})
+			{
+				SCOPED_TRACE(testing::Message() << "cycle=" << cycle << " distance=" << distance << " budget=" << budget);
+				VU1 = initial;
+				VU1.cycle = cycle;
+				VU1.VIBackupCycles = 2;
+				VU1.VI[REG_STATUS_FLAG].UL = 0xabc;
+				VU1.fmaccount = 3;
+				VU1.fmacreadpos = 3;
+				VU1.fmacwritepos = 2;
+				for (u32 n = 0; n < 3; n++)
+				{
+					auto& pipe = VU1.fmac[(3 + n) & 3];
+					pipe.sCycle = cycle - (2 - n);
+					pipe.Cycle = 4;
+					pipe.regupper = 1;
+					pipe.xyzwupper = 15;
+					pipe.flagreg = n == 1 ? (1 << REG_CLIP_FLAG) | (1 << REG_STATUS_FLAG) : 0;
+					pipe.statusflag = 0x481 + n;
+					pipe.macflag = 0x1234 + n;
+					pipe.clipflag = 0x54321 + n;
+				}
+				VU1.fdiv.enable = VU1.efu.enable = 1;
+				VU1.fdiv.sCycle = VU1.efu.sCycle = cycle;
+				VU1.fdiv.Cycle = 7;
+				VU1.efu.Cycle = 11;
+				VU1.fdiv.statusflag = 0x820;
+				VU1.fdiv.reg.UL = 0x40000000;
+				VU1.efu.reg.UL = 0x40400000;
+				VU1.ialucount = 3;
+				VU1.ialureadpos = 2;
+				VU1.ialuwritepos = 1;
+				for (u32 n = 0; n < 3; n++)
+				{
+					auto& pipe = VU1.ialu[(2 + n) & 3];
+					pipe.sCycle = cycle;
+					pipe.Cycle = 1 + n;
+				}
+				for (u32 i = 0; i < 96; i++)
+				{
+					// Repeated VF1 writes exercise each scheduled dependency distance.
+					// MULq also observes FDIV's Q writeback during the native block.
+					const u32 upper = i % distance == 0 ? (15 << 21) | (1 << 11) | (1 << 6) | 0x1c : 0x2ff;
+					Put(i * 8, upper, 0x80000030 | (2 << 16) | (1 << 11) | (3 << 6));
+				}
+				Compare(budget);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, RecompilesInputFlushWhenFpcrChanges)
+{
+	const VURegs initial = VU1;
+	Put(0, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x2a, 0x3f800000);
+	for (bool flush : {true, false, true, false})
+	{
+		SCOPED_TRACE(flush);
+		VU1 = initial;
+		VU1.VF[1].UL[0] = 1;
+		VU1.VF[1].UL[1] = 0x80000001;
+		VU1.VF[1].UL[2] = 0x007fffff;
+		VU1.VF[1].UL[3] = 0x807fffff;
+		for (u32 lane = 0; lane < 4; lane++)
+			VU1.VF[2].UL[lane] = 0x7f7fffff;
+		EmuConfig.Cpu.VU1FPCR = FPControlRegister::GetDefault().DisableExceptions().SetFlushToZero(flush);
+		// Reuse the same instruction bytes and cache entry. Without recompiling
+		// after disabling FZ, denormal times max-finite produces a nonzero result.
+		Compare(1);
+		if (HasFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, SpecialFloatsAndChangedFloatingPointOptions)
 {
 	const VURegs initial = VU1;

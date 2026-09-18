@@ -83,8 +83,19 @@ instruction pairs. Pipeline retirement and XGKICK retain the reference timing.
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
 pairs can use a dependency calculated during compilation: incoming four-cycle
 FMAC results have matured, and only producers in the preceding three pairs can
-still stall. Cycle-wrap boundaries retain the general queue scan. This does not
-enable MTVU or adopt microVU's separate execution and synchronization protocol.
+still stall. Cycle-wrap boundaries retain the general queue scan. Preparation
+helpers are specialized for read-free pairs, incoming dependencies,
+and each scheduled producer distance. Pipeline retirement lives in the shared
+`VUPipeline.h` implementation, allowing the compiler to combine preparation and
+retirement without expanding the same logic at every generated instruction.
+This does not enable MTVU or adopt microVU's separate execution and synchronization
+protocol.
+
+Arithmetic input clamping uses signed/unsigned NEON min operations to clamp both
+signs of infinity/NaN. When VU1's FPCR flushes denormals, arithmetic supplies the
+input flush directly; other modes retain explicit signed-zero conversion. The
+code-cache options include this FPCR setting so changing it recompiles affected
+blocks. Output clamping and MAC/status flag classification remain unchanged.
 
 ## Validation
 
@@ -99,5 +110,6 @@ all source/destination alias patterns, dependent instruction blocks, quadword
 transfers and delay slots. They also check unchanged host FPSR and fallback for
 unsupported packed selectors. Broader game coverage still needs proper testing.
 `vu1_recompiler_tests.cpp` compares complete VU state and memory, including live
-pipeline entries and execution-budget boundaries. Synthetic timing results are
+pipeline entries and execution-budget boundaries, including overlapping FMAC,
+FDIV, EFU and IALU retirement and cycle wrap. Synthetic timing results are
 kept under the ignored build directory; they are not game-performance guarantees.
