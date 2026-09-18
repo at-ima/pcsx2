@@ -63,6 +63,7 @@ namespace
 		std::array<u32, MaxInstructions> next_pc{};
 		std::array<bool, MaxInstructions> delay{};
 		bool has_branches = false;
+		bool loops_to_entry = false;
 		u32 count = 0;
 		VectorCache cache;
 		Function function = nullptr;
@@ -82,7 +83,8 @@ namespace
 	u32 Options()
 	{
 		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (CHECK_VU_OVERFLOW(1) ? 2 : 0) | (CHECK_VUADDSUBHACK ? 4 : 0) |
-		       (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero() ? 8 : 0);
+		       (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero() ? 8 : 0) |
+		       (CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? 16 : 0);
 	}
 
 	void InvalidateAll()
@@ -198,6 +200,7 @@ namespace
 		Mtir,
 		Ilw,
 		Ibgtz,
+		Xgkick,
 		Branch,
 		Unsupported
 	};
@@ -243,6 +246,8 @@ namespace
 						return Lower::Mfir;
 					case 0x3fc:
 						return Lower::Mtir;
+					case 0x6fc:
+						return CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? Lower::Xgkick : Lower::Unsupported;
 				}
 				break;
 		}
@@ -678,7 +683,8 @@ namespace
 			}
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
-			if (DecodeLower(ins.lower) != Lower::Branch && DecodeLower(ins.lower) != Lower::Ibgtz)
+			if (DecodeLower(ins.lower) != Lower::Branch && DecodeLower(ins.lower) != Lower::Ibgtz &&
+				DecodeLower(ins.lower) != Lower::Xgkick)
 				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
@@ -768,6 +774,35 @@ namespace
 		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
 	}
 
+	void EmitKick(MacroAssembler& a, u32 code)
+	{
+		Label fresh;
+		a.Ldr(w9, Field(offsetof(VURegs, xgkickenable)));
+		a.Cbz(w9, &fresh);
+		a.Str(x26, Field(offsetof(VURegs, cycle)));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.flush_kick));
+		a.Blr(x16);
+		a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+		a.Bind(&fresh);
+		// Read VI after flushing, matching the reference lower-op ordering.
+		a.Ldrh(w0, Field(VI((code >> 11) & 15)));
+		a.And(w0, w0, 0x3ff);
+		a.Lsl(w0, w0, 4);
+		a.Str(w0, Field(offsetof(VURegs, xgkickaddr)));
+		a.Mov(w9, VU1_MEMSIZE);
+		a.Sub(w9, w9, w0);
+		a.Str(w9, Field(offsetof(VURegs, xgkickdiff)));
+		StoreWord(a, VURegs::XgkickPacket, offsetof(VURegs, xgkickenable));
+		StoreWord(a, 0, offsetof(VURegs, xgkicksizeremaining));
+		StoreWord(a, 0, offsetof(VURegs, xgkickendpacket));
+		StoreWord(a, 1, offsetof(VURegs, xgkickcyclecount));
+		a.Str(x26, Field(offsetof(VURegs, xgkicklastcycle)));
+		a.Mov(x0, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+		a.Ldr(w9, MemOperand(x0));
+		a.Orr(w9, w9, 1 << 12);
+		a.Str(w9, MemOperand(x0));
+	}
+
 	void EmitIntegerIssue(MacroAssembler& a, const Instruction& ins)
 	{
 		if (ins.lregs.pipe != VUPIPE_IALU || !ins.lregs.cycles)
@@ -824,9 +859,10 @@ namespace
 					}
 				}
 			}
-			// A VI-dependent branch can add an incoming IALU wait. Forget exact
+			// VI waits and kick/transfer callbacks can change timing. Forget exact
 			// producer ages until enough new pairs establish a known schedule.
-			if (ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread)
+			if ((ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread) ||
+				ins.lregs.pipe == VUPIPE_XGKICK || (i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
@@ -894,7 +930,7 @@ namespace
 		Label done, loop, ready;
 		a.Mov(w25, 0);
 		// XGKICK may call C++ and change state during the prefix. Promotion
-		// requires a fresh guard after the explicit first-pair packet boundary.
+		// requires a fresh guard after the explicit packet boundary.
 		a.Ldr(w9, Field(offsetof(VURegs, xgkickenable)));
 		a.Cbnz(w9, &done);
 		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
@@ -1106,7 +1142,8 @@ namespace
 		const u32 saved_code = VU1.code;
 		// Decode static B and taken IBGTZ edges with one vector-cache and
 		// pipeline schedule. Reachable source bytes are validated before entry.
-		// Repeated PCs, unsupported pairs and the size limit end the trace.
+		// A repeated entry can loop natively; other repeated PCs, unsupported
+		// pairs and the size limit end the trace.
 		u32 next_pc = pc, branch_target = 0;
 		bool pending_branch = false;
 		std::array<bool, VU1_PROGSIZE / 8> visited{};
@@ -1114,7 +1151,12 @@ namespace
 		{
 			auto& ins = block->instructions[i];
 			if (visited[next_pc / 8])
-				break; // Back edges return with complete state until linking supports loops.
+			{
+				// Reenter only this trace's incoming-state path, with no unresolved
+				// delay. Other internal targets need their own state contract.
+				block->loops_to_entry = next_pc == pc && !pending_branch;
+				break;
+			}
 			ins.pc = next_pc;
 			std::memcpy(&ins.lower, VU1.Micro + ins.pc, 4);
 			std::memcpy(&ins.upper, VU1.Micro + ins.pc + 4, 4);
@@ -1199,7 +1241,7 @@ namespace
 			if (!s_pipeline.prepare[0])
 			{
 				HostSys::BeginCodeWrite();
-				s_pipeline = Arm64VU1::CompilePipeline(s_write, s_end - s_write);
+				s_pipeline = Arm64VU1::CompilePipeline(s_write, s_end - s_write, &_vuXGKICKTransfer, (s_options & 16) != 0);
 				HostSys::EndCodeWrite();
 				HostSys::FlushInstructionCache(s_write, static_cast<u32>(s_pipeline.size));
 				s_write += (s_pipeline.size + 15) & ~size_t(15);
@@ -1229,7 +1271,7 @@ namespace
 			}
 			const bool deferred = !regions.empty();
 			std::array<Label, MaxInstructions> deferred_entries, resumes;
-			Label exit;
+			Label exit, loop_entry, finished;
 			const int saved_size = deferred ? 96 : 80;
 			// Save only the d8..d15 registers this block modifies.
 			// Round paired saves up to retain 16-byte stack alignment.
@@ -1273,6 +1315,7 @@ namespace
 			const u32 shared_prepare = std::max_element(uses.begin(), uses.end()) - uses.begin();
 			a.Mov(x22, reinterpret_cast<uintptr_t>(prepare[shared_prepare]));
 			a.Mov(x23, reinterpret_cast<uintptr_t>(block->instructions.data()));
+			a.Bind(&loop_entry);
 			bool cycle_dirty = false;
 			bool readiness_checked = false;
 			u32 region_index = 0;
@@ -1333,24 +1376,34 @@ namespace
 					a.Bind(&prepared);
 				cycle_dirty = schedule_pair;
 				EmitPair(a, cache, ins, true);
+				const bool kick = ins.lregs.pipe == VUPIPE_XGKICK;
+				if (kick)
+				{
+					EmitKick(a, ins.lower);
+					if (scheduled)
+						a.Mov(w25, 0);
+				}
 				EmitFinish(a, ins);
 				EmitIntegerIssue(a, ins);
 				if (scheduled && ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 					a.And(w25, w25, 1);
 				EmitControlFlow(a, *block, i);
-				if (i == 0)
+				if (!kick && (i == 0 || block->instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				{
 					Label no_packet;
-					a.Ldr(w9, MemOperand(sp, 72));
-					a.Cbz(w9, &no_packet);
+					if (i == 0)
+					{
+						a.Ldr(w9, MemOperand(sp, 72));
+						a.Cbz(w9, &no_packet);
+					}
 					// Commit the delayed pair before GIF observes VU state, then
 					// continue with the same cache assignment and host frame.
 					a.Str(x26, Field(offsetof(VURegs, cycle)));
 					a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.finish_packet));
 					a.Blr(x16);
 					a.Ldr(x26, Field(offsetof(VURegs, cycle)));
-					// Entry rejected scheduling while the packet was pending. Recheck
-					// after the callback; the generic prefix still drains incoming work.
+					// Scheduling was disabled while the packet was pending. Recheck
+					// after the callback; generic preparation rebuilds known timing.
 					if (scheduled)
 						EmitScheduleGuard(a);
 					a.Bind(&no_packet);
@@ -1367,7 +1420,7 @@ namespace
 				a.B(hs, &exit);
 			}
 			if (deferred)
-				a.B(&exit);
+				a.B(&finished);
 			for (u32 r = 0; r < regions.size(); r++)
 			{
 				const auto& region = regions[r];
@@ -1384,7 +1437,22 @@ namespace
 					a.Cmp(x9, x21);
 					a.B(lo, &resumes[r]);
 				}
-				a.B(&exit);
+				a.B(region.end == block->count ? &finished : &exit);
+			}
+			a.Bind(&finished);
+			if (block->loops_to_entry)
+			{
+				a.Sub(x9, x26, x20);
+				a.Cmp(x9, x21);
+				a.B(hs, &exit);
+				// Keep VF/ACC and the host frame, but start pipeline preparation
+				// afresh. Every reachable source pair was validated before entry.
+				a.Str(x26, Field(offsetof(VURegs, cycle)));
+				if (scheduled)
+					EmitScheduleGuard(a);
+				a.Mov(w9, block->instructions[block->count - 1].lregs.pipe == VUPIPE_XGKICK ? 1 : 0);
+				a.Str(w9, MemOperand(sp, 72));
+				a.B(&loop_entry);
 			}
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));

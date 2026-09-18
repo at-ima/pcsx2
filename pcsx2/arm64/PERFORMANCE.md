@@ -923,3 +923,67 @@ The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `reentry-production-{build,ctest,state,state-console}.log`.
+
+## Native XGKICK issuance and same-trace loop back edges
+
+Ordinary native XGKICK no longer returns to the opcode interpreter. Its emitter
+flushes an old request through the shared cache-aware helper, reads the low VI
+address afterwards, initializes the architectural packet fields and sets the
+VU0 busy bit. Its upper operation and FMAC issue retain reference ordering.
+The following pair completes the packet after its stores and branch retirement;
+a consecutive kick flushes the previous request and leaves the new one delayed.
+Both issuance and delayed completion break deferred scheduling, and timing
+analysis recovers known producer ages before resuming scheduled regions.
+XgKickHack retains interpreter issuance. The transfer policy is part of the
+code-cache options and the shared pipeline's compiled configuration.
+
+The expanded reference comparison exposed an existing credit-only discrepancy:
+with XgKickHack enabled, a restored native packet marker stayed marked as native
+until a later transfer-helper call. The reference downgrades it on the first
+pipeline tick. The shared preparation stub now performs that downgrade even
+when it takes the credit-only path.
+
+The decoder also records back edges which return to the same trace entry with
+no unresolved branch delay. Such edges keep the VF/ACC assignment and host frame,
+check the original budget, publish the cycle, rerun the pipeline guard and branch
+to the generic incoming-state preparation. A kick in the final pair carries its
+pending flag into the next iteration. Other internal repeated PCs still exit;
+there are no pointers between independently invalidated compiled blocks.
+Completing a whole iteration implies that its source bytes were all within the
+initial validation budget. Supported VU stores and GIF callbacks do not mutate
+microcode, so those bytes need not be compared again each iteration.
+
+The new differential test uses interpreted opcode steps under the existing
+native packet policy as its reference. It compares complete VU0/VU1 state, data
+memory and copied GIF bytes across every tested budget: consecutive kicks,
+branch-delay kicks, conditional delayed pairs, the 256-pair trace boundary,
+conditional loop exits and a kick carried across the back edge. It also covers
+old incremental/native requests and both XgKickHack settings. The shared ABI test
+now exercises flushing an old incremental request as well as packet completion,
+including zero/one/eight cached vectors and callback clobbers.
+
+An exploratory native-issuance-only run reached **53.20 VPS**, versus **53.00 VPS**
+for the current baseline: effectively unchanged. Same-trace loop continuation
+is measured separately below. These are throughput measurements, not evidence
+that video decoding or integer arithmetic is the dominant cost.
+
+Serial final comparison against `186de5b75`, frames 850–1100, MTVU disabled:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| kick-old-a | 53.00 | 18.80 | 3.11 |
+| kick-loop-a | 54.62 | 18.25 | 3.13 |
+| kick-old-b | 53.01 | 18.81 | 3.10 |
+| kick-loop-b | 54.19 | 18.40 | 3.13 |
+
+Mean throughput is **53.00 → 54.40 VPS (+2.6%)**. This is a modest improvement,
+still below 60 VPS in this interval. Both apps used the same temporary metrics
+logging; no profiling counters, concurrent builds or tests ran during measurement.
+Logs: `diagnostic-kick-{new-a,old-a,loop-a,old-b,loop-b}.log`.
+
+Production validation: temporary metrics logging removed, ARM64 app rebuilt,
+**201 tests** (20 common, 181 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`kick-production-{build,ctest,state,state-console}.log`.

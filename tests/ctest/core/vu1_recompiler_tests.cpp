@@ -1233,7 +1233,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 {
 	using namespace vixl::aarch64;
 	using Wrapper = void (*)(VURegs*, const Arm64VU1::Instruction*, const u32*, const VECTOR*, VECTOR*);
-	std::array<Wrapper, 8> wrappers;
+	std::array<Wrapper, 9> wrappers;
 	u8* const base = SysMemory::GetVU1Rec();
 	HostSys::BeginCodeWrite();
 	const auto pipeline = Arm64VU1::CompilePipeline(base, SysMemory::GetVU1RecEnd() - base, &ObservePipelineCallout);
@@ -1252,7 +1252,9 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 		a.Mov(x25, x4);
 		for (u32 slot = 0; slot < 8; slot++)
 			a.Ldr(VRegister(8 + slot, 128), MemOperand(x3, sizeof(VECTOR) * slot));
-		const void* target = entry == 7 ? pipeline.finish_packet : pipeline.branch_prepare;
+		const void* target = entry == 8 ? pipeline.flush_kick : pipeline.branch_prepare;
+		if (entry == 7)
+			target = pipeline.finish_packet;
 		if (entry < pipeline.prepare.size())
 			target = pipeline.prepare[entry];
 		a.Mov(x16, reinterpret_cast<uintptr_t>(target));
@@ -1299,12 +1301,12 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 			}
 			wrappers[entry](&VU1, &ins, offsets.data(), cached.data(), output.data());
 			ASSERT_EQ(s_transfer_calls, 1u);
-			EXPECT_EQ(s_transfer_cycles, entry == 7 ? 0 : 2);
-			EXPECT_EQ(s_transfer_flush, entry == 7);
-			EXPECT_EQ(VU1.cycle, entry == 7 ? 357u : 358u);
-			EXPECT_EQ(VU1.VIBackupCycles, entry == 7 ? 3u : 1u);
-			EXPECT_EQ(VU1.VI[REG_TPC].UL, entry == 7 ? initial.VI[REG_TPC].UL : 48u);
-			EXPECT_EQ(VU1.code, entry == 7 ? initial.code : ins.upper);
+			EXPECT_EQ(s_transfer_cycles, entry >= 7 ? 0 : 2);
+			EXPECT_EQ(s_transfer_flush, entry >= 7);
+			EXPECT_EQ(VU1.cycle, entry >= 7 ? 357u : 358u);
+			EXPECT_EQ(VU1.VIBackupCycles, entry >= 7 ? 3u : 1u);
+			EXPECT_EQ(VU1.VI[REG_TPC].UL, entry >= 7 ? initial.VI[REG_TPC].UL : 48u);
+			EXPECT_EQ(VU1.code, entry >= 7 ? initial.code : ins.upper);
 			for (u32 slot = 0; slot < count; slot++)
 			{
 				EXPECT_EQ(std::memcmp(&s_seen_vectors[slot], &cached[slot], sizeof(VECTOR)), 0);
@@ -1483,6 +1485,100 @@ TEST_F(VU1PacketXgkickTest, ConditionalConnectionPublishesBeforePendingTransfer)
 	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
 	EXPECT_EQ(std::memcmp(VU1.Mem + 16, &VU1.VF[3], 16), 0);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, NativeKickMatchesReferenceStepsAcrossEveryBudget)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	std::array<u8, VU1_MEMSIZE> memory;
+	std::memcpy(memory.data(), VU1.Mem, memory.size());
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+	const u32 kick = 0x800006fc | (1 << 11);
+	constexpr u32 budgets[] = {240, 240, 240, 1040, 512, 512};
+	for (bool gamefix : {false, true})
+		for (u32 variant = 0; variant < std::size(budgets); variant++)
+			for (u32 old_mode : {0u, 1u, VURegs::XgkickPacket})
+			{
+				EmuConfig.Gamefixes.XgKickHack = gamefix;
+				for (u32 i = 0; i < 260; i++)
+					Put(i * 8, 0x80000000 | add, 0x3f800000);
+				Put(0, add, kick);
+				Put(8, add, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+				Put(16, add, variant == 0 ? kick : 0x40000000 | (48 - 3));
+				Put(24, add, kick); // Consecutive kick or branch-delay kick.
+				Put(52 * 8, add, kick);
+				if (variant == 2)
+					Put(53 * 8, 0x2ff, 0x5a000000 | (2 << 11) | 2);
+				Put(80 * 8, 0xc00002ff, 0x3f800000);
+				if (variant == 3)
+				{
+					for (u32 pc : {0u, 8u, 16u, 24u, 52u * 8, 80u * 8})
+						Put(pc, 0x80000000 | add, 0x3f800000);
+					Put(255 * 8, add, kick); // Last pair of the bounded trace.
+					Put(256 * 8, add, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+					Put(258 * 8, 0xc00002ff, 0x3f800000);
+				}
+				if (variant >= 4)
+				{
+					for (u32 pc : {16u, 24u})
+						Put(pc, 0x80000000 | add, 0x3f800000);
+					Put(30 * 8, add, 0x12000001 | (4 << 16) | (4 << 11));
+					Put(32 * 8, add, 0x5a000000 | (4 << 11) | ((-33) & 0x7ff));
+					Put(36 * 8, 0xc00002ff, 0x3f800000);
+					if (variant == 5)
+					{
+						Put(0, add, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+						Put(33 * 8, add, kick); // Carry this request across the native back edge.
+					}
+				}
+				auto reset = [&]() {
+					VU1 = initial;
+					VU0 = initial0;
+					VU1.VI[1].UL = 0;
+					VU1.VI[2].UL = 1;
+					VU1.VI[4].UL = 3;
+					std::memcpy(VU1.Mem, memory.data(), memory.size());
+					Tag(0, 2, true);
+					Tag(64, 1, true);
+					if (old_mode)
+					{
+						VU1.xgkickenable = old_mode;
+						VU1.xgkickaddr = 64;
+						VU1.xgkickdiff = VU1_MEMSIZE - 64;
+					}
+					gifUnit.Reset();
+					gifRegs.ctrl.PSE = 1;
+					vif1Regs.stat.VGW = false;
+				};
+				for (u32 budget = 1; budget <= budgets[variant]; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << gamefix << "/" << variant << "/" << old_mode << "/" << budget);
+					reset();
+					const u64 start = VU1.cycle;
+					while (VU1.cycle - start < budget)
+					{
+						if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
+							break;
+						CpuArm64VU1.Step(); // Original opcode interpreter, with native packet policy.
+					}
+					VU1.VI[REG_TPC].UL >>= 3;
+					VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;
+					const VURegs expected = VU1, expected0 = VU0;
+					std::array<u8, VU1_MEMSIZE> expected_memory;
+					std::memcpy(expected_memory.data(), VU1.Mem, expected_memory.size());
+					const u32 size = gifUnit.gifPath[0].curSize;
+					std::array<u8, 4096> packet;
+					ASSERT_LE(size, packet.size());
+					std::memcpy(packet.data(), gifUnit.gifPath[0].buffer, size);
+					reset();
+					CpuArm64VU1.Execute(budget);
+					ASSERT_EQ(std::memcmp(&VU1, &expected, sizeof(VU1)), 0);
+					ASSERT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
+					ASSERT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
+					ASSERT_EQ(gifUnit.gifPath[0].curSize, size);
+					ASSERT_EQ(std::memcmp(gifUnit.gifPath[0].buffer, packet.data(), size), 0);
+				}
+			}
 }
 
 TEST_F(VU1PacketXgkickTest, NativePacketContinuationMatchesSplitExecution)

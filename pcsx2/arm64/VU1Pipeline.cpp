@@ -8,7 +8,7 @@ namespace Arm64VU1
 {
 	using namespace vixl::aarch64;
 
-	PipelineCode CompilePipeline(u8* code, size_t capacity, XgkickTransfer transfer)
+	PipelineCode CompilePipeline(u8* code, size_t capacity, XgkickTransfer transfer, bool packet_mode)
 	{
 		MacroAssembler a(code, capacity);
 		PipelineCode result;
@@ -249,6 +249,13 @@ namespace Arm64VU1
 		// implementation. Broader XGKICK/game timing still needs proper testing.
 		a.Ldr(w10, field(offsetof(VURegs, xgkickenable)));
 		a.Cbz(w10, &backup);
+		if (!packet_mode)
+		{
+			// A restored packet marker must downgrade even on a credit-only tick,
+			// just as the reference helper does after enabling XgKickHack.
+			a.Mov(w17, 1);
+			a.Str(w17, field(offsetof(VURegs, xgkickenable)));
+		}
 		// Credit-only ticks need no GIF call or vector-cache spill. Match the
 		// transfer helper's u32 count and sign-extended s32 cycle arithmetic.
 		a.Ldr(x10, field(offsetof(VURegs, xgkicklastcycle)));
@@ -305,12 +312,17 @@ namespace Arm64VU1
 		a.Bind(&done);
 		a.Ret();
 		result.finish_packet = code + a.GetCursorOffset();
-		Label packet_done;
+		Label packet_done, flush_transfer;
 		a.Ldr(w9, field(offsetof(VURegs, xgkickenable)));
 		a.Cmp(w9, VURegs::XgkickPacket);
 		a.B(ne, &packet_done);
 		a.Ldr(w9, field(offsetof(VURegs, xgkicksizeremaining)));
 		a.Cbnz(w9, &packet_done);
+		a.B(&flush_transfer);
+		result.flush_kick = code + a.GetCursorOffset();
+		a.Ldr(w9, field(offsetof(VURegs, xgkickenable)));
+		a.Cbz(w9, &packet_done);
+		a.Bind(&flush_transfer);
 		a.Stp(x15, lr, MemOperand(sp, -16, PreIndex));
 		transfer_cache(false);
 		a.Mov(w0, 0);

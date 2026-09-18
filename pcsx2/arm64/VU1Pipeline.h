@@ -34,9 +34,11 @@ namespace Arm64VU1
 		const void* branch_prepare = nullptr;
 		// Same cache ABI; finish a delayed packet after the pair has committed.
 		const void* finish_packet = nullptr;
+		// Flush any old transfer before issuing another XGKICK.
+		const void* flush_kick = nullptr;
 		size_t size = 0;
 	};
 
 	using XgkickTransfer = void (*)(s32 cycles, bool flush);
-	PipelineCode CompilePipeline(u8* code, size_t capacity, XgkickTransfer transfer = &_vuXGKICKTransfer);
+	PipelineCode CompilePipeline(u8* code, size_t capacity, XgkickTransfer transfer = &_vuXGKICKTransfer, bool packet_mode = true);
 } // namespace Arm64VU1

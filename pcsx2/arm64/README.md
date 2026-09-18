@@ -110,9 +110,11 @@ at an internal B or taken IBGTZ edge. Before entry, source validation checks eac
 can reach, including destination edits. Each pair advances at least one cycle;
 bytes beyond that bound are checked on a later call before they can execute. Per-pair budget exits publish the correct branch,
 delay and TPC state; a complete deferred region publishes its final state as
-before. Repeated PCs end the trace, so native loop back-edge linking is not yet
-implemented. The trace is bounded by the same 256-pair limit. Connecting
-not-taken successors and independently cached target-state matching remain
+before. A back edge to the same trace entry can stay native when no branch delay
+is unresolved. It retains the host frame and VF/ACC cache, rechecks the budget
+and pipeline guard, and reenters the generic incoming-state preparation. Back
+edges to other internal positions still end the trace. The trace is bounded by
+the same 256-pair limit. Connecting not-taken successors and independently cached target-state matching remain
 future work.
 Wider gameplay and callback combinations still need proper testing.
 
@@ -184,13 +186,19 @@ The x86 backend provides architectural references beyond instruction selection:
 
 These are different execution contracts, not just different SIMD encodings.
 The native packet policy keeps a pending kick in the existing architectural
-XGKICK fields. It completes after the following instruction pair, including its
+XGKICK fields. Ordinary ARM64 XGKICK issuance is native: it flushes an older
+request if present, reads the low VI address and initializes the same transfer
+fields and VU0 busy bit as the reference. XgKickHack keeps interpreter issuance,
+and changing that policy invalidates compiled code. A request completes after
+the following instruction pair, including its
 lower store, as microVU does. The next native call carries a pending-packet flag.
 After its first pair commits, a shared private-ABI entry publishes VF/ACC, calls
 the existing packet transfer and reloads the cache. Execution then continues in
 the same native frame if budget remains. Interpreter fallback observes the same
-transfer boundary, while a second
-XGKICK flushes the old request and starts a new delay. A pipeline stall must not
+transfer boundary. The same completion entry handles an in-trace delayed pair;
+a second XGKICK flushes the old request and starts a new delay. Kick issuance
+and delayed completion stay outside deferred queue regions, and their callbacks
+reset timing analysis before known scheduling resumes. A pipeline stall must not
 cause the transfer to move before the following store.
 
 Cycle-budget exits retain an unexecuted delay, and completion clears the busy
@@ -207,7 +215,7 @@ For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls
 After a generic prefix drains incoming entries, it emits known retirement counts
 instead of checking every queue at every pair. An entry guard rejects pending
 XGKICK, irregular incoming FMAC queues and cycle wrap. After the explicit
-first-pair packet completion, the full guard runs again against the current
+packet completion, the full guard runs again against the current
 state; the generic prefix still drains incoming work before scheduled execution. Pending FDIV,
 EFU and IALU work initially keeps the generic path, but readiness is checked again
 at the first scheduled pair and at the deferred region boundary. Once these
