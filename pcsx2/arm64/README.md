@@ -21,8 +21,14 @@ inside the execution driver, avoiding additional indirect dispatch through
 SPECIAL, REGIMM, COP0 and COP2 grouping functions. Exact NOP skips its empty
 handler after the driver has performed the usual PC/cycle/debug work. Opcode
 semantics remain in the existing tables; no extra decoded-code cache is used.
-These shared interpreter changes still need proper testing in PS1 mode and on
-other host architectures.
+At taken branch boundaries, scheduled device/counter work is scanned only when
+`iopNextEventCycle` is due, using the x64 dispatcher's signed 64-bit comparison.
+Already enabled hardware interrupts still force a scan immediately, including
+when CP0 Status changes in the delay slot. The EE-side unconditional event test
+and all event scheduling APIs remain in place. This avoids repeatedly walking
+the event queues during short loops without fast-forwarding guest cycles.
+These shared interpreter changes still need proper testing in PS1 gameplay and
+on other host architectures.
 
 ## EE
 

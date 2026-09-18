@@ -1129,3 +1129,63 @@ The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `dispatch-production-{build,ctest,state,state-console}.log`.
+
+## IOP branch event polling
+
+Temporary instruction and branch counters identified a much more concentrated
+workload than general integer arithmetic. Fourteen 10-million-instruction chunks
+reported between the logged intro frames 872 and 1095 contained 140,001,909
+instructions: exact NOP accounted for 45.84%, and J for 45.10%. This frequency
+does not by itself prove that those jumps are all safe idle loops, nor measure
+the time cost of individual opcodes. The first chunk can include work before
+frame 872. Diagnostic artifact: `diagnostic-iop-counts.log`.
+
+Of 64,203,310 taken-branch event scans in those chunks, 64,010,108 (**99.70%**)
+occurred before `iopNextEventCycle`. These diagnostics added per-instruction
+counters and timers, so their VPS is not used as a performance baseline. The
+recorded ExecuteBlock elapsed time also includes instrumentation and scheduling;
+it is not an exact CPU-time attribution.
+
+Unlike the x64 recompiler's deadline check in `iPsxBranchTest`, the IOP
+interpreter unconditionally called `iopEventTest` at every taken branch. It now
+checks the same signed 64-bit cycle difference before scanning scheduled events.
+It additionally retains the interpreter's immediate response to an already
+pending, enabled hardware interrupt, using the existing CP0 Status/ICTRL/
+ISTAT/IMASK condition after the delay slot. This matters because MTC0 and RFE can
+change interrupt eligibility before the scheduled deadline. The EE-side
+unconditional scan and device/counter scheduling APIs are unchanged. No guest
+instructions or cycles are skipped, and no idle-loop fast-forwarding is added.
+
+Six integration tests execute actual J/delay-slot programs through `psxInt`.
+They cover future/due deadlines, crossing both the 32-bit and full 64-bit cycle
+boundaries, immediate pending interrupts against the existing event handler,
+MTC0 and RFE enabling/disabling interrupts in the delay slot, future device and
+counter scheduling, and the PS1 fractional EE/IOP cycle conversion. More games
+and real PS1 execution still need proper testing.
+
+Serial comparison against `e57f028bc`, frames 850–1100, MTVU disabled, in execution
+order:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| poll-old-a | 56.97 | 17.50 | 3.17 |
+| poll-new-a | 58.32 | 17.11 | 3.17 |
+| poll-new-b | 57.73 | 17.28 | 3.17 |
+| poll-old-b | 54.68 | 18.13 | 3.34 |
+| poll-old-c | 57.04 | 17.47 | 3.16 |
+| poll-new-c | 57.66 | 17.29 | 3.17 |
+
+Mean throughput is **56.23 → 57.91 VPS (+3.0%)**. All three paired comparisons
+improved, but old-b was slower than the other baselines, including increased GS
+time. Paired gains range from about 1.1% to 5.6%; the average should not be treated
+as a precise universal speedup. Both apps had the same temporary metrics logging,
+with no instruction counters, sampling or concurrent builds/tests. No run was
+excluded. Logs: `diagnostic-poll-{old-a,new-a,new-b,old-b,old-c,new-c}.log`.
+
+Production validation: temporary diagnostics removed, ARM64 app rebuilt,
+**214 tests** (20 common, 194 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS during the 20-second smoke run; the log records
+normal device shutdown and host-memory release. The process exit code was not
+captured after the tool session ended. The existing optional patches.zip warning
+remains. No visual, long-gameplay or x64 runtime validation was performed. Logs:
+`poll-production-{build,ctest,state,state-console}.log`.

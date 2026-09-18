@@ -7,6 +7,7 @@ add_pcsx2_test(core_test
 	ee_recompiler_tests.cpp
 	iop_fetch_tests.cpp
 	iop_dispatch_tests.cpp
+	iop_branch_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )

@@ -261,7 +261,15 @@ static void doBranch(s32 tar) {
 	iopIsDelaySlot = false;
 	psxRegs.pc = branchPC;
 
-	iopEventTest();
+	// As in the x64 dispatcher, scheduled work only needs a scan at its deadline.
+	// Unlike a deadline-only check, keep the interpreter's immediate interrupt
+	// response when CP0 or hardware state changes (including in the delay slot).
+	if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0 ||
+		((psxRegs.CP0.n.Status & 0xFE01) >= 0x401 && psxHu32(HW_ICTRL) != 0 &&
+			(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
+	{
+		iopEventTest();
+	}
 }
 
 static void intReserve() {
