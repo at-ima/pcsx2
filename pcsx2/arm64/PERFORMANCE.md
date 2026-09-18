@@ -140,3 +140,39 @@ frames 850–1300 were 24.581 / 24.3565 / 24.066 / 23.937 VPS, with no clear ben
 
 After restoring the production sources, the ARM64 application build and deep code
 signature verification passed, as did both CTest executables (160 unit tests).
+
+## Follow-up: avoid premature EE branch event polling
+
+The ARM64 driver was calling `_cpuEventTest_Shared()` on every branch test,
+including before `cpuRegs.nextEventCycle`. The x86 `iBranchTest` checks the event
+deadline first. This repeatedly invoked IOP synchronization and device checks
+from short EE blocks. Applying the same deadline check only to native branch
+exits measured 26.54 VPS; applying it to interpreted branch fallback during
+native execution as well measured 28.38 and 27.89 VPS, with an intervening old
+build at 24.83 VPS. CPU-thread time fell from 40.17 to 35.19–35.77 ms/frame.
+These runs use the same frame selection and configuration described above.
+
+The adopted change is the EE branch-polling policy, approximately 12–14% higher
+throughput in this scene. Normal interpreter/boot polling, explicit CP0/MMIO
+requests, and requested execution exits retain their forced behavior. Tests
+cover deadline equality, overdue events, 32-bit/full-64-bit cycle boundaries,
+and forced/interpreter polling. Runtime timing compatibility beyond the tested
+scene still needs broader coverage. This does **not** achieve 60 FPS.
+
+Other experiments were not adopted: 128-pair VU blocks measured 25.60 and 25.33
+VPS against 24.75 VPS; adding compiled vector-cache transfer stubs measured
+25.17 and 25.40 VPS, providing no additional gain. Their patch is retained as
+`build-arm64/transfer-stub-experiment.patch`. Hot-block counting identified the
+movie's repeated color-conversion microprogram, rather than an unexplained VU
+spin loop. No game-specific instruction sequence was added to the backend.
+
+Follow-up logs are `diagnostic-ee-{deadline-a,all-a,old,all-b}.log` under the
+ignored build directory. Temporary metrics logging was removed from production.
+
+The final production application and core test executable were rebuilt after
+removing instrumentation. Deep code-signature verification and all 161 unit
+tests passed. The additional production save-state smoke run was initially
+blocked by the approval-review usage limit. After continuation, the existing
+SCPS-15025 state loaded successfully, ran for 20 seconds without an early process
+exit, and shut down with exit code 0. This is a smoke check, not a visual or
+long-duration compatibility validation. Logs: `ee-deadline-state*.log`.

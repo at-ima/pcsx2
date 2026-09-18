@@ -44,9 +44,9 @@ Supported integer branches and jumps terminate the block. Their delay slot must
 be a supported, nontrapping integer instruction in the same page and block.
 Taken branches return after executing that slot, with the sequential PC still
 just past it. The shared driver commits the target, applies the existing wait-loop
-logic, commits cycles and tests events. Untaken branches preserve the interpreter's
-boundaries: ordinary branches leave the delay slot for the next dispatch, likely
-branches annul it, and BEQ/BNE and annulled likely branches request an event test
+logic, commits cycles and polls the event deadline. Untaken branches preserve
+the interpreter's boundaries: ordinary branches leave the delay slot for the next dispatch, likely
+branches annul it, and BEQ/BNE and annulled likely branches poll the event deadline
 without committing cycles. Unsupported delay slots fall back with the entire
 branch, before any link-register changes. Goemon TLB callbacks remain interpreted;
 changing that gamefix invalidates the block cache. Branch/event integration still
@@ -72,6 +72,14 @@ pairs do not repeatedly invoke compilation. Patching either word rechecks the
 pair. Cache hits validate bytes without decoding the entry opcode again;
 allocation and compilation stay outside the frequently executed dispatcher.
 Exhausting the reserved executable buffer resets the cache as a whole.
+
+Native execution uses the x86 dispatcher's signed 64-bit event-deadline check
+for branch polling, including interpreted branch fallbacks. Boot and ordinary
+interpreter execution retain unconditional branch event tests. Explicit CP0 and
+MMIO event tests remain forced; pending execution exits also bypass the deadline.
+The active-backend flag is cleared on execution exit and on return to boot hooks.
+This avoids synchronizing IOP and scanning device events at every short branch.
+Interrupt-sensitive games still need broader testing.
 
 `R5900cpu::usesInterpreterExecution` specifies the shared driver's branch timing
 and architectural TLB-miss behavior. It is independent of whether a provider

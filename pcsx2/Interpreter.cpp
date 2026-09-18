@@ -22,10 +22,20 @@ static int branch2 = 0;
 static u32 cpuBlockCycles = 0;		// 3 bit fixed point version of cycle count
 static std::string disOut;
 static bool intExitExecution = false;
+static bool intBackendActive = false;
 static fastjmp_buf intJmpBuf;
 static u32 intLastBranchTo;
 
 void intEventTest();
+
+static __fi void intBranchEventTest()
+{
+	// Match the x86 dispatcher's event deadline for native execution, including
+	// interpreted branch fallback. CP0/MMIO still request forced tests directly.
+	// Broader interrupt-sensitive game coverage needs proper testing.
+	if (EEBranchEventDue(intBackendActive, intExitExecution, cpuRegs.cycle, cpuRegs.nextEventCycle))
+		intEventTest();
+}
 
 void intUpdateCPUCycles()
 {
@@ -276,7 +286,7 @@ static void doBranch( u32 target )
 {
 	_doBranch_shared( target );
 	intUpdateCPUCycles();
-	intEventTest();
+	intBranchEventTest();
 }
 
 void intDoBranch(u32 target)
@@ -287,7 +297,7 @@ void intDoBranch(u32 target)
 	if (Cpu->usesInterpreterExecution)
 	{
 		intUpdateCPUCycles();
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -341,7 +351,7 @@ void BEQ()  // Branch if Rs == Rt
 	if (cpuRegs.GPR.r[_Rs_].SD[0] == cpuRegs.GPR.r[_Rt_].SD[0])
 		doBranch(_BranchTarget_);
 	else
-		intEventTest();
+		intBranchEventTest();
 }
 
 void BNE()  // Branch if Rs != Rt
@@ -349,7 +359,7 @@ void BNE()  // Branch if Rs != Rt
 	if (cpuRegs.GPR.r[_Rs_].SD[0] != cpuRegs.GPR.r[_Rt_].SD[0])
 		doBranch(_BranchTarget_);
 	else
-		intEventTest();
+		intBranchEventTest();
 }
 
 /*********************************************************
@@ -422,7 +432,7 @@ void BEQL()    // Branch if Rs == Rt
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -435,7 +445,7 @@ void BNEL()     // Branch if Rs != Rt
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -448,7 +458,7 @@ void BLEZL()    // Branch if Rs <= 0
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -461,7 +471,7 @@ void BGTZL()     // Branch if Rs >  0
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -474,7 +484,7 @@ void BLTZL()     // Branch if Rs <  0
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -487,7 +497,7 @@ void BGEZL()     // Branch if Rs >= 0
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -501,7 +511,7 @@ void BLTZALL()   // Branch if Rs <  0 and link
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -515,7 +525,7 @@ void BGEZALL()   // Branch if Rs >= 0 and link
 	else
 	{
 		cpuRegs.pc +=4;
-		intEventTest();
+		intBranchEventTest();
 	}
 }
 
@@ -597,15 +607,20 @@ static void intCancelInstruction()
 
 void intExecuteWithBackend(EEBlockExecutor execute_block)
 {
+	intBackendActive = false;
 	// This will come back as zero the first time it runs, or on instruction cancel.
 	// It will come back as nonzero when we exit execution.
 	if (fastjmp_set(&intJmpBuf) != 0)
+	{
+		intBackendActive = false;
 		return;
+	}
 
 	for (;;)
 	{
 		if (!VMManager::Internal::HasBootedELF())
 		{
+			intBackendActive = false;
 			// Avoid reloading every instruction.
 			u32 elf_entry_point = VMManager::Internal::GetCurrentELFEntryPoint();
 			u32 eeload_main = g_eeloadMain;
@@ -659,6 +674,7 @@ void intExecuteWithBackend(EEBlockExecutor execute_block)
 		}
 		else if (execute_block)
 		{
+			intBackendActive = true;
 			while (true)
 			{
 				const EEBlockResult result = execute_block(cpuBlockCycles);
@@ -671,10 +687,10 @@ void intExecuteWithBackend(EEBlockExecutor execute_block)
 						branch2 = cpuRegs.branch = 1;
 						intFinishBranch(result.target);
 						intUpdateCPUCycles();
-						intEventTest();
+						intBranchEventTest();
 						break;
 					case EEBlockExit::EventTest:
-						intEventTest();
+						intBranchEventTest();
 						break;
 					case EEBlockExit::Continue:
 						break;

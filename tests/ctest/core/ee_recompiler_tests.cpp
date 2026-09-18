@@ -11,6 +11,30 @@
 #include <array>
 #include <algorithm>
 
+// Deadline polling must remain correct across both the old 32-bit cycle boundary
+// and the full counter wrap, without postponing an execution-exit request.
+TEST(EEBranchPollingTest, DeadlinesWrapAndForcedInterpreterPolling)
+{
+	struct Case
+	{
+		u64 cycle;
+		u64 deadline;
+		bool due;
+	};
+	constexpr Case cases[] = {
+		{99, 100, false}, {100, 100, true}, {101, 100, true},
+		{0xffffffff, 0x100000000, false}, {0x100000000, 0xffffffff, true},
+		{~u64(0), 0, false}, {0, ~u64(0), true},
+		{~u64(0) - 2, 2, false}, {2, ~u64(0) - 2, true}};
+	for (const auto& test : cases)
+	{
+		SCOPED_TRACE(testing::Message() << "cycle=" << test.cycle << " deadline=" << test.deadline);
+		EXPECT_EQ(EEBranchEventDue(true, false, test.cycle, test.deadline), test.due);
+		EXPECT_TRUE(EEBranchEventDue(true, true, test.cycle, test.deadline));
+		EXPECT_TRUE(EEBranchEventDue(false, false, test.cycle, test.deadline));
+	}
+}
+
 namespace
 {
 	constexpr u32 Base = 0x10000;
