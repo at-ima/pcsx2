@@ -1041,3 +1041,49 @@ The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `flags-production-{build,ctest,state,state-console}.log`.
+
+## IOP instruction fetch overhead
+
+`VMManager::UpdateCPUImplementations` still selects `psxInt` on ARM64, while x64
+can select `psxRec`. The earlier sample contains repeated IOP interpreter frames,
+but does not establish IOP's fraction of CPU time. Inspection found that every
+IOP opcode fetch, and J's import-table delay-slot probe, called the general
+`iopMemRead32` device/memory dispatcher even for ordinary RAM.
+
+`iopMemFetch32` now inlines the aligned main-RAM case through the current RLUT.
+It only handles physical addresses below 8 MiB, retains page mirrors and virtual
+aliases, and reloads both the mapping and instruction on every access. It does
+not cache decoded instructions or require write invalidation. Unmapped entries,
+unaligned addresses, ROM and hardware regions use the existing read function;
+in particular, a nonzero hardware/SIF RLUT entry never bypasses its handler.
+Cycle accounting, branch delay slots, event polling and debug hooks are unchanged.
+
+Three focused tests cover RAM page boundaries and aliases, instruction edits,
+remapping/unmapping, ROM/expansion fallback and the hardware scratchpad path even
+when its RLUT points at different data. They supplement the existing EE/VU tests;
+PS1 execution, other host architectures and long gameplay remain unvalidated.
+
+Serial comparison against `fd2fdf4f1`, frames 850–1100, MTVU disabled, in execution
+order:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| iop-old-a | 54.60 | 18.23 | 3.20 |
+| iop-new-a | 56.70 | 17.58 | 3.18 |
+| iop-old-b | 54.65 | 18.23 | 3.19 |
+| iop-new-b | 54.92 | 18.08 | 3.29 |
+| iop-new-c | 55.51 | 17.92 | 3.24 |
+| iop-old-c | 54.11 | 18.41 | 3.16 |
+
+Mean throughput is **54.45 → 55.71 VPS (+2.3%)**. All three paired comparisons
+improved, but the size varied substantially (about 0.5–3.8%); this is not a
+precise universal speedup or a solution to the remaining 60-VPS gap. Both apps
+used the same temporary metrics logging, without sampling or concurrent builds
+or tests. Logs: `diagnostic-iop-{old-a,new-a,old-b,new-b,new-c,old-c}.log`.
+
+Production validation: temporary metrics logging removed, ARM64 app rebuilt,
+**206 tests** (20 common, 186 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`iop-production-{build,ctest,state,state-console}.log`.

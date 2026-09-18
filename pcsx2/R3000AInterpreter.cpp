@@ -85,7 +85,7 @@ void psxBNE()   // Branch if Rs != Rt
 void psxJ()
 {
 	// check for iop module import table magic
-	u32 delayslot = iopMemRead32(psxRegs.pc);
+	u32 delayslot = iopMemFetch32(psxRegs.pc);
 	if (delayslot >> 16 == 0x2400 && irxImportExec(irxImportTableAddr(psxRegs.pc), delayslot & 0xffff))
 		return;
 
@@ -226,9 +226,9 @@ static __fi void execI()
 		}
 	}
 
-	psxRegs.code = iopMemRead32(psxRegs.pc);
+	psxRegs.code = iopMemFetch32(psxRegs.pc);
 
-		PSXCPU_LOG("%s", disR3000AF(psxRegs.code, psxRegs.pc));
+	PSXCPU_LOG("%s", disR3000AF(psxRegs.code, psxRegs.pc));
 
 	psxRegs.pc+= 4;
 	psxRegs.cycle++;

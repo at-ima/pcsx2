@@ -7,6 +7,18 @@ against the interpreters. Do not add game-specific execution shortcuts.
 See [the intro performance investigation](PERFORMANCE.md) for measured bottlenecks
 and the limits of the current x64 comparison.
 
+## IOP
+
+ARM64 still uses the IOP interpreter. Aligned instruction fetches in the first
+8 MiB physical RAM window read through the live RLUT directly, including RAM
+mirrors and virtual aliases. Each fetch reloads both the page mapping and the
+instruction; no decoded-code cache or invalidation mechanism is introduced.
+ROM, unmapped memory and hardware regions retain `iopMemRead32` handling. The
+same path serves the J instruction's import-table delay-slot probe. Instruction
+execution, branch timing, event polling and debugging hooks remain unchanged.
+This shared interpreter change still needs proper testing in PS1 mode and on
+other host architectures.
+
 ## EE
 
 - `EERecompiler.cpp` owns the `R5900cpu` provider, block lookup, source validation,
