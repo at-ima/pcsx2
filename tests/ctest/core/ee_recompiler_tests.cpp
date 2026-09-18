@@ -331,6 +331,92 @@ TEST_F(EERecompilerTest, RamLoadsStoresAndAddressWrapping)
 	}
 }
 
+TEST_F(EERecompilerTest, LookupCollisionsRemappingAndCacheLifetime)
+{
+	// These PCs collide in the front cache while naming different instructions.
+	constexpr u32 other = Alias + 16;
+	Map(Alias, memory.data());
+	memory.fill(Stop);
+	program[0] = (9u << 26) | (1 << 16) | 11;
+	memory[4] = (9u << 26) | (1 << 16) | 22;
+	auto run = [&](u32 pc, u32 expected) {
+		cpuRegs.pc = pc;
+		u32 cycles = 0;
+		EXPECT_TRUE(Arm64EE::TryExecute(cycles));
+		EXPECT_EQ(cpuRegs.GPR.r[1].UD[0], expected);
+		EXPECT_EQ(cpuRegs.pc, pc + 4);
+	};
+	run(Base, 11);
+	run(other, 22);
+	const size_t warmed = Arm64EE::GetCommittedCache();
+	for (u32 i = 0; i < 32; i++)
+	{
+		run(Base, 11);
+		run(other, 22);
+	}
+	EXPECT_EQ(Arm64EE::GetCommittedCache(), warmed);
+	// A cached PC still validates its mapping and every source word.
+	memory[0] = (9u << 26) | (1 << 16) | 33;
+	Map(Base, memory.data());
+	run(Base, 33);
+	memory[0] = (9u << 26) | (1 << 16) | 44;
+	run(Base, 44);
+	Arm64EE::Reset();
+	run(Base, 44);
+	Arm64EE::Shutdown();
+	run(Base, 44);
+}
+
+TEST_F(EERecompilerTest, RejectedLookupRechecksCodeMappingAndCollidingPCs)
+{
+	Map(Alias, memory.data());
+	memory.fill(Stop);
+	constexpr u32 other = Alias + 16;
+	auto reject = [&](u32 pc) {
+		cpuRegs.pc = pc;
+		const cpuRegisters before = cpuRegs;
+		u32 cycles = 123;
+		for (u32 i = 0; i < 3; i++)
+		{
+			EXPECT_FALSE(Arm64EE::TryExecute(cycles));
+			EXPECT_EQ(cycles, 123u);
+			EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(before)), 0);
+		}
+	};
+	reject(Base);
+	reject(other);
+	reject(Base);
+	program[0] = (9u << 26) | (1 << 16) | 77;
+	cpuRegs.pc = Base;
+	Compare(1);
+	program[0] = Stop;
+	reject(Base);
+	memory[0] = (9u << 26) | (1 << 16) | 88;
+	Map(Base, memory.data());
+	cpuRegs.pc = Base;
+	Compare(1);
+	EXPECT_EQ(cpuRegs.GPR.r[1].UD[0], 88u);
+}
+
+TEST_F(EERecompilerTest, LookupPointersSurviveBackingMapGrowth)
+{
+	for (u32 i = 0; i < 256; i++)
+		program[i * 2] = (9u << 26) | (1 << 16) | (i + 1);
+	for (u32 i = 0; i < 256; i++)
+	{
+		cpuRegs.pc = Base + i * 8;
+		u32 cycles = 0;
+		ASSERT_TRUE(Arm64EE::TryExecute(cycles));
+		EXPECT_EQ(cpuRegs.GPR.r[1].UD[0], i + 1);
+	}
+	const size_t warmed = Arm64EE::GetCommittedCache();
+	cpuRegs.pc = Base;
+	u32 cycles = 0;
+	ASSERT_TRUE(Arm64EE::TryExecute(cycles));
+	EXPECT_EQ(cpuRegs.GPR.r[1].UD[0], 1u);
+	EXPECT_EQ(Arm64EE::GetCommittedCache(), warmed);
+}
+
 TEST_F(EERecompilerTest, MixedMemoryBlocksAndSelfModifyingAliases)
 {
 	cpuRegs.GPR.r[1].UD[0] = Data;

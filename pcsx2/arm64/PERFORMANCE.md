@@ -176,3 +176,40 @@ blocked by the approval-review usage limit. After continuation, the existing
 SCPS-15025 state loaded successfully, ran for 20 seconds without an early process
 exit, and shut down with exit code 0. This is a smoke check, not a visual or
 long-duration compatibility validation. Logs: `ee-deadline-state*.log`.
+
+## Follow-up: EE lookup and rejected-entry caching
+
+After the event fix, a separate 2,888-sample CPU capture classified 28.5% in the
+shared VU pipeline, 19.8% in generated VU blocks, 13.0% in XGKICK/GIF, 15.5% in
+EE dispatch/generated code, and 7.9% in IOP execution/events. These are sampled
+shares, not a claim that VU pipeline work became more expensive per frame.
+Artifacts: `diagnostic-sample-after-events.sample.txt` and
+`post-event-sample-breakdown.json` in the ignored build directory.
+
+A 1,024-entry front cache retains full virtual-PC tags and non-owning pointers to
+the existing owning block map. Full mapping/source validation still occurs for
+compiled blocks. Opcode-level rejection is reusable only when both the mapped
+source pointer and first instruction word match; rejected branch/delay blocks
+continue to validate both words. Cache reset/shutdown clears all lookup entries.
+The table uses 24 KiB on ARM64.
+
+With the event fix in both versions, the new/old/old/new sequence over frames
+850–1100 measured **28.56 / 28.03 / 28.00 / 28.96 VPS**. New CPU-thread times were
+34.93 and 34.45 ms/frame, versus 35.68 and 35.60 for the old version. This is a
+modest approximately 2–3% improvement in this scene, not a route to 60 FPS by
+itself. Logs: `diagnostic-rejected-{new,old}-{a,b}.log`.
+
+Positive lookup caching alone measured 28.44 / 28.32 / 28.12 / 28.27 VPS, showing
+little benefit. Separately, removing duplicate VU opcode-field stores passed
+state-comparison tests but measured 27.91 / 28.31 / 27.78 / 28.16 VPS. It was not
+adopted. That experiment remains in `vu-opcode-store-experiment.patch`.
+
+New tests exercise lookup collisions, source mutation, virtual remapping,
+reset/shutdown/restart, rejection becoming supported, and pointer validity across
+owning-map growth. Temporary performance logging is removed from production.
+
+Final production validation: ARM64 app/core-test build, deep code-signature
+verification, and all 164 unit tests passed. The existing SCPS-15025 save state
+loaded and ran for 20 seconds without early process exit, then shut down with
+exit code 0 (`ee-lookup-state*.log`). No cross-platform or long-gameplay validation
+was performed for this change.

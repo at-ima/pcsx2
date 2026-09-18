@@ -26,6 +26,16 @@ namespace
 		Function function = nullptr;
 	};
 	std::unordered_map<u32, Block> s_blocks;
+	struct LookupEntry
+	{
+		u32 pc = 0;
+		u32 rejected_word = 0;
+		const Block* block = nullptr;
+		const u32* rejected_source = nullptr;
+	};
+	// unordered_map preserves element addresses across rehash. Reset/Shutdown
+	// clear this non-owning cache before destroying the backing blocks.
+	std::array<LookupEntry, 1024> s_lookup{};
 	u8* s_write = nullptr;
 	u8* s_write_limit = nullptr;
 	bool s_goemon_tlb_hack = false;
@@ -87,6 +97,7 @@ namespace
 
 __noinline void Arm64EE::Reset()
 {
+	s_lookup.fill({});
 	s_blocks.clear();
 	s_write = SysMemory::GetEERec();
 	// The reserved buffer is stable until Shutdown; keep its compilation margin
@@ -97,6 +108,7 @@ __noinline void Arm64EE::Reset()
 
 void Arm64EE::Shutdown()
 {
+	s_lookup.fill({});
 	decltype(s_blocks){}.swap(s_blocks);
 	s_write = nullptr;
 	s_write_limit = nullptr;
@@ -116,8 +128,20 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 	const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
 	if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_write > s_write_limit)
 		Reset();
-	const auto it = s_blocks.find(pc);
-	const Block* block = it != s_blocks.end() ? &it->second : nullptr;
+	// Mix page and instruction bits to avoid concentrating same-offset blocks
+	// in one slot. The full PC tag keeps virtual aliases distinct.
+	LookupEntry& lookup = s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)];
+	const Block* block = lookup.pc == pc ? lookup.block : nullptr;
+	if (!block)
+	{
+		// Only opcode-level rejection is cached here. Branch/delay rejection
+		// still uses a Block and validates both instruction words below.
+		if (lookup.pc == pc && lookup.rejected_source == source && lookup.rejected_word == source[0])
+			return {};
+		const auto it = s_blocks.find(pc);
+		block = it != s_blocks.end() ? &it->second : nullptr;
+		lookup = {pc, 0, block, nullptr};
+	}
 	// Recheck the virtual mapping and all source words on every entry. This also
 	// covers self-modifying code, DMA, TLB changes and state loads without Clear().
 	if (!block || block->source != source || std::memcmp(source, block->words.data(), block->word_count * 4) != 0)
@@ -125,8 +149,12 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		// Validated cache hits need no opcode decoding. Avoid allocating entries
 		// for unsupported entry instructions on the interpreter fallback path.
 		if (!CodeGenerator::Supports(source[0]))
+		{
+			lookup = {pc, source[0], nullptr, source};
 			return {};
+		}
 		block = &Compile(pc, source);
+		lookup = {pc, 0, block, nullptr};
 	}
 	if (!block->function)
 		return {};

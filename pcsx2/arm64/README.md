@@ -65,6 +65,13 @@ patches and state restoration without requiring a separate invalidation scheme.
 The initial implementation uses memory-backed guest registers; register caching
 must preserve the same entry, exit and fallback contracts when introduced.
 
+A small direct-mapped lookup cache avoids repeated hash-table searches for hot
+PCs. Tags contain the full virtual PC. Unsupported entry opcodes are cached only
+while their mapped source pointer and instruction word remain unchanged; rejected
+branch/delay pairs still validate both words. Supported hits retain full source
+validation. The owning map keeps block addresses stable across rehash, and reset
+or shutdown clears lookup pointers before destroying blocks.
+
 The cache is keyed by the full guest PC. Distinct blocks with the same page
 offset coexist instead of repeatedly evicting and recompiling each other.
 Rejected branch/delay pairs retain their source words so unchanged unsupported
