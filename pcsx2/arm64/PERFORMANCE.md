@@ -741,3 +741,61 @@ before the packet transfer. Deep signature verification passed. The SCPS-15025
 state loaded SPU2/GS, ran for 20 seconds and shut down normally. The existing
 optional patches.zip warning remains. No visual, long-gameplay or x64 runtime
 validation was performed. Logs: `link-production-{build,ctest,state,state-console}.log`.
+
+
+## Native ILW and IBGTZ with integer-pipeline timing
+
+The fallback counts identified ILW and IBGTZ as active work, unlike unconditional
+B in this intro. ILW now performs its halfword load natively and issues the
+reference four-cycle IALU record, preserving queue padding and inactive entries.
+It does not use arithmetic BackupVI. IBGTZ uses a new shared preparation entry
+which applies matching VI load stalls after upper FMAC stalls and before pipeline
+retirement, then selects the signed current/backup VI value and records a taken
+branch with one delay pair remaining.
+
+ILW invalidates transient scheduling readiness; its own pair and four following
+pairs use generic retirement. The compiler rechecks readiness when a known
+schedule resumes. Thus pending integer work is never silently omitted from the
+deferred representation. A conditional terminal pair is kept outside that
+representation: the preceding body can still defer queue construction and flow
+into branch preparation with VF/ACC cached. Exact budget exhaustion exits before
+the branch. Conditional successors and pending delay slots still use dispatch;
+this change does not claim conditional edge linking.
+
+Tests cover all ILW component masks, VI0, base/destination aliasing, halfword
+preservation, signed/wrapped addresses, inactive queue padding, VI backups,
+matching and unrelated integer hazards, combined FMAC/IALU waits, cycle wrap,
+load bursts and resumption of static scheduling. Every budget across deferred
+bodies and taken/not-taken conditional tails is compared against the interpreter.
+The private-ABI callback test also exercises the seventh (integer branch) entry.
+
+Exploratory measurements: baseline 50.46 VPS; native ILW/IBGTZ with a separate
+conditional entry 51.96 VPS; including the conditional tail in its preceding
+native trace 52.09 VPS. These measure the same frames 850–1100 with MTVU disabled.
+They show a modest benefit, not evidence that video decoding itself is the root
+cause. Logs: `diagnostic-int-{old-a,new-a,tail-a}.log`.
+
+Serial final/new baseline comparison, in new/old/old/new order:
+
+| Run | VPS | CPU ms/frame |
+| --- | ---: | ---: |
+| int-tail-a | 52.09 | 19.12 |
+| int-old-b | 51.02 | 19.53 |
+| int-old-c | 50.63 | 19.69 |
+| int-tail-b | 52.73 | 18.90 |
+
+Mean throughput improves **50.83 → 52.41 VPS (3.1%)** against
+`665b161c5`. This remains below 60 VPS. The runs were unsampled and serial, with
+identical temporary metrics logging in both apps; logs are
+`diagnostic-int-{tail-a,old-b,old-c,tail-b}.log`. The change retains shared FMAC
+retirement and adds native integer pipeline/branch handling; it does not establish
+that the remaining frame-time cost belongs to a video decoder. Direct conditional
+successor linking, other extended lower operations and EE/IOP work remain outside
+this change.
+
+Production validation: metrics logging removed, ARM64 app and core tests rebuilt,
+all **195 tests** (20 common, 175 core) passed, and deep signature verification
+passed. The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and shut down with
+exit code 0. The existing optional patches.zip warning remains. No visual,
+long-gameplay or x64 runtime validation was performed. Logs:
+`int-production-{build,ctest,state,state-console}.log`.

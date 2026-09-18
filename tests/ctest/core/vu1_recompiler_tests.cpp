@@ -174,6 +174,152 @@ TEST_F(VU1RecompilerTest, BlockBoundaryPreservesHostVectorRegisters)
 	}
 }
 
+TEST_F(VU1RecompilerTest, IntegerLoadsAndPositiveBranchesMatchPipelineTiming)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 mask = 0; mask < 16; mask++)
+	{
+		for (u32 dest : {0u, 1u, 2u})
+		{
+			for (u32 budget = 1; budget <= 12; budget++)
+			{
+				SCOPED_TRACE(testing::Message() << mask << "/" << dest << "/" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.VI[1].UL = 0xabcdffff;
+				VU1.ialureadpos = VU1.ialuwritepos = 3;
+				std::memset(VU1.ialu, 0xa5, sizeof(VU1.ialu));
+				VU1.VIBackupCycles = 3;
+				VU1.VIRegNumber = dest;
+				VU1.VIOldValue = 0xffff;
+				const u32 data[] = {1u, 0x8000u, 0xffffu, 0u};
+				std::memcpy(VU1.Mem + 0x3fe0, data, sizeof(data));
+				Put(0, 0x2ff, 0x08000000 | (mask << 21) | (dest << 16) | (1 << 11) | 0x7ff);
+				Put(8, 0x2ff, 0x5a000000 | (dest << 11) | 2); // IBGTZ, with ILW dependency.
+				Put(16, 0x800002ff, 0x40000000);
+				Put(24, 0xc00002ff, 0x40400000);
+				Put(32, 0x800002ff, 0x40800000);
+				Put(40, 0xc00002ff, 0x41000000);
+				Put(48, 0x800002ff, 0x3f800000);
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, IntegerBranchUsesBackupAndIncomingHazards)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	Put(0, 0x2ff, 0x5a000000 | (2 << 11) | 2);
+	Put(8, 0x800002ff, 0x40000000);
+	for (u32 value : {0u, 1u, 0x7fffu, 0x8000u, 0xffffu})
+		for (u32 latency : {0u, 1u, 2u, 4u, 16u, 260u})
+			for (bool wrap : {false, true})
+			{
+				SCOPED_TRACE(testing::Message() << value << "/" << latency << "/" << wrap);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = wrap ? ~u64(0) - 2 : 100;
+				VU1.VI[2].UL = 0xffff0000 | value;
+				VU1.VIRegNumber = 2;
+				VU1.VIOldValue = value ? 0 : 1;
+				VU1.VIBackupCycles = 2;
+				if (latency)
+				{
+					VU1.ialucount = 1;
+					VU1.ialuwritepos = 1;
+					VU1.ialu[0].sCycle = VU1.cycle;
+					VU1.ialu[0].Cycle = latency;
+					VU1.ialu[0].reg = 1 << 2;
+				}
+				Compare(1);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
+TEST_F(VU1RecompilerTest, IntegerBranchCombinesFmacAndIaluWaits)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	Put(0, (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x5a000000 | (2 << 11) | 2);
+	for (u32 latency : {1u, 2u, 4u, 8u})
+		for (u32 match : {1u, 2u})
+			for (u32 budget : {1u, 4u, 8u})
+			{
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = 100;
+				VU1.fmaccount = 1;
+				VU1.fmacwritepos = 1;
+				VU1.fmac[0].sCycle = 100;
+				VU1.fmac[0].Cycle = 4;
+				VU1.fmac[0].regupper = 1;
+				VU1.fmac[0].xyzwupper = 15;
+				VU1.ialucount = 1;
+				VU1.ialuwritepos = 1;
+				VU1.ialu[0].sCycle = 100;
+				VU1.ialu[0].Cycle = latency;
+				VU1.ialu[0].reg = 1 << match;
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
+TEST_F(VU1RecompilerTest, IntegerLoadsResumeScheduledSuffix)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 load_at : {0u, 7u, 16u, 30u})
+	{
+		for (u32 i = 0; i < 64; i++)
+			Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
+		for (u32 i = load_at; i < load_at + 4; i++)
+			Put(i * 8, 0x2ff, 0x08000000 | (15 << 21) | (2 << 16) | (1 << 11));
+		Put(512, 0xc00002ff, 0x3f800000);
+		Put(520, 0x800002ff, 0x3f800000);
+		for (u32 budget : {1u, 7u, 16u, 31u, 64u, 128u, 256u})
+		{
+			VU0 = initial0;
+			VU1 = initial;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ConditionalTailPreservesEveryBudgetExit)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 length : {16u, 32u})
+		for (u32 load_at : {0u, 8u, length - 1})
+			for (u32 value : {0u, 1u, 0xffffu})
+			{
+				for (u32 i = 0; i < length; i++)
+					Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
+				Put(load_at * 8, 0x2ff, 0x08000000 | (8 << 21) | (2 << 16) | (1 << 11));
+				Put(length * 8, 0x2ff, 0x5a000000 | (2 << 11) | 3);
+				Put((length + 1) * 8, 0x800002ff, 0x40000000);
+				Put((length + 2) * 8, 0xc00002ff, 0x40400000);
+				Put((length + 3) * 8, 0x800002ff, 0x40800000);
+				Put((length + 4) * 8, 0xc00002ff, 0x41000000);
+				Put((length + 5) * 8, 0x800002ff, 0x3f800000);
+				for (u32 budget = 1; budget <= length * 4 + 8; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << length << "/" << load_at << "/" << value << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0;
+					std::memcpy(VU1.Mem, &value, sizeof(value));
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+}
+
 TEST_F(VU1RecompilerTest, ArithmeticTransfersAndIntegerOperations)
 {
 	constexpr u32 upper[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -991,7 +1137,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 {
 	using namespace vixl::aarch64;
 	using Wrapper = void (*)(VURegs*, const Arm64VU1::Instruction*, const u32*, const VECTOR*, VECTOR*);
-	std::array<Wrapper, 6> wrappers;
+	std::array<Wrapper, 7> wrappers;
 	u8* const base = SysMemory::GetVU1Rec();
 	HostSys::BeginCodeWrite();
 	const auto pipeline = Arm64VU1::CompilePipeline(base, SysMemory::GetVU1RecEnd() - base, &ObservePipelineCallout);
@@ -1010,7 +1156,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 		a.Mov(x25, x4);
 		for (u32 slot = 0; slot < 8; slot++)
 			a.Ldr(VRegister(8 + slot, 128), MemOperand(x3, sizeof(VECTOR) * slot));
-		a.Mov(x16, reinterpret_cast<uintptr_t>(pipeline.prepare[entry]));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(entry == 6 ? pipeline.branch_prepare : pipeline.prepare[entry]));
 		a.Blr(x16);
 		for (u32 slot = 0; slot < 8; slot++)
 			a.Str(VRegister(8 + slot, 128), MemOperand(x25, sizeof(VECTOR) * slot));
@@ -1030,6 +1176,7 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 	ins.pc = 40;
 	ins.upper = 0x800002ff;
 	ins.lower = 0x3f800000;
+	ins.lregs.VIread = 1 << 2;
 	for (u32 entry = 0; entry < wrappers.size(); entry++)
 	{
 		for (u32 count : {0u, 1u, 8u})

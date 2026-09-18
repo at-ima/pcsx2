@@ -196,6 +196,8 @@ namespace
 		Mr32,
 		Mfir,
 		Mtir,
+		Ilw,
+		Ibgtz,
 		Branch,
 		Unsupported
 	};
@@ -207,6 +209,10 @@ namespace
 				return Lower::Lq;
 			case 1:
 				return Lower::Sq;
+			case 4:
+				return Lower::Ilw;
+			case 0x2d:
+				return Lower::Ibgtz;
 			case 8:
 				return Lower::Iaddiu;
 			case 9:
@@ -542,6 +548,23 @@ namespace
 		const Lower op = DecodeLower(code);
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, id = (code >> 6) & 15;
 		const u32 is = fs & 15, it = ft & 15, mask = (code >> 21) & 15;
+		if (op == Lower::Ilw)
+		{
+			if (!it || !mask)
+				return;
+			const s32 imm = static_cast<s32>(code << 21) >> 21;
+			a.Ldrh(w0, Field(VI(is)));
+			a.Add(w0, w0, imm);
+			a.And(w0, w0, 0x3ff);
+			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
+			a.Add(x1, x1, Operand(x0, LSL, 4));
+			const u32 lane = (mask & 1) ? 3 : (mask & 2) ? 2 :
+			                              (mask & 4)     ? 1 :
+			                                               0;
+			a.Ldrh(w0, MemOperand(x1, lane * 4));
+			a.Strh(w0, Field(VI(it))); // ILW does not create an arithmetic VI backup.
+			return;
+		}
 		if (op == Lower::Move || op == Lower::Mr32 || op == Lower::Mfir)
 		{
 			if (!ft)
@@ -655,7 +678,7 @@ namespace
 			}
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
-			if (DecodeLower(ins.lower) != Lower::Branch)
+			if (DecodeLower(ins.lower) != Lower::Branch && DecodeLower(ins.lower) != Lower::Ibgtz)
 				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
@@ -670,6 +693,25 @@ namespace
 			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
 			StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
 			StoreWord(a, 1, offsetof(VURegs, branch));
+		}
+		else if (!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Ibgtz)
+		{
+			Label current, done;
+			const u32 src = (ins.lower >> 11) & 15;
+			a.Ldrsh(w0, Field(VI(src)));
+			a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+			a.Cbz(w9, &current);
+			a.Ldr(w9, Field(offsetof(VURegs, VIRegNumber)));
+			a.Cmp(w9, src);
+			a.B(ne, &current);
+			a.Ldrsh(w0, Field(offsetof(VURegs, VIOldValue)));
+			a.Bind(&current);
+			a.Cmp(w0, 0);
+			a.B(le, &done);
+			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+			StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
+			StoreWord(a, 1, offsetof(VURegs, branch));
+			a.Bind(&done);
 		}
 		else if (block.delay[index])
 		{
@@ -726,6 +768,27 @@ namespace
 		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
 	}
 
+	void EmitIntegerIssue(MacroAssembler& a, const Instruction& ins)
+	{
+		if (ins.lregs.pipe != VUPIPE_IALU || !ins.lregs.cycles)
+			return;
+		a.Ldr(w0, Field(offsetof(VURegs, ialuwritepos)));
+		a.Mov(w1, sizeof(ialuPipe));
+		a.Madd(x1, x0, x1, x19);
+		a.Add(x1, x1, offsetof(VURegs, ialu));
+		a.Str(x26, MemOperand(x1, offsetof(ialuPipe, sCycle)));
+		a.Mov(w9, ins.lregs.cycles);
+		a.Str(w9, MemOperand(x1, offsetof(ialuPipe, Cycle)));
+		a.Mov(w9, ins.lregs.VIwrite);
+		a.Str(w9, MemOperand(x1, offsetof(ialuPipe, reg)));
+		a.Add(w0, w0, 1);
+		a.And(w0, w0, 3);
+		a.Str(w0, Field(offsetof(VURegs, ialuwritepos)));
+		a.Ldr(w0, Field(offsetof(VURegs, ialucount)));
+		a.Add(w0, w0, 1);
+		a.Str(w0, Field(offsetof(VURegs, ialucount)));
+	}
+
 	bool HasFmac(const Instruction& ins)
 	{
 		return ins.uregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_FMAC;
@@ -737,6 +800,7 @@ namespace
 		// still depends on incoming timing. Every pair advances at least one cycle.
 		std::array<int, MaxInstructions> ages{};
 		ages.fill(-1);
+		u32 integer_ready = 0;
 		for (u32 i = 0; i < block.count; i++)
 		{
 			const auto& ins = block.instructions[i];
@@ -760,7 +824,10 @@ namespace
 					}
 				}
 			}
-			if (i >= 7 && cycles > 0)
+			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
+				integer_ready = i + 5;
+			if (i >= 7 && cycles > 0 && i >= integer_ready &&
+				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				for (u32 j = i - 4; j < i; j++)
@@ -919,15 +986,15 @@ namespace
 			a.Str(w10, Field(offsetof(VURegs, fmacreadpos)));
 			StoreWord(a, plan.remaining, offsetof(VURegs, fmaccount));
 		}
-		// No division/EFU/IALU or GIF work can arise inside a supported block
-		// admitted by the readiness check. Broader game coverage still needs proper testing.
+		// Special work has drained at scheduled pairs. ILW clears readiness and
+		// keeps retirement generic until its queue drains; broader games need proper testing.
 		EmitBackupCountdown(a, plan.cycles);
 	}
 
 	// A fully budgeted, callback-free suffix can keep its four FMAC flag
 	// snapshots in q28..q31. Queue metadata and cycle stamps are compile-time
 	// facts and only need materializing when returning to the dispatcher.
-	void EmitDeferredSuffix(MacroAssembler& a, const Block& block, u32 first)
+	void EmitDeferredSuffix(MacroAssembler& a, const Block& block, u32 first, u32 end)
 	{
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
 					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
@@ -955,7 +1022,7 @@ namespace
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
-		for (u32 i = first; i < block.count; i++)
+		for (u32 i = first; i < end; i++)
 		{
 			const auto& plan = block.schedule[i];
 			const auto& ins = block.instructions[i];
@@ -1010,8 +1077,8 @@ namespace
 			a.Umov(w9, VRegister(28 + slot, 128).V4S(), 2);
 			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
 		}
-		const auto& last = block.instructions[block.count - 1];
-		const u32 live = block.schedule[block.count - 1].remaining + HasFmac(last);
+		const auto& last = block.instructions[end - 1];
+		const u32 live = block.schedule[end - 1].remaining + HasFmac(last);
 		a.Add(w9, w27, issued & 3);
 		a.And(w9, w9, 3);
 		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
@@ -1021,7 +1088,7 @@ namespace
 		StoreWord(a, live, offsetof(VURegs, fmaccount));
 		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Str(w28, Field(VI(REG_MAC_FLAG)));
-		StoreWord(a, block.next_pc[block.count - 1], VI(REG_TPC));
+		StoreWord(a, block.next_pc[end - 1], VI(REG_TPC));
 		const bool upper_code = (last.upper & 0x80000000) ||
 		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
 		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
@@ -1051,6 +1118,10 @@ namespace
 			block->words[i * 2 + 1] = ins.upper;
 			if (DecodeUpper(ins.upper).op == Op::Unsupported ||
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
+				break;
+			const bool conditional = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Ibgtz;
+			// A conditional branch ends the trace; its delay and successors resume at dispatch.
+			if (conditional && pending_branch)
 				break;
 			const bool branch = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Branch;
 			if (branch && (pending_branch || i + 1 == MaxInstructions))
@@ -1114,6 +1185,11 @@ namespace
 				}
 			}
 			block->count++;
+			if (conditional)
+			{
+				block->has_branches = true;
+				break;
+			}
 		}
 		VU1.code = saved_code;
 		if (block->count)
@@ -1131,11 +1207,14 @@ namespace
 			}
 			HostSys::BeginCodeWrite();
 			MacroAssembler a(s_write, s_end - s_write);
-			u32 suffix_start = block->count, suffix_cycles = 0;
+			const auto& last = block->instructions[block->count - 1];
+			const bool conditional_tail = last.lregs.pipe == VUPIPE_BRANCH && last.lregs.VIread;
+			const u32 scheduled_end = block->count - conditional_tail;
+			u32 suffix_start = scheduled_end, suffix_cycles = 0;
 			while (suffix_start > 7 && block->schedule[suffix_start - 1].cycles)
 				suffix_cycles += block->schedule[--suffix_start].cycles;
-			const bool deferred = block->count - suffix_start >= 8;
-			Label exit, deferred_suffix;
+			const bool deferred = scheduled_end - suffix_start >= 8;
+			Label exit, deferred_suffix, tail;
 			const int saved_size = deferred ? 96 : 80;
 			// Save only the d8..d15 registers this block modifies.
 			// Round paired saves up to retain 16-byte stack alignment.
@@ -1183,8 +1262,10 @@ namespace
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
+				if (deferred && conditional_tail && i == scheduled_end)
+					a.Bind(&tail);
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
-				if (schedule_pair && (!readiness_checked || (deferred && i == suffix_start)))
+				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || (deferred && i == suffix_start)))
 				{
 					EmitScheduleReadiness(a);
 					readiness_checked = true;
@@ -1213,7 +1294,13 @@ namespace
 					a.Str(x26, Field(offsetof(VURegs, cycle)));
 				const u32 selected_prepare = ins.readsVF ? ins.dependency + 2 : 0;
 				a.Add(x0, x23, i * sizeof(Instruction));
-				if (selected_prepare == shared_prepare)
+				const bool integer_branch = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread;
+				if (integer_branch)
+				{
+					a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.branch_prepare));
+					a.Blr(x16);
+				}
+				else if (selected_prepare == shared_prepare)
 					a.Blr(x22);
 				else
 				{
@@ -1226,6 +1313,9 @@ namespace
 				cycle_dirty = schedule_pair;
 				EmitPair(a, cache, ins, true);
 				EmitFinish(a, ins);
+				EmitIntegerIssue(a, ins);
+				if (scheduled && ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
+					a.And(w25, w25, 1);
 				EmitControlFlow(a, *block, i);
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
@@ -1235,7 +1325,15 @@ namespace
 			{
 				a.B(&exit);
 				a.Bind(&deferred_suffix);
-				EmitDeferredSuffix(a, *block, suffix_start);
+				EmitDeferredSuffix(a, *block, suffix_start, scheduled_end);
+				if (conditional_tail)
+				{
+					// The suffix has published its queues, but VF/ACC stay cached for
+					// branch preparation. An exact budget exit must precede the branch.
+					a.Sub(x9, x26, x20);
+					a.Cmp(x9, x21);
+					a.B(lo, &tail);
+				}
 			}
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));

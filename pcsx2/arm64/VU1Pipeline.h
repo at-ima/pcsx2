@@ -30,6 +30,8 @@ namespace Arm64VU1
 		// x19..x29 and SP. x24 points to eight VF/ACC cache offsets (unused
 		// slots are ~0u); q8..q15 hold those cached values and survive preparation.
 		std::array<const void*, 6> prepare{};
+		// Same ABI; also waits for lregs.VIread in the incoming IALU queue.
+		const void* branch_prepare = nullptr;
 		size_t size = 0;
 	};
 

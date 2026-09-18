@@ -96,8 +96,11 @@ emits native instructions; the existing x86 recompiler keeps its own behavior.
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
 queues. Static unconditional B edges can connect the branch, supported delay
-pair and destination within one bounded native trace. Conditional/indirect
-branches, nested branches and end-bit delay slots retain interpreter fallback. Pipeline retirement retains the interpreter timing. Normal
+pair and destination within one bounded native trace. IBGTZ executes natively
+at the end of a trace, including integer-load waits and VI backup selection;
+its successors still return through dispatch. Other conditional/indirect branches,
+nested branches and end-bit delay slots retain interpreter fallback. Pipeline
+retirement retains the interpreter timing. Normal
 XGKICK follows microVU's delayed whole-packet policy; the interpreter and
 `XgKickHack` keep incremental transfers.
 
@@ -107,8 +110,8 @@ at an internal B edge. Every non-contiguous source range is checked before entry
 including destination edits. Per-pair budget exits publish the correct branch,
 delay and TPC state; a complete deferred suffix publishes its final state as
 before. Repeated PCs end the trace, so native loop back-edge linking is not yet
-implemented. The trace is bounded by the same 256-pair limit. Conditional branch
-VI hazards and independently cached target-state matching remain future work.
+implemented. The trace is bounded by the same 256-pair limit. Connecting conditional successors and independently cached target-state matching
+remain future work.
 Wider gameplay and callback combinations still need proper testing.
 
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
@@ -116,10 +119,20 @@ pairs can use a dependency calculated during compilation: incoming four-cycle
 FMAC results have matured, and only producers in the preceding three pairs can
 still stall. Cycle-wrap boundaries retain the general queue scan. Preparation
 entry points are specialized for read-free pairs, incoming dependencies,
-and each scheduled producer distance. `VU1Pipeline.cpp` emits these entry stubs
+each scheduled producer distance, and integer-branch VI dependencies. `VU1Pipeline.cpp` emits these entry stubs
 and one shared ARM64 retirement body per code-cache generation. It mirrors the
 reference retirement order in `VUPipeline.h`; generated blocks do not each contain
 a copy of the retirement routine. Native retirement omits interpreter trace logs.
+
+ILW reads the low halfword of the final selected component, wraps VU1 data memory,
+and preserves the upper half of the VI register. It issues the same four-cycle
+IALU entry even for a masked-out or VI0 destination, without creating an arithmetic
+VI backup. ILW clears schedule readiness and keeps the following four pairs on
+generic retirement; readiness is checked again when static scheduling resumes.
+A deferred body can flow into the final IBGTZ with VF/ACC still cached. It publishes
+its queues and checks the remaining budget before branch preparation. Branch
+preparation combines upper FMAC stalls with matching IALU waits, then retires
+pipelines before testing the signed VI value or its applicable backup.
 
 Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
 The assignment is fixed for the block, including every budget exit. Entry loads

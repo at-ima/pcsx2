@@ -16,11 +16,19 @@ namespace Arm64VU1
 		auto field = [](size_t offset) { return MemOperand(x19, offset); };
 		auto vi = [&](u32 reg) { return field(offsetof(VURegs, VI) + sizeof(REG_VI) * reg); };
 
-		// Six small entry stubs share a single retirement body. Keep this code
+		// Six FMAC entry stubs and an integer-branch entry share retirement. Keep this code
 		// outside the guest blocks, where repeating it would inflate the I-cache.
-		for (int dependency = -2; dependency <= 3; dependency++)
+		for (int entry = 0; entry < 7; entry++)
 		{
-			result.prepare[dependency + 2] = code + a.GetCursorOffset();
+			const int dependency = entry == 6 ? -1 : entry - 2;
+			if (entry == 6)
+				result.branch_prepare = code + a.GetCursorOffset();
+			else
+				result.prepare[entry] = code + a.GetCursorOffset();
+			if (entry == 6)
+				a.Ldr(w2, MemOperand(x0, offsetof(Instruction, lregs) + offsetof(_VURegsNum, VIread)));
+			else
+				a.Mov(w2, 0);
 			a.Ldr(x9, field(offsetof(VURegs, cycle)));
 			a.Mov(w15, w9); // Interpreter truncates cyclesBeforeOp to u32.
 			a.Add(x9, x9, 1);
@@ -103,6 +111,35 @@ namespace Arm64VU1
 		// Mirror VUPipeline::Retire, including flag writeback order. Architectural
 		// queue contents remain intact for prefix exits and interpreter fallback.
 		a.Bind(&retire);
+		{
+			// Branches wait for matching integer loads after upper FMAC stalls.
+			Label loop, next, end;
+			a.Cbz(w2, &end);
+			a.Ldr(w10, field(offsetof(VURegs, ialucount)));
+			a.Cbz(w10, &end);
+			a.Ldr(w11, field(offsetof(VURegs, ialureadpos)));
+			a.Bind(&loop);
+			a.Mov(w12, sizeof(ialuPipe));
+			a.Madd(x12, x11, x12, x19);
+			a.Add(x12, x12, offsetof(VURegs, ialu));
+			a.Ldr(x13, MemOperand(x12, offsetof(ialuPipe, sCycle)));
+			a.Ldr(w14, MemOperand(x12, offsetof(ialuPipe, Cycle)));
+			a.Sub(x16, x9, x13);
+			a.Cmp(x16, x14);
+			a.B(hs, &next);
+			a.Ldr(w17, MemOperand(x12, offsetof(ialuPipe, reg)));
+			a.Tst(w17, w2);
+			a.B(eq, &next);
+			a.Add(x13, x13, x14);
+			a.Cmp(x9, x13);
+			a.Csel(x9, x9, x13, hs);
+			a.Bind(&next);
+			a.Add(w11, w11, 1);
+			a.And(w11, w11, 3);
+			a.Subs(w10, w10, 1);
+			a.B(ne, &loop);
+			a.Bind(&end);
+		}
 		a.Str(x9, field(offsetof(VURegs, cycle)));
 		{
 			Label loop, end, no_clip, normal_flags, store_flags;
