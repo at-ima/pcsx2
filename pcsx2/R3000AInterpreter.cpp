@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-#include "R3000A.h"
+#include "R3000AInterpreter.h"
 #include "Common.h"
 #include "Config.h"
 #include "VMManager.h"
@@ -233,7 +233,7 @@ static __fi void execI()
 	psxRegs.pc+= 4;
 	psxRegs.cycle++;
 
-	psxBSC[psxRegs.code >> 26]();
+	psxExecuteOpcode();
 }
 
 static void doBranch(s32 tar) {

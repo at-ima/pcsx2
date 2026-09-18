@@ -16,7 +16,12 @@ instruction; no decoded-code cache or invalidation mechanism is introduced.
 ROM, unmapped memory and hardware regions retain `iopMemRead32` handling. The
 same path serves the J instruction's import-table delay-slot probe. Instruction
 execution, branch timing, event polling and debugging hooks remain unchanged.
-This shared interpreter change still needs proper testing in PS1 mode and on
+`R3000AInterpreter.h` resolves grouped opcodes to their existing leaf handlers
+inside the execution driver, avoiding additional indirect dispatch through
+SPECIAL, REGIMM, COP0 and COP2 grouping functions. Exact NOP skips its empty
+handler after the driver has performed the usual PC/cycle/debug work. Opcode
+semantics remain in the existing tables; no extra decoded-code cache is used.
+These shared interpreter changes still need proper testing in PS1 mode and on
 other host architectures.
 
 ## EE

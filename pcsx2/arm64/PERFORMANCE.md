@@ -1087,3 +1087,45 @@ The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
 The existing optional patches.zip warning remains. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `iop-production-{build,ctest,state,state-console}.log`.
+
+## IOP leaf dispatch and NOP
+
+The IOP interpreter previously dispatched grouped instructions through a basic
+opcode handler followed by a second indirect dispatch; COP2 basic operations
+used an additional grouping level. `psxExecuteOpcode` now resolves these groups
+inline and calls the original leaf function. It retains the existing tables
+and opcode implementations rather than introducing another decoded cache or
+copying instruction semantics. Exact NOP skips the empty SLL-to-r0 handler.
+The execution driver still performs its debugger/logging hooks, PC increment and
+cycle increment before this dispatch, including NOPs and branch delay slots.
+
+A differential routing test replaces only leaf handlers with unique probes,
+retaining the original grouping functions as the reference. It compares 131,072
+combinations covering every primary, function and register selector, including
+unsupported encodings. Another test verifies that both legacy and new NOP
+execution preserve the full register state, including a nonzero r0 backing value.
+These checks do not replace PS1 or long-gameplay validation, which remains needed.
+
+Serial comparison against `e08ac048c`, frames 850–1100, MTVU disabled, in execution
+order:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| dispatch-old-a | 56.36 | 17.69 | 3.24 |
+| dispatch-new-a | 57.18 | 17.44 | 3.09 |
+| dispatch-new-b | 57.00 | 17.50 | 3.11 |
+| dispatch-old-b | 56.15 | 17.74 | 3.23 |
+
+Mean throughput is **56.26 → 57.09 VPS (+1.5%)**. Both paired comparisons improved
+by a similar amount, but this is a small, scene-specific result from two runs per
+variant. It does not establish how much time all IOP interpretation consumes,
+or isolate NOP elimination from the grouped-dispatch change. Both apps used the
+same temporary metrics logging, without sampling or concurrent builds/tests.
+Logs: `diagnostic-dispatch-{old-a,new-a,new-b,old-b}.log`.
+
+Production validation: temporary metrics logging removed, ARM64 app rebuilt,
+**208 tests** (20 common, 188 core) passed, and deep signature verification passed.
+The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited with code 0.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`dispatch-production-{build,ctest,state,state-console}.log`.
