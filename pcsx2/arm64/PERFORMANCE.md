@@ -799,3 +799,66 @@ passed. The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and shut down wi
 exit code 0. The existing optional patches.zip warning remains. No visual,
 long-gameplay or x64 runtime validation was performed. Logs:
 `int-production-{build,ctest,state,state-console}.log`.
+
+## Taken IBGTZ connections and budget-limited source validation
+
+Taken IBGTZ edges now continue through a supported delay pair into the target
+within the same bounded trace and VF/ACC assignment. Not-taken paths and exact
+budget exhaustion publish complete state through the common exit. Repeated PCs,
+nested branches and unsupported instructions still end the trace. This is not
+native loop back-edge linking or independently cached block linking.
+
+An integer branch can introduce an unknown IALU wait, so retirement analysis
+forgets uncertain producer ages at that pair. Later pairs recover known timing.
+Deferred queue construction now applies to each sufficiently long scheduled
+region, with queues materialized before conditional exits. The deferred emitter
+restores scheduling readiness before continuing, since it borrows that register
+for architectural flags.
+
+The initial implementation applied deferred emission only before the first
+conditional branch and regressed to **39.00 VPS**. Extending it to all eligible
+regions recovered **50.44 VPS**, still below the current baseline. A separate
+instrumented diagnostic then showed approximately 470,573 calls each at byte PCs
+4128 and 4136 per million native calls. These entries contained 247 and 246 pairs
+respectively; the former starts with ILW immediately before IBGTZ, whose target
+is byte PC 2168. Short calls were validating almost the entire connected loop
+body even when their remaining budget could not reach it. These counts describe
+the diagnostic run, not CPU-time shares or proof of a video-decoder bottleneck.
+
+Validation now checks at most the remaining cycle budget's number of pairs,
+across all relevant source ranges. Every pair advances at least one cycle, so
+omitted bytes cannot execute in that call. Subsequent calls validate those bytes
+before they can execute; changing a reachable branch or target still invalidates
+the cached trace. A pending packet transfer uses a one-pair bound consistently
+for validation and execution.
+
+Final serial comparisons against `66574d2f9`, MTVU disabled, frames 850–1100:
+
+| Run | VPS | CPU ms/frame |
+| --- | ---: | ---: |
+| taken-old-a | 52.43 | 19.00 |
+| taken-prefix-a | 52.38 | 19.01 |
+| taken-old-b | 51.78 | 19.25 |
+| taken-prefix-b | 52.58 | 18.96 |
+
+Means are **52.11 → 52.48 VPS (+0.7%)**. This is effectively unchanged within
+run-to-run variation; no substantial speedup is claimed. The connection is a
+correctness-tested foundation, and native loop continuation remains unresolved.
+The frequency of short budget-limited entries also means eliminating a branch
+fallback alone does not eliminate host dispatch. Logs are
+`diagnostic-taken-{old-a,old-b,prefix-a,prefix-b}.log`; the slower exploratory and
+counter runs are `diagnostic-taken-{new-a,regions-a,diag}.log`.
+
+New differential tests cover multiple conditional regions, taken/not-taken
+paths, long incoming integer waits, every budget across those paths, source
+edits and retargeting, nested delay fallback, wrapped delay addresses and the
+256-pair limit. A separate test changes initially unreachable source bytes and
+then increases the budget. A packet-transfer test verifies that a connected
+conditional delay store cannot run before the pending transfer observes memory.
+
+Production validation: diagnostic logging/counters removed, ARM64 app and tests
+rebuilt, **199 tests** (20 common, 179 core) passed. Deep signature verification
+passed. The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds and exited normally.
+The existing optional patches.zip warning remains. No visual, long-gameplay or
+x64 runtime validation was performed. Logs:
+`taken-production-{build,ctest,state,state-console}.log`.

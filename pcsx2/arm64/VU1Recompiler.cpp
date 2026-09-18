@@ -824,6 +824,10 @@ namespace
 					}
 				}
 			}
+			// A VI-dependent branch can add an incoming IALU wait. Forget exact
+			// producer ages until enough new pairs establish a known schedule.
+			if (ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread)
+				cycles = -1;
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
 			if (i >= 7 && cycles > 0 && i >= integer_ready &&
@@ -890,7 +894,7 @@ namespace
 		Label done, loop, ready;
 		a.Mov(w25, 0);
 		// XGKICK may call C++ and change state during the prefix. Never promote
-		// those blocks, even if the pending transfer finishes before the suffix.
+		// those blocks, even if the pending transfer finishes before the region.
 		a.Ldr(w9, Field(offsetof(VURegs, xgkickenable)));
 		a.Cbnz(w9, &done);
 		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
@@ -991,10 +995,10 @@ namespace
 		EmitBackupCountdown(a, plan.cycles);
 	}
 
-	// A fully budgeted, callback-free suffix can keep its four FMAC flag
+	// A fully budgeted, callback-free region can keep its four FMAC flag
 	// snapshots in q28..q31. Queue metadata and cycle stamps are compile-time
 	// facts and only need materializing when returning to the dispatcher.
-	void EmitDeferredSuffix(MacroAssembler& a, const Block& block, u32 first, u32 end)
+	void EmitDeferredRegion(MacroAssembler& a, const Block& block, u32 first, u32 end)
 	{
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
 					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
@@ -1100,8 +1104,8 @@ namespace
 			InvalidateAll();
 		auto block = std::make_unique<Block>();
 		const u32 saved_code = VU1.code;
-		// Decode static B edges in execution order with one vector-cache and
-		// pipeline schedule. Every source range is validated before entry.
+		// Decode static B and taken IBGTZ edges with one vector-cache and
+		// pipeline schedule. Reachable source bytes are validated before entry.
 		// Repeated PCs, unsupported pairs and the size limit end the trace.
 		u32 next_pc = pc, branch_target = 0;
 		bool pending_branch = false;
@@ -1120,7 +1124,7 @@ namespace
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
 				break;
 			const bool conditional = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Ibgtz;
-			// A conditional branch ends the trace; its delay and successors resume at dispatch.
+			// Follow the taken edge; the generated guard exits on the other path.
 			if (conditional && pending_branch)
 				break;
 			const bool branch = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Branch;
@@ -1131,7 +1135,7 @@ namespace
 			block->next_pc[i] = pending_branch ? branch_target : ins.pc + 8;
 			if (pending_branch)
 				pending_branch = false;
-			if (branch)
+			if (branch || conditional)
 			{
 				const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
 				branch_target = (ins.pc + 8 + displacement) & VU1_PROGMASK;
@@ -1185,11 +1189,6 @@ namespace
 				}
 			}
 			block->count++;
-			if (conditional)
-			{
-				block->has_branches = true;
-				break;
-			}
 		}
 		VU1.code = saved_code;
 		if (block->count)
@@ -1207,14 +1206,30 @@ namespace
 			}
 			HostSys::BeginCodeWrite();
 			MacroAssembler a(s_write, s_end - s_write);
-			const auto& last = block->instructions[block->count - 1];
-			const bool conditional_tail = last.lregs.pipe == VUPIPE_BRANCH && last.lregs.VIread;
-			const u32 scheduled_end = block->count - conditional_tail;
-			u32 suffix_start = scheduled_end, suffix_cycles = 0;
-			while (suffix_start > 7 && block->schedule[suffix_start - 1].cycles)
-				suffix_cycles += block->schedule[--suffix_start].cycles;
-			const bool deferred = scheduled_end - suffix_start >= 8;
-			Label exit, deferred_suffix, tail;
+			// Defer each sufficiently long known region separately. Conditional
+			// exits must see materialized queues, without penalizing later regions.
+			struct DeferredRegion
+			{
+				u32 first, end, cycles;
+			};
+			std::vector<DeferredRegion> regions;
+			for (u32 i = 7; i < block->count;)
+			{
+				if (!block->schedule[i].cycles)
+				{
+					i++;
+					continue;
+				}
+				const u32 first = i;
+				u32 cycles = 0;
+				while (i < block->count && block->schedule[i].cycles)
+					cycles += block->schedule[i++].cycles;
+				if (i - first >= 8)
+					regions.push_back({first, i, cycles});
+			}
+			const bool deferred = !regions.empty();
+			std::array<Label, MaxInstructions> deferred_entries, resumes;
+			Label exit;
 			const int saved_size = deferred ? 96 : 80;
 			// Save only the d8..d15 registers this block modifies.
 			// Round paired saves up to retain 16-byte stack alignment.
@@ -1259,25 +1274,30 @@ namespace
 			a.Mov(x23, reinterpret_cast<uintptr_t>(block->instructions.data()));
 			bool cycle_dirty = false;
 			bool readiness_checked = false;
+			u32 region_index = 0;
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
-				if (deferred && conditional_tail && i == scheduled_end)
-					a.Bind(&tail);
+				if (region_index < regions.size() && i == regions[region_index].end)
+				{
+					a.Bind(&resumes[region_index]);
+					region_index++;
+				}
+				const bool region_start = region_index < regions.size() && i == regions[region_index].first;
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
-				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || (deferred && i == suffix_start)))
+				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || region_start))
 				{
 					EmitScheduleReadiness(a);
 					readiness_checked = true;
 				}
-				if (deferred && i == suffix_start)
+				if (region_start)
 				{
 					Label partial;
 					a.Tbz(w25, 1, &partial);
 					a.Sub(x9, x26, x20);
 					a.Sub(x9, x21, x9);
-					a.Cmp(x9, suffix_cycles);
-					a.B(hs, &deferred_suffix);
+					a.Cmp(x9, regions[region_index].cycles);
+					a.B(hs, &deferred_entries[region_index]);
 					a.Bind(&partial);
 				}
 				Label generic_prepare, prepared;
@@ -1317,23 +1337,36 @@ namespace
 				if (scheduled && ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 					a.And(w25, w25, 1);
 				EmitControlFlow(a, *block, i);
+				if (integer_branch && i + 1 < block->count)
+				{
+					// The fallthrough path has no pending branch. Publish the common
+					// cache at exit; only the taken path executes the connected delay.
+					a.Ldr(w9, Field(offsetof(VURegs, branch)));
+					a.Cbz(w9, &exit);
+				}
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
 				a.B(hs, &exit);
 			}
 			if (deferred)
-			{
 				a.B(&exit);
-				a.Bind(&deferred_suffix);
-				EmitDeferredSuffix(a, *block, suffix_start, scheduled_end);
-				if (conditional_tail)
+			for (u32 r = 0; r < regions.size(); r++)
+			{
+				const auto& region = regions[r];
+				a.Bind(&deferred_entries[r]);
+				EmitDeferredRegion(a, *block, region.first, region.end);
+				// The emitter borrows w25 for flags. Entry proved both guards and
+				// no special work can be issued inside the region.
+				a.Mov(w25, 3);
+				if (region.end < block->count)
 				{
-					// The suffix has published its queues, but VF/ACC stay cached for
-					// branch preparation. An exact budget exit must precede the branch.
+					// Queues are complete; retain VF/ACC for the following region.
+					// Exact budget exhaustion must exit before its first pair.
 					a.Sub(x9, x26, x20);
 					a.Cmp(x9, x21);
-					a.B(lo, &tail);
+					a.B(lo, &resumes[r]);
 				}
+				a.B(&exit);
 			}
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
@@ -1368,13 +1401,21 @@ namespace
 		       VU1.xgkickenable == VURegs::XgkickPacket && VU1.xgkicksizeremaining == 0;
 	}
 
-	bool Matches(const Block& block, u32 pc)
+	bool Matches(const Block& block, u32 pc, u64 max_pairs)
 	{
 		if (!block.count)
 			return std::memcmp(block.words.data(), VU1.Micro + pc, 8) == 0;
+		// Every pair advances at least one cycle. A short call cannot reach the
+		// remainder of a connected trace; validate that remainder when it can.
 		for (const auto& range : block.ranges)
-			if (std::memcmp(block.words.data() + range.first * 2, VU1.Micro + range.pc, range.count * 8) != 0)
+		{
+			const u32 count = static_cast<u32>(std::min<u64>(range.count, max_pairs));
+			if (std::memcmp(block.words.data() + range.first * 2, VU1.Micro + range.pc, count * 8) != 0)
 				return false;
+			max_pairs -= count;
+			if (!max_pairs)
+				break;
+		}
 		return true;
 	}
 } // namespace
@@ -1425,7 +1466,7 @@ void Arm64VU1Recompiler::Step()
 }
 void Arm64VU1Recompiler::Clear(u32, u32)
 {
-	// Entries validate their complete source bytes before execution, including
+	// Entries validate reachable source bytes before execution, including
 	// wrapped MPG uploads and debugger/state-load writes which omit Clear().
 	// Retaining them avoids recompiling identical program uploads.
 }
@@ -1459,8 +1500,10 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			Step();
 			continue;
 		}
+		const bool pending = PacketXgkickPending();
+		const u64 remaining = pending ? 1 : cycles - (VU1.cycle - start);
 		Block* block = s_blocks[pc / 8].get();
-		if (!block || !Matches(*block, pc))
+		if (!block || !Matches(*block, pc, remaining))
 			block = &Compile(pc);
 		// A restored chained-delay state still requires interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU1.takedelaybranch))
@@ -1468,7 +1511,6 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			// microVU transfers after the pair following XGKICK, including its
 			// lower store. Exit after that pair so the complete architectural state
 			// is published before GIF callbacks, even at a cycle-budget boundary.
-			const bool pending = PacketXgkickPending();
 			block->function(start, pending ? VU1.cycle - start + 1 : cycles);
 			if (pending && PacketXgkickPending())
 				_vuXGKICKTransfer(0, true);

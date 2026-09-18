@@ -320,6 +320,102 @@ TEST_F(VU1RecompilerTest, ConditionalTailPreservesEveryBudgetExit)
 			}
 }
 
+TEST_F(VU1RecompilerTest, ConditionalSuccessorsPreserveBudgetsAndSourceEdits)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+	for (u32 i = 0; i < 96; i++)
+		Put(i * 8, 0x80000000 | add, 0x3f800000);
+	Put(24 * 8, add, 0x5a000000 | (2 << 11) | (48 - 25));
+	Put(64 * 8, add, 0x5a000000 | (3 << 11) | (80 - 65));
+	Put(88 * 8, add, 0x40000000 | ((8 - 89) & 0x7ff));
+	for (u32 pass = 0; pass < 4; pass++)
+	{
+		if (pass == 1)
+			Put(52 * 8, 0x80000000 | ((add & ~63u) | 0x2c), 0x41000000);
+		else if (pass == 2)
+			Put(24 * 8, add, 0x5a000000 | (2 << 11) | (50 - 25));
+		else if (pass == 3)
+			Put(25 * 8, 0x2ff, 0x5a000000 | (3 << 11) | 2); // Nested delay branch.
+		for (u32 value : {0u, 1u, 0xffffu})
+			for (u32 latency : {0u, 104u, 260u})
+				for (u32 budget = 1; budget <= 340; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << pass << "/" << value << "/" << latency << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 100;
+					VU1.VI[2].UL = value;
+					VU1.VI[3].UL = pass & 1;
+					if (latency)
+					{
+						VU1.ialucount = 1;
+						VU1.ialuwritepos = 1;
+						VU1.ialu[0].sCycle = VU1.cycle;
+						VU1.ialu[0].Cycle = latency;
+						VU1.ialu[0].reg = 1 << 2;
+					}
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+	}
+}
+
+TEST_F(VU1RecompilerTest, BudgetLimitedValidationChecksLaterCodeBeforeExecution)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	Put(0, 0x800002ff, 0x3f800000);
+	Put(8, 0x2ff, 0x5a000000 | (2 << 11) | 30); // Taken target at byte 256.
+	Put(16, 0x800002ff, 0x40000000);
+	Put(384, 0xc00002ff, 0x3f800000);
+	for (u32 pass = 0; pass < 4; pass++)
+	{
+		if (pass == 1)
+			Put(280, 0x800002ff, 0x40400000); // Later target region.
+		else if (pass == 2)
+			Put(16, 0x800002ff, 0x40800000); // Conditional delay.
+		else if (pass == 3)
+			Put(8, 0x2ff, 0x5a000000 | (2 << 11) | 34); // Retarget the edge.
+		for (u32 budget : {1u, 2u, 3u, 4u, 8u, 32u})
+		{
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VI[2].UL = 1;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ConditionalDelayWrapAndTraceLimit)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 start : {0u, VU1_PROGSIZE - 8})
+		for (u32 length : {1u, 255u, 256u})
+		{
+			for (u32 pc = 0; pc < VU1_PROGSIZE; pc += 8)
+				Put(pc, 0x800002ff, 0x3f800000);
+			const u32 pc = (start + (length - 1) * 8) & VU1_PROGMASK;
+			Put(pc, 0x2ff, 0x5a000000 | (2 << 11) | 3);
+			Put((pc + 8) & VU1_PROGMASK, 0x800002ff, 0x40000000);
+			Put((pc + 32) & VU1_PROGMASK, 0xc00002ff, 0x40800000);
+			for (u32 value : {0u, 1u})
+				for (u32 budget : {length, length + 1, length + 2, length + 8})
+				{
+					SCOPED_TRACE(testing::Message() << start << "/" << length << "/" << value << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[REG_TPC].UL = start / 8;
+					VU1.VI[2].UL = value;
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+		}
+}
+
 TEST_F(VU1RecompilerTest, ArithmeticTransfersAndIntegerOperations)
 {
 	constexpr u32 upper[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -1360,6 +1456,26 @@ TEST_F(VU1PacketXgkickTest, ConnectedBranchDoesNotRunDelayBeforePendingTransfer)
 	EXPECT_EQ(VU1.branch, 1u);
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
 	CpuArm64VU1.Execute(1);
+	EXPECT_EQ(VU1.branch, 0u);
+	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
+	EXPECT_EQ(std::memcmp(VU1.Mem + 16, &VU1.VF[3], 16), 0);
+	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
+}
+
+TEST_F(VU1PacketXgkickTest, ConditionalConnectionPublishesBeforePendingTransfer)
+{
+	Tag(0, 2, true);
+	Kick();
+	VU1.VI[2].UL = 1;
+	Put(8, 0x2ff, 0x5a000000 | (2 << 11) | 6);
+	Put(16, 0x2ff, 0x02000000 | (15 << 21) | (2 << 16) | (3 << 11));
+	std::array<u8, 16> previous{};
+	std::memcpy(previous.data(), VU1.Mem + 16, previous.size());
+	// A larger caller budget must still publish the branch pair and complete
+	// the pending transfer before allowing the connected delay store.
+	CpuArm64VU1.Execute(2);
+	ASSERT_EQ(gifUnit.gifPath[0].curSize, 48u);
+	EXPECT_FALSE(VU1.xgkickenable);
 	EXPECT_EQ(VU1.branch, 0u);
 	EXPECT_EQ(VU1.VI[REG_TPC].UL, 64u / 8);
 	EXPECT_EQ(std::memcmp(VU1.Mem + 16, &VU1.VF[3], 16), 0);

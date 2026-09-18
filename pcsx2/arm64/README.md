@@ -96,9 +96,9 @@ emits native instructions; the existing x86 recompiler keeps its own behavior.
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
 queues. Static unconditional B edges can connect the branch, supported delay
-pair and destination within one bounded native trace. IBGTZ executes natively
-at the end of a trace, including integer-load waits and VI backup selection;
-its successors still return through dispatch. Other conditional/indirect branches,
+pair and destination within one bounded native trace. Taken IBGTZ edges also
+connect their supported delay pair and destination, including integer-load waits
+and VI backup selection. Not-taken edges exit with complete architectural state. Other conditional/indirect branches,
 nested branches and end-bit delay slots retain interpreter fallback. Pipeline
 retirement retains the interpreter timing. Normal
 XGKICK follows microVU's delayed whole-packet policy; the interpreter and
@@ -106,12 +106,14 @@ XGKICK follows microVU's delayed whole-packet policy; the interpreter and
 
 Connected regions share the VF/ACC cache assignment and the pipeline schedule in
 execution order. They do not publish/reload cached vectors or restart preparation
-at an internal B edge. Every non-contiguous source range is checked before entry,
-including destination edits. Per-pair budget exits publish the correct branch,
-delay and TPC state; a complete deferred suffix publishes its final state as
+at an internal B or taken IBGTZ edge. Before entry, source validation checks each range the remaining cycle budget
+can reach, including destination edits. Each pair advances at least one cycle;
+bytes beyond that bound are checked on a later call before they can execute. Per-pair budget exits publish the correct branch,
+delay and TPC state; a complete deferred region publishes its final state as
 before. Repeated PCs end the trace, so native loop back-edge linking is not yet
-implemented. The trace is bounded by the same 256-pair limit. Connecting conditional successors and independently cached target-state matching
-remain future work.
+implemented. The trace is bounded by the same 256-pair limit. Connecting
+not-taken successors and independently cached target-state matching remain
+future work.
 Wider gameplay and callback combinations still need proper testing.
 
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
@@ -129,10 +131,13 @@ and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic
 VI backup. ILW clears schedule readiness and keeps the following four pairs on
 generic retirement; readiness is checked again when static scheduling resumes.
-A deferred body can flow into the final IBGTZ with VF/ACC still cached. It publishes
-its queues and checks the remaining budget before branch preparation. Branch
+Each sufficiently long region with a known schedule can defer queue construction.
+It publishes its queues and checks the remaining budget before returning to the
+ordinary generated path, keeping VF/ACC cached across branch preparation. Branch
 preparation combines upper FMAC stalls with matching IALU waits, then retires
-pipelines before testing the signed VI value or its applicable backup.
+pipelines before testing the signed VI value or its applicable backup. Since
+integer waits can change FMAC ages, analysis forgets uncertain ages at IBGTZ
+and resumes static retirement only when subsequent pairs establish known timing.
 
 Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
 The assignment is fixed for the block, including every budget exit. Entry loads
@@ -201,10 +206,10 @@ After a generic prefix drains incoming entries, it emits known retirement counts
 instead of checking every queue at every pair. An entry guard permanently rejects
 pending XGKICK, irregular incoming FMAC queues and cycle wrap. Pending FDIV,
 EFU and IALU work initially keeps the generic path, but readiness is checked again
-at the first scheduled pair and at the deferred suffix boundary. Once these
-queues drain, the validated block may use scheduled execution. Supported pairs
-cannot start special pipelines or stall on IALU: native integer operations have
-zero pipeline latency, and supported unconditional B reads no VI operands. Unknown timing keeps the
+at the first scheduled pair and at the deferred region boundary. Once these
+queues drain, the validated block may use scheduled execution. ILW issues integer work and clears readiness; IBGTZ waits for matching loads
+and breaks the static schedule. Other supported integer operations have zero
+pipeline latency. Unknown timing keeps the
 generic preparation path. Every queue entry is materialized
 at observable exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored. This is a limited first step
@@ -215,8 +220,8 @@ reloading architectural memory. Before generic preparation after a scheduled
 pair, and at every block exit, it is published to VURegs. Generic preparation
 reloads it afterwards so callback changes remain visible. x26 is saved/restored
 by the block and preserved by the private pipeline ABI.
-A contiguous scheduled suffix of at least eight pairs has a second execution
-path. It checks the whole remaining cycle budget once, after the generic prefix.
+Each contiguous scheduled region of at least eight pairs has a second execution
+path. It checks the budget for that region once before entering it.
 Only the validated, callback-free case can enter; partial budgets and pending
 special pipelines keep the existing per-pair path. q28..q31 retain the four
 FMAC flag snapshots relative to the entry write position. x25/x28 retain retired
@@ -225,11 +230,11 @@ so the path restores only each slot's last writer at exit, including overwritten
 inactive entries and padding. It then publishes queue indices/count, flags,
 TPC, code and cycles. VF/ACC publication uses the common exit. VI backup timing
 and all arithmetic execute in their original order. The VI backup countdown is
-accumulated until the next VI write or suffix exit, with byte saturation; this
+accumulated until the next VI write or region exit, with byte saturation; this
 preserves the value seen by BackupVI without updating memory every pair.
 
 Compiled traces contain at most 256 pairs, with every source range bounded by
-micro-memory and supported instructions. Source validation covers the entire block. Generated-code space
+micro-memory and supported instructions. Source validation covers every pair that the current budget can reach. Generated-code space
 and cycle-wrap protection scale with this limit. This reduces artificial block
 boundaries without adding cross-block linking. A 512-pair limit did not improve
 the measured opening-movie workload; see PERFORMANCE.md for the comparison.
@@ -237,9 +242,9 @@ MaxBlockBytes is the pre-compilation free-space threshold, not an allocation
 reserved for every block.
 
 This removes per-pair queue construction, retirement memory traffic and budget/
-TPC/code updates from that suffix. It shares pair emission and metadata encoding
+TPC/code updates from those regions. It shares pair emission and metadata encoding
 with the general path. EmitPair must preserve q28..q31 and x25..x28. There are no
-C++ callbacks or unsupported instructions inside the suffix; expanding supported
+C++ callbacks or unsupported instructions inside a deferred region; expanding supported
 operations must preserve that invariant. Wider gameplay still needs proper testing.
 This is an internal block-state contract, not yet cross-block linking or MTVU.
 Runtime profiles should distinguish these management costs from arithmetic throughput.
