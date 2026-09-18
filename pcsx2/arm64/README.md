@@ -112,6 +112,33 @@ FZ arithmetic already produces signed zero for tiny results, so that mode omits
 redundant software underflow classification and conversion. Other FPCR modes
 retain them, with the same MAC/status results as the interpreter.
 
+### microVU reference and remaining execution costs
+
+The x86 backend provides architectural references beyond instruction selection:
+
+- `x86/microVU_Analyze.inl` and `microVU_Compile.inl` (`mVUincCycles`,
+  `mVUsetCycles`) compute lane dependencies and stalls during compilation.
+  `microRegInfo` carries pipeline state between compiled blocks. ARM64 still
+  retires architectural pipeline queues at runtime for each instruction pair.
+- `x86/microVU_Flags.inl` (`mVUsetFlags`) selects flag instances and necessary
+  updates, including flags needed by following blocks. Eliminating an ARM64
+  update requires preserving the state visible at budget exits and fallback,
+  not merely finding no flag reader in the current block.
+- `x86/microVU_Lower.inl` (`mVU_XGKICK_`) normally transfers a complete packet
+  at the scheduled kick. The separate `CHECK_XGKICKHACK` path accumulates cycles
+  and synchronizes at memory writes and block boundaries. ARM64 instead calls
+  the interpreter transfer path during retirement, which can repeatedly copy
+  small chunks and enter GIF arbitration within a native block.
+
+These are different execution contracts, not just different SIMD encodings.
+ARM64's native blocks and interpreter fallback currently share the same queues
+and XGKICK state. Adopting microVU-style scheduling or transfer batching needs
+an explicit boundary-state design covering cycle budgets, pending flags,
+VU-memory writes, wraparound, GIF arbitration and completion interrupts.
+A wholesale switch to microVU transfer timing cannot be made by replacing its
+transfer call alone. Runtime profiles should distinguish these management costs
+from arithmetic throughput when selecting the next optimization.
+
 ## Validation
 
 `ee_recompiler_tests.cpp` compares complete CPU state, RAM, modified instruction
