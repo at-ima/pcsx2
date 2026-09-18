@@ -563,3 +563,48 @@ and shut down with exit code 0. Both baseline and new development apps report
 missing optional `patches.zip`; these runs do not validate bundled game patches.
 No visual, long-gameplay or x64 runtime validation was performed. Logs:
 `readiness-production-{build,ctest,state,state-console}.log`.
+
+
+## Compare larger linear-block limits
+
+The scheduling-readiness fix makes larger blocks worth measuring again.
+`MaxInstructions` limits guest instruction pairs per compiled block;
+`MaxBlockBytes` is a conservative free-space threshold before code generation,
+not a separate throughput setting or the amount allocated to every block.
+Raising the latter alone can cause earlier cache resets without reducing guest
+execution overhead. The existing 2 KiB-per-pair margin is retained.
+
+The 128/256/512 candidates differ only in the instruction limit. They use the
+same temporary metrics logger, movie frames 850–1100 and MTVU-disabled settings.
+Builds, tests and measurements run serially. Larger-block differential coverage
+includes 255/256/257 and 511/512/513 pairs, full queue bytes, partial budgets,
+cycle wrap and source changes at pairs 191 and 447. These are interpreter-state
+comparisons rather than assertions that a larger limit is always faster.
+
+Measured order: 128 A, 256 A, 512 A, 512 B, 256 B, 128 B.
+
+| Pair limit | VPS A | VPS B | Mean VPS |
+| --- | ---: | ---: | ---: |
+| 128 | 48.92 | 48.15 | 48.53 |
+| 256 | 50.42 | 50.72 | 50.57 |
+| 512 | 49.94 | 50.04 | 49.99 |
+
+Select **256 pairs**: mean throughput improves by **4.2%**
+relative to 128 pairs. The 512-pair version was slightly slower than 256 in both
+passes. This supports a conservative 256-pair cap for this workload, not a claim
+of a universal optimum. Larger limits can change register selection, generated
+code footprint, source-validation work and whole-suffix budget eligibility;
+these runs do not isolate their individual contributions. Compilation cost is
+also relevant: the present age analysis visits earlier producers quadratically.
+Increasing the cap indefinitely is therefore not a substitute for reducing
+cross-block state publication and generic-prefix work.
+
+Logs: `diagnostic-limits{128,256,512}-{a,b}.log` and corresponding JSON files in
+the ignored build directory. All 182 tests passed on both candidate limits.
+
+Final 256-pair production validation: metrics logging removed, app rebuilt,
+all **182 tests** passed, deep signature verification passed, and the existing
+SCPS-15025 state loaded SPU2/GS and ran for 20 seconds with normal shutdown.
+Logs: `limits-production-{build,ctest,state,state-console}.log`. The existing
+missing optional patches.zip warning remains; visual correctness, long gameplay
+and x64 execution were not validated in this experiment.

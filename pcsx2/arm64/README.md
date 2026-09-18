@@ -202,10 +202,13 @@ and all arithmetic execute in their original order. The VI backup countdown is
 accumulated until the next VI write or suffix exit, with byte saturation; this
 preserves the value seen by BackupVI without updating memory every pair.
 
-Linear blocks contain at most 128 pairs, bounded by micro-memory and supported
+Linear blocks contain at most 256 pairs, bounded by micro-memory and supported
 instructions. Source validation covers the entire block. Generated-code space
 and cycle-wrap protection scale with this limit. This reduces artificial block
-boundaries without adding cross-block linking.
+boundaries without adding cross-block linking. A 512-pair limit did not improve
+the measured opening-movie workload; see PERFORMANCE.md for the comparison.
+MaxBlockBytes is the pre-compilation free-space threshold, not an allocation
+reserved for every block.
 
 This removes per-pair queue construction, retirement memory traffic and budget/
 TPC/code updates from that suffix. It shares pair emission and metadata encoding

@@ -496,7 +496,7 @@ TEST_F(VU1RecompilerTest, ScheduledRetirementPreservesEveryBudgetPrefix)
 TEST_F(VU1RecompilerTest, DeferredSuffixMaterializesCompleteQueues)
 {
 	const VURegs initial = VU1, initial0 = VU0;
-	for (u32 length : {15u, 24u, 32u, 63u, 64u, 65u, 96u, 128u})
+	for (u32 length : {15u, 24u, 32u, 63u, 64u, 65u, 96u, 128u, 255u, 256u, 257u, 511u, 512u, 513u})
 	{
 		for (u32 pattern = 0; pattern < 8; pattern++)
 		{
@@ -597,13 +597,13 @@ TEST_F(VU1RecompilerTest, DeferredSuffixMixedInstructionsAndResume)
 TEST_F(VU1RecompilerTest, LongBlockWrapAndLateCodeModification)
 {
 	const VURegs initial = VU1, initial0 = VU0;
-	for (u32 i = 0; i < 128; i++)
+	for (u32 i = 0; i < 512; i++)
 		Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
-	Put(128 * 8, 0xc00002ff, 0x3f800000);
-	Put(129 * 8, 0x800002ff, 0x3f800000);
-	for (u64 distance : {129u, 255u, 259u, 260u, 511u, 515u, 516u, 1023u})
+	Put(512 * 8, 0xc00002ff, 0x3f800000);
+	Put(513 * 8, 0x800002ff, 0x3f800000);
+	for (u64 distance : {129u, 255u, 259u, 260u, 511u, 515u, 516u, 1023u, 1027u, 1028u, 2047u, 2051u, 2052u})
 	{
-		for (u32 budget : {63u, 64u, 65u, 127u, 128u, 129u, 255u, 256u, 257u, 511u, 512u, 513u})
+		for (u32 budget : {63u, 64u, 65u, 127u, 128u, 129u, 255u, 256u, 257u, 511u, 512u, 513u, 1023u, 1024u, 1025u, 2047u, 2048u, 2049u})
 		{
 			SCOPED_TRACE(testing::Message() << "distance=" << distance << " budget=" << budget);
 			VU0 = initial0;
@@ -614,15 +614,15 @@ TEST_F(VU1RecompilerTest, LongBlockWrapAndLateCodeModification)
 				return;
 		}
 	}
-	// Re-enter cached code whose first 32 pairs are unchanged.
+	// Re-enter cached code whose first 128 pairs are unchanged.
 	for (u32 pass = 0; pass < 3; pass++)
 	{
 		VU0 = initial0;
 		VU1 = initial;
 		VU1.cycle = 100;
 		if (pass)
-			Put((pass == 1 ? 47 : 96) * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x2a, 0x40000000);
-		Compare(512);
+			Put((pass == 1 ? 191 : 447) * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x2a, 0x40000000);
+		Compare(2048);
 		if (HasFatalFailure())
 			return;
 	}

@@ -14,7 +14,10 @@
 namespace
 {
 	using namespace vixl::aarch64;
-	constexpr u32 MaxInstructions = 128;
+	// Larger blocks amortize preparation, but increase generated code and validation work.
+	constexpr u32 MaxInstructions = 256;
+	// Free-space threshold before compiling both ordinary and deferred paths,
+	// not a fixed allocation per block or an independent throughput setting.
 	constexpr size_t MaxBlockBytes = MaxInstructions * 2048;
 
 	using Arm64VU1::Instruction;
