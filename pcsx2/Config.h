@@ -1500,6 +1500,8 @@ namespace EmuFolders
 #define REC_VU1 (EmuConfig.Cpu.Recompiler.EnableVU1)
 #define THREAD_VU1 (REC_VU1 && EmuConfig.Speedhacks.vuThread)
 #else
+// The ARM64 block recompiler retains interpreter pipeline/XGKICK timing.
+// REC_VU1 here selects microVU's timing and MTVU protocol, not merely native code.
 #define THREAD_VU1 false
 #define REC_VU1 false
 #endif

@@ -29,13 +29,51 @@ void _vu1ExecLower(VURegs* VU, u32* ptr)
 
 int vu1branch = 0;
 
+namespace
+{
+	struct VU1DecodedInstruction
+	{
+		u32 upper;
+		u32 lower;
+		_VURegsNum upperRegs;
+		_VURegsNum lowerRegs;
+		bool valid;
+	};
+
+	VU1DecodedInstruction s_vu1DecodedInstructions[VU1_PROGSIZE / 8] = {};
+
+	VU1DecodedInstruction& DecodeInstruction(VURegs* VU, const u32* ptr)
+	{
+		auto& decoded = s_vu1DecodedInstructions[(VU->VI[REG_TPC].UL & VU1_PROGMASK) / 8];
+		// Register dependencies depend only on the instruction words. Check both on
+		// every fetch so MPG uploads, debugger edits and state loads need no invalidation.
+		if (!decoded.valid || decoded.upper != ptr[1] || decoded.lower != ptr[0])
+		{
+			decoded.upper = ptr[1];
+			decoded.lower = ptr[0];
+			decoded.upperRegs = {};
+			decoded.lowerRegs = {};
+			VU->code = ptr[1];
+			VU1regs_UPPER_OPCODE[VU->code & 0x3f](&decoded.upperRegs);
+			if (!(ptr[1] & 0x80000000))
+			{
+				VU->code = ptr[0];
+				VU1regs_LOWER_OPCODE[VU->code >> 25](&decoded.lowerRegs);
+			}
+			decoded.valid = true;
+		}
+		return decoded;
+	}
+} // namespace
+
 static void _vu1Exec(VURegs* VU)
 {
-	_VURegsNum lregs;
-	_VURegsNum uregs;
 	u32* ptr;
 
 	ptr = (u32*)&VU->Micro[VU->VI[REG_TPC].UL];
+	auto& decoded = DecodeInstruction(VU, ptr);
+	_VURegsNum& uregs = decoded.upperRegs;
+	_VURegsNum& lregs = decoded.lowerRegs;
 	VU->VI[REG_TPC].UL += 8;
 
 	if (ptr[1] & 0x40000000) // E flag
@@ -64,7 +102,6 @@ static void _vu1Exec(VURegs* VU)
 	//VUM_LOG("VU->cycle = %d (flags st=%x;mac=%x;clip=%x,q=%f)", VU->cycle, VU->statusflag, VU->macflag, VU->clipflag, VU->q.F);
 
 	VU->code = ptr[1];
-	VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
 	u32 cyclesBeforeOp = VU1.cycle-1;
 
@@ -81,9 +118,8 @@ static void _vu1Exec(VURegs* VU)
 		_vu1ExecUpper(VU, ptr);
 
 		VU->VI[REG_I].UL = ptr[0];
-		//Lower not used, set to 0 to fill in the FMAC stall gap
+		//Lower metadata is zero for I-bit instructions to fill in the FMAC stall gap.
 		//Could probably get away with just running upper stalls, but lets not tempt fate.
-		memset(&lregs, 0, sizeof(lregs));
 	}
 	else
 	{
@@ -96,8 +132,6 @@ static void _vu1Exec(VURegs* VU)
 		int discard = 0;
 
 		VU->code = ptr[0];
-		lregs.cycles = 0;
-		VU1regs_LOWER_OPCODE[VU->code >> 25](&lregs);
 
 		_vuTestLowerStalls(VU, &lregs);
 		_vuTestPipes(VU);

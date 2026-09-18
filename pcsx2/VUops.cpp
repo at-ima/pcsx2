@@ -8,6 +8,9 @@
 #include "MTVU.h"
 
 #include <cmath>
+#if defined(ARCH_ARM64)
+#include <arm_neon.h>
+#endif
 u32 laststall = 0;
 //Lower/Upper instructions can use that..
 #define _Ft_ ((VU->code >> 16) & 0x1F)  // The rt part of the instruction register
@@ -187,16 +190,12 @@ void _vuFlushAll(VURegs* VU)
 
 __fi void _vuTestPipes(VURegs* VU)
 {
-	bool flushed;
-
-	do
-	{
-		flushed = false;
-		flushed |= _vuFMACflush(VU);
-		flushed |= _vuFDIVflush(VU);
-		flushed |= _vuEFUflush(VU);
-		flushed |= _vuIALUflush(VU);
-	} while (flushed == true);
+	// Each flush retires all ready entries without advancing the cycle or adding
+	// work to another pipeline. Keep the flag writeback order, but only visit once.
+	_vuFMACflush(VU);
+	_vuFDIVflush(VU);
+	_vuEFUflush(VU);
+	_vuIALUflush(VU);
 
 	if (VU == &VU1)
 	{
@@ -516,6 +515,82 @@ void __fi _vuABS(VURegs* VU)
 
 enum class MACOpDst { Fd, Acc };
 
+static __fi float _vuOpADD(u32 fs, u32 ft);
+static __fi float _vuOpSUB(u32 fs, u32 ft);
+static __fi float _vuOpMUL(u32 fs, u32 ft);
+static __fi float _vuOpMADD(u32 acc, u32 fs, u32 ft);
+static __fi float _vuOpMSUB(u32 acc, u32 fs, u32 ft);
+
+#if defined(ARCH_ARM64)
+static __fi float32x4_t vuDoubleNEON(uint32x4_t value)
+{
+#ifndef INT_VUDOUBLEHACK
+	const uint32x4_t exponent = vandq_u32(value, vdupq_n_u32(0x7f800000));
+	const uint32x4_t sign = vandq_u32(value, vdupq_n_u32(0x80000000));
+	value = vbslq_u32(vceqzq_u32(exponent), sign, value);
+	// Match vuDouble(), including its existing use of VU0's input clamp option.
+	if (CHECK_VU_OVERFLOW(0))
+		value = vbslq_u32(vceqq_u32(exponent, vdupq_n_u32(0x7f800000)),
+			vorrq_u32(sign, vdupq_n_u32(0x7f7fffff)), value);
+#endif
+	return vreinterpretq_f32_u32(value);
+}
+
+static __fi void storeMACNEON(VURegs* VU, VECTOR* dst, float32x4_t result)
+{
+	uint32x4_t bits = vreinterpretq_u32_f32(result);
+	const uint32x4_t exponent = vandq_u32(bits, vdupq_n_u32(0x7f800000));
+	// Use the same floating-point zero comparison as VU_MAC_UPDATE: FPCR's FZ
+	// setting determines whether a denormal result counts as zero or underflow.
+	const uint32x4_t zero = vceqzq_f32(result);
+	const uint32x4_t underflow = vbicq_u32(vceqzq_u32(exponent), zero);
+	const uint32x4_t overflow = vbicq_u32(vceqq_u32(exponent, vdupq_n_u32(0x7f800000)), zero);
+	uint32x4_t flags = vorrq_u32(vandq_u32(vorrq_u32(zero, underflow), vdupq_n_u32(1)),
+		vshlq_n_u32(vshrq_n_u32(bits, 31), 4));
+	flags = vorrq_u32(flags, vandq_u32(underflow, vdupq_n_u32(0x100)));
+	flags = vorrq_u32(flags, vandq_u32(overflow, vdupq_n_u32(0x1000)));
+	const int32x4_t shifts = {3, 2, 1, 0};
+	VU->macflag = (VU->macflag & 0xffff0000) | vaddvq_u32(vshlq_u32(flags, shifts));
+
+	const uint32x4_t sign = vandq_u32(bits, vdupq_n_u32(0x80000000));
+	bits = vbslq_u32(underflow, sign, bits);
+	if (CHECK_VU_OVERFLOW(1))
+		bits = vbslq_u32(overflow, vorrq_u32(sign, vdupq_n_u32(0x7f7fffff)), bits);
+	vst1q_u32(dst->UL, bits);
+	VU_STAT_UPDATE(VU);
+}
+
+template <float (*Fn)(u32, u32)>
+static __fi void binaryMACNEON(VURegs* VU, VECTOR* dst, uint32x4_t rhs)
+{
+	static_assert(Fn == _vuOpADD || Fn == _vuOpSUB || Fn == _vuOpMUL);
+	const float32x4_t a = vuDoubleNEON(vld1q_u32(VU->VF[_Fs_].UL));
+	const float32x4_t b = vuDoubleNEON(rhs);
+	if constexpr (Fn == _vuOpADD)
+		storeMACNEON(VU, dst, vaddq_f32(a, b));
+	else if constexpr (Fn == _vuOpSUB)
+		storeMACNEON(VU, dst, vsubq_f32(a, b));
+	else
+		storeMACNEON(VU, dst, vmulq_f32(a, b));
+}
+
+template <float (*Fn)(u32, u32, u32)>
+static __fi void ternaryMACNEON(VURegs* VU, VECTOR* dst, uint32x4_t rhs)
+{
+	static_assert(Fn == _vuOpMADD || Fn == _vuOpMSUB);
+	const float32x4_t acc = vuDoubleNEON(vld1q_u32(VU->ACC.UL));
+	const float32x4_t a = vuDoubleNEON(vld1q_u32(VU->VF[_Fs_].UL));
+	const float32x4_t b = vuDoubleNEON(rhs);
+	// Use the scalar expression's multiply and add/subtract operations, with the
+	// same compiler contraction policy (do not explicitly introduce fused intrinsics).
+	const float32x4_t product = vmulq_f32(a, b);
+	if constexpr (Fn == _vuOpMADD)
+		storeMACNEON(VU, dst, vaddq_f32(acc, product));
+	else
+		storeMACNEON(VU, dst, vsubq_f32(acc, product));
+}
+#endif
+
 template <MACOpDst Dst>
 static __fi VECTOR* _getDst(VURegs* VU)
 {
@@ -531,6 +606,13 @@ template <float(*Fn)(u32, u32), MACOpDst Dst>
 static __fi void applyBinaryMACOp(VURegs* VU)
 {
 	VECTOR* dst = _getDst<Dst>(VU);
+#if defined(ARCH_ARM64)
+	if (VU == &VU1 && _XYZW == 15)
+	{
+		binaryMACNEON<Fn>(VU, dst, vld1q_u32(VU->VF[_Ft_].UL));
+		return;
+	}
+#endif
 	if (_X) { dst->i.x = VU_MACx_UPDATE(VU, Fn(VU->VF[_Fs_].i.x, VU->VF[_Ft_].i.x)); } else VU_MACx_CLEAR(VU);
 	if (_Y) { dst->i.y = VU_MACy_UPDATE(VU, Fn(VU->VF[_Fs_].i.y, VU->VF[_Ft_].i.y)); } else VU_MACy_CLEAR(VU);
 	if (_Z) { dst->i.z = VU_MACz_UPDATE(VU, Fn(VU->VF[_Fs_].i.z, VU->VF[_Ft_].i.z)); } else VU_MACz_CLEAR(VU);
@@ -542,6 +624,16 @@ template <float(*Fn)(u32, u32), MACOpDst Dst>
 static __fi void applyBinaryMACOpBroadcast(VURegs* VU, u32 bc)
 {
 	VECTOR* dst = _getDst<Dst>(VU);
+#if defined(ARCH_ARM64)
+	if constexpr (Fn == _vuOpADD || Fn == _vuOpSUB || Fn == _vuOpMUL)
+	{
+		if (VU == &VU1 && _XYZW == 15)
+		{
+			binaryMACNEON<Fn>(VU, dst, vdupq_n_u32(bc));
+			return;
+		}
+	}
+#endif
 	if (_X) { dst->i.x = VU_MACx_UPDATE(VU, Fn(VU->VF[_Fs_].i.x, bc)); } else VU_MACx_CLEAR(VU);
 	if (_Y) { dst->i.y = VU_MACy_UPDATE(VU, Fn(VU->VF[_Fs_].i.y, bc)); } else VU_MACy_CLEAR(VU);
 	if (_Z) { dst->i.z = VU_MACz_UPDATE(VU, Fn(VU->VF[_Fs_].i.z, bc)); } else VU_MACz_CLEAR(VU);
@@ -683,6 +775,13 @@ template <float(*Fn)(u32, u32, u32), MACOpDst Dst>
 static __fi void applyTernaryMACOp(VURegs* VU)
 {
 	VECTOR* dst = _getDst<Dst>(VU);
+#if defined(ARCH_ARM64)
+	if (VU == &VU1 && _XYZW == 15)
+	{
+		ternaryMACNEON<Fn>(VU, dst, vld1q_u32(VU->VF[_Ft_].UL));
+		return;
+	}
+#endif
 	if (_X) { dst->i.x = VU_MACx_UPDATE(VU, Fn(VU->ACC.i.x, VU->VF[_Fs_].i.x, VU->VF[_Ft_].i.x)); } else VU_MACx_CLEAR(VU);
 	if (_Y) { dst->i.y = VU_MACy_UPDATE(VU, Fn(VU->ACC.i.y, VU->VF[_Fs_].i.y, VU->VF[_Ft_].i.y)); } else VU_MACy_CLEAR(VU);
 	if (_Z) { dst->i.z = VU_MACz_UPDATE(VU, Fn(VU->ACC.i.z, VU->VF[_Fs_].i.z, VU->VF[_Ft_].i.z)); } else VU_MACz_CLEAR(VU);
@@ -694,6 +793,13 @@ template <float(*Fn)(u32, u32, u32), MACOpDst Dst>
 static __fi void applyTernaryMACOpBroadcast(VURegs* VU, u32 bc)
 {
 	VECTOR* dst = _getDst<Dst>(VU);
+#if defined(ARCH_ARM64)
+	if (VU == &VU1 && _XYZW == 15)
+	{
+		ternaryMACNEON<Fn>(VU, dst, vdupq_n_u32(bc));
+		return;
+	}
+#endif
 	if (_X) { dst->i.x = VU_MACx_UPDATE(VU, Fn(VU->ACC.i.x, VU->VF[_Fs_].i.x, bc)); } else VU_MACx_CLEAR(VU);
 	if (_Y) { dst->i.y = VU_MACy_UPDATE(VU, Fn(VU->ACC.i.y, VU->VF[_Fs_].i.y, bc)); } else VU_MACy_CLEAR(VU);
 	if (_Z) { dst->i.z = VU_MACz_UPDATE(VU, Fn(VU->ACC.i.z, VU->VF[_Fs_].i.z, bc)); } else VU_MACz_CLEAR(VU);

@@ -3,6 +3,10 @@
 
 #include "Achievements.h"
 #include "BuildVersion.h"
+#if defined(ARCH_ARM64)
+#include "arm64/EERecompiler.h"
+#include "arm64/VU1Recompiler.h"
+#endif
 #include "CDVD/CDVD.h"
 #include "CDVD/IsoReader.h"
 #include "Counters.h"
@@ -2681,7 +2685,9 @@ void VMManager::InitializeCPUProviders()
 	CpuMicroVU0.Reserve();
 	CpuMicroVU1.Reserve();
 #else
-	// Despite not having any VU recompilers on ARM64, therefore no MTVU,
+	arm64Cpu.Reserve();
+	CpuArm64VU1.Reserve();
+	// The ARM64 VU1 provider does not support MTVU, but
 	// we still need the thread alive. Otherwise the read and write positions
 	// of the ring buffer wont match, and various systems in the emulator end up deadlocked.
 	vu1Thread.Open();
@@ -2705,6 +2711,8 @@ void VMManager::ShutdownCPUProviders()
 	psxRec.Shutdown();
 	recCpu.Shutdown();
 #else
+	arm64Cpu.Shutdown();
+	CpuArm64VU1.Shutdown();
 	// See the comment in the InitializeCPUProviders for an explaination why we
 	// still need to manage the MTVU thread.
 	if (vu1Thread.IsOpen())
@@ -2730,11 +2738,13 @@ void VMManager::UpdateCPUImplementations()
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
 #else
-	Cpu = &intCpu;
+	Cpu = EmuConfig.Cpu.Recompiler.EnableEE ? &arm64Cpu : &intCpu;
 	psxCpu = &psxInt;
 
 	CpuVU0 = &CpuIntVU0;
-	CpuVU1 = &CpuIntVU1;
+	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
+	Console.WriteLn("CPU execution: EE: %s; IOP/VU0 interpreters; VU1: %s; MTVU unavailable",
+		Cpu == &arm64Cpu ? "ARM64 block recompiler (partial)" : "interpreter", CpuVU1->GetLongName());
 #endif
 }
 

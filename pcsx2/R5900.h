@@ -350,6 +350,10 @@ struct R5900cpu
 	// resets, since TLB remaps affect more than just the code they contain (code that
 	// may reference the remapped blocks via memory loads/stores, for example).
 	void (*Clear)(u32 Addr, u32 Size);
+
+	// Providers sharing the interpreter execution driver also use its branch
+	// timing and architectural TLB-miss recovery, even when emitting native code.
+	bool usesInterpreterExecution = false;
 };
 
 extern R5900cpu *Cpu;
