@@ -496,7 +496,7 @@ TEST_F(VU1RecompilerTest, ScheduledRetirementPreservesEveryBudgetPrefix)
 TEST_F(VU1RecompilerTest, DeferredSuffixMaterializesCompleteQueues)
 {
 	const VURegs initial = VU1, initial0 = VU0;
-	for (u32 length : {15u, 24u, 32u})
+	for (u32 length : {15u, 24u, 32u, 63u, 64u, 65u, 96u, 128u})
 	{
 		for (u32 pattern = 0; pattern < 8; pattern++)
 		{
@@ -540,7 +540,7 @@ TEST_F(VU1RecompilerTest, DeferredSuffixMaterializesCompleteQueues)
 					VU1.macflag = 0xa5a51234;
 					VU1.statusflag = 0x65432109;
 					VU1.clipflag = 0x89abcdef;
-					VU1.VIBackupCycles = 3;
+					VU1.VIBackupCycles = ring == 3 ? 255 : 3;
 					Compare(budget);
 					if (HasFatalFailure())
 						return;
@@ -568,7 +568,7 @@ TEST_F(VU1RecompilerTest, DeferredSuffixMixedInstructionsAndResume)
 		VU1.cycle = 100;
 		VU1.fmacreadpos = VU1.fmacwritepos = seed & 3;
 		std::memset(VU1.Mem, 0x3f, VU1_MEMSIZE);
-		for (u32 i = 0; i < 64; i++)
+		for (u32 i = 0; i < 128; i++)
 		{
 			const u32 op = ops[next() % std::size(ops)];
 			const u32 dest = (op & 63) >= 60 ? 0 : (next() % 10) << 6;
@@ -581,11 +581,11 @@ TEST_F(VU1RecompilerTest, DeferredSuffixMixedInstructionsAndResume)
 			}
 			Put(i * 8, upper, lower);
 		}
-		Put(64 * 8, 0xc00002ff, 0x3f800000);
-		Put(65 * 8, 0x800002ff, 0x3f800000);
+		Put(128 * 8, 0xc00002ff, 0x3f800000);
+		Put(129 * 8, 0x800002ff, 0x3f800000);
 		// Partial execution followed by a full suffix, then continuation into
 		// another block and the E-bit fallback must expose identical state.
-		for (u32 budget : {1u, 7u, 31u, 128u, 128u})
+		for (u32 budget : {1u, 7u, 31u, 128u, 512u})
 		{
 			Compare(budget);
 			if (HasFatalFailure())
@@ -594,7 +594,113 @@ TEST_F(VU1RecompilerTest, DeferredSuffixMixedInstructionsAndResume)
 	}
 }
 
-TEST_F(VU1RecompilerTest, ScheduledRetirementFallsBackForSpecialAndIncomingState)
+TEST_F(VU1RecompilerTest, LongBlockWrapAndLateCodeModification)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 i = 0; i < 128; i++)
+		Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
+	Put(128 * 8, 0xc00002ff, 0x3f800000);
+	Put(129 * 8, 0x800002ff, 0x3f800000);
+	for (u64 distance : {129u, 255u, 259u, 260u, 511u, 515u, 516u, 1023u})
+	{
+		for (u32 budget : {63u, 64u, 65u, 127u, 128u, 129u, 255u, 256u, 257u, 511u, 512u, 513u})
+		{
+			SCOPED_TRACE(testing::Message() << "distance=" << distance << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = ~u64(0) - distance;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+	// Re-enter cached code whose first 32 pairs are unchanged.
+	for (u32 pass = 0; pass < 3; pass++)
+	{
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 100;
+		if (pass)
+			Put((pass == 1 ? 47 : 96) * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x2a, 0x40000000);
+		Compare(512);
+		if (HasFatalFailure())
+			return;
+	}
+	for (u32 i = 0; i < 64; i++)
+		Put(VU1_PROGSIZE - 512 + i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x3f800000);
+	for (u32 budget : {63u, 64u, 65u, 128u})
+	{
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VI[REG_TPC].UL = (VU1_PROGSIZE - 512) / 8;
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, ScheduledReadinessAfterIncomingQueuesDrain)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 i = 0; i < 64; i++)
+		Put(i * 8, (15 << 21) | (1 << 11) | (3 << 6) | 0x20, // ADDq observes division completion.
+			0x10000003 | (2 << 16) | (1 << 11));
+	Put(64 * 8, 0xc00002ff, 0x3f800000);
+	Put(65 * 8, 0x800002ff, 0x3f800000);
+	for (u32 variant = 0; variant < 6; variant++)
+	{
+		for (u32 latency : {1u, 2u, 6u, 7u, 8u, 16u})
+		{
+			for (u32 budget : {6u, 7u, 8u, 15u, 63u, 64u, 65u, 96u})
+			{
+				SCOPED_TRACE(testing::Message() << "variant=" << variant << " latency=" << latency << " budget=" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = variant == 5 ? ~u64(0) - 200 : 100;
+				VU1.VI[REG_Q].UL = 0x3f800000;
+				if (variant == 0 || variant >= 3)
+				{
+					VU1.ialucount = 1;
+					VU1.ialureadpos = 3;
+					VU1.ialuwritepos = 0;
+					VU1.ialu[3].sCycle = VU1.cycle;
+					VU1.ialu[3].Cycle = latency;
+					VU1.ialu[3].reg = 1 << 2;
+				}
+				if (variant == 1 || variant == 3)
+				{
+					VU1.fdiv.enable = 1;
+					VU1.fdiv.sCycle = VU1.cycle;
+					VU1.fdiv.Cycle = latency;
+					VU1.fdiv.reg.UL = 0x40000000;
+					VU1.fdiv.statusflag = 0xc30;
+				}
+				if (variant == 2 || variant == 3)
+				{
+					VU1.efu.enable = 1;
+					VU1.efu.sCycle = VU1.cycle;
+					VU1.efu.Cycle = latency;
+					VU1.efu.reg.UL = 0x40400000;
+				}
+				if (variant == 4)
+				{
+					// Drained special work must not override invalid incoming FMAC timing.
+					VU1.fmaccount = 1;
+					VU1.fmacwritepos = 1;
+					VU1.fmac[0].sCycle = VU1.cycle;
+					VU1.fmac[0].Cycle = 8;
+					VU1.fmac[0].regupper = 1;
+					VU1.fmac[0].xyzwupper = 15;
+				}
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ScheduledRetirementHandlesSpecialAndIncomingState)
 {
 	const VURegs initial = VU1;
 	for (u32 i = 0; i < 64; i++)

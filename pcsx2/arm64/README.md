@@ -172,9 +172,14 @@ transfer policy, not cycle-exact GIF timing; wider game coverage is still needed
 FMAC/FDIV/EFU/IALU queues and arithmetic flags remain interpreter-compatible.
 For sufficiently long blocks, the compiler now tracks FMAC ages and known stalls.
 After a generic prefix drains incoming entries, it emits known retirement counts
-instead of checking every queue at every pair. An entry guard rejects pending
-special pipelines or XGKICK, irregular incoming queues and cycle wrap. Unknown
-timing keeps the generic preparation path. Every queue entry is materialized
+instead of checking every queue at every pair. An entry guard permanently rejects
+pending XGKICK, irregular incoming FMAC queues and cycle wrap. Pending FDIV,
+EFU and IALU work initially keeps the generic path, but readiness is checked again
+at the first scheduled pair and at the deferred suffix boundary. Once these
+queues drain, the validated block may use scheduled execution. Supported pairs
+cannot start special pipelines or stall on IALU: native integer operations have
+zero pipeline latency and branches end the block. Unknown timing keeps the
+generic preparation path. Every queue entry is materialized
 at observable exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored. This is a limited first step
 toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
@@ -193,7 +198,14 @@ STATUS/MAC values. Producer metadata and issue-cycle offsets are compiler facts,
 so the path restores only each slot's last writer at exit, including overwritten
 inactive entries and padding. It then publishes queue indices/count, flags,
 TPC, code and cycles. VF/ACC publication uses the common exit. VI backup timing
-and all arithmetic execute in their original order.
+and all arithmetic execute in their original order. The VI backup countdown is
+accumulated until the next VI write or suffix exit, with byte saturation; this
+preserves the value seen by BackupVI without updating memory every pair.
+
+Linear blocks contain at most 128 pairs, bounded by micro-memory and supported
+instructions. Source validation covers the entire block. Generated-code space
+and cycle-wrap protection scale with this limit. This reduces artificial block
+boundaries without adding cross-block linking.
 
 This removes per-pair queue construction, retirement memory traffic and budget/
 TPC/code updates from that suffix. It shares pair emission and metadata encoding

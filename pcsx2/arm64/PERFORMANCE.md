@@ -484,3 +484,82 @@ verification passed. The existing SCPS-15025 state loaded, ran for 20 seconds
 without early exit, and shut down with exit code 0. No visual, long-gameplay or
 x64 runtime validation was performed. Logs:
 `deferred-production-{build,ctest,state,state-console}.log`.
+
+
+## Refresh scheduling readiness after incoming special work retires
+
+The deferred path retained one eligibility decision from block entry. Pending
+IALU work disabled scheduling for the entire block even when it retired during
+the generic prefix. Increasing block length then extended generic execution
+instead of amortizing its management overhead.
+
+Temporary counters on the 64-pair candidate recorded 15,826,944 deferred-boundary
+visits, 11,870,208 entry-guard passes and the same number of budget passes.
+All 3,956,736 guard failures reported pending IALU; FDIV/EFU/XGKICK counters were
+zero. A separate 128-pair run passed the entry guard on only 4,143,104 of
+8,286,208 visits, again with no further budget failures. These are whole-boot
+counts, not just the timed movie interval. The initial hypothesis that larger
+blocks failed the suffix budget check was therefore rejected. Diagnostic counter
+runs are excluded from throughput comparisons.
+
+Eligibility now has two stages. Incoming FMAC validity, cycle-wrap protection
+and absence of XGKICK establish a permanent safety condition. Special-queue
+readiness can become true after generic preparation drains FDIV/EFU/IALU.
+Generated code checks this at the first scheduled pair and the suffix boundary,
+not at every pair. Invalid incoming FMAC state and possible XGKICK callbacks
+remain permanently ineligible. Native supported pairs cannot issue new special
+work or incur IALU branch stalls, so readiness stays valid once established.
+
+The selected block cap is 128 pairs, with code-buffer margin and cycle-wrap
+protection scaled accordingly. VI backup countdown updates are accumulated until
+a VI write or suffix exit. Source validation still covers every cached pair;
+full architectural state is published at exits. There is no cross-block linking,
+threading change or relaxed emulated timing.
+
+Exploratory unsampled runs, frames 850–1100, MTVU disabled:
+
+| Candidate | VPS |
+| --- | ---: |
+| Previous 32-pair implementation (`a1595a4b9`) | 40.89 |
+| 64 pairs | 42.35 |
+| 64 pairs, accumulated backup countdown | 43.12 |
+| 128 pairs, accumulated backup countdown, stale guard | 40.29 |
+| 64 pairs, accumulated backup countdown, refreshed readiness | 46.63 |
+| 128 pairs, accumulated backup countdown, refreshed readiness | 48.81 |
+
+The 128-pair regression disappears after fixing readiness. This supports the
+management-path explanation; no hardware cache-miss or stall-counter claim is
+made. Larger generated blocks may still perform differently on other workloads.
+
+Serial new/old/old/new confirmation against `a1595a4b9`, same interval/settings:
+
+| Build | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| Refreshed readiness, 128 pairs A | 48.81 | 20.42 | 3.05 |
+| Previous A | 41.30 | 24.13 | 2.90 |
+| Previous B | 41.38 | 24.10 | 2.91 |
+| Refreshed readiness, 128 pairs B | 48.17 | 20.66 | 3.08 |
+
+Mean throughput is **41.34 → 48.49 VPS, approximately 17.3% higher**. CPU time
+falls from 24.12 to 20.54 ms/frame. The first new run is the same 128-pair run
+listed above, followed by the two baseline repeats and the final new run.
+Logs: `diagnostic-readiness128-a.log`,
+`diagnostic-readiness-final-{old-a,old-b,new-b}.log`. Sampling and diagnostic
+counters were disabled; the temporary metrics logger was identical in both
+apps. This remains below 60 VPS and is not a same-revision Rosetta comparison.
+
+Differential tests now cover 128-pair blocks, changes beyond the old 32-pair
+source boundary, micro-memory and cycle wrap, full queue bytes, byte-saturated
+VI backup countdown, mixed instructions and partial execution/resume. A new test
+varies pending IALU/FDIV/EFU completion around the scheduling boundary, including
+Q consumers, invalid incoming FMAC timing and near-wrap state. These establish
+state equivalence; the separate counters and timed runs establish the performance
+path diagnosis.
+
+Production validation: rebuilt the ARM64 app and test binaries without metrics
+logging; all **182 tests** (20 common, 162 core) passed. Deep signature verification
+passed. The SCPS-15025 state loaded SPU2/GS, ran for 20 seconds without early exit,
+and shut down with exit code 0. Both baseline and new development apps report
+missing optional `patches.zip`; these runs do not validate bundled game patches.
+No visual, long-gameplay or x64 runtime validation was performed. Logs:
+`readiness-production-{build,ctest,state,state-console}.log`.

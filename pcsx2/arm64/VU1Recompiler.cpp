@@ -14,8 +14,8 @@
 namespace
 {
 	using namespace vixl::aarch64;
-	constexpr u32 MaxInstructions = 32;
-	constexpr size_t MaxBlockBytes = 64 * 1024;
+	constexpr u32 MaxInstructions = 128;
+	constexpr size_t MaxBlockBytes = MaxInstructions * 2048;
 
 	using Arm64VU1::Instruction;
 
@@ -769,20 +769,34 @@ namespace
 		}
 	}
 
-	void EmitScheduleGuard(MacroAssembler& a)
+	void EmitScheduleReadiness(MacroAssembler& a)
 	{
-		Label done, loop, ready;
-		a.Mov(w25, 0);
+		// Bit 0 validates incoming FMAC timing and excludes callbacks. Bit 1
+		// additionally permits scheduled execution once special queues drain.
+		Label done;
+		a.Cmp(w25, 1);
+		a.B(ne, &done);
 		for (size_t offset : {offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable),
-				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount),
-				 offsetof(VURegs, xgkickenable)})
+				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount)})
 		{
 			a.Ldr(w9, Field(offset));
 			a.Cbnz(w9, &done);
 		}
+		a.Mov(w25, 3);
+		a.Bind(&done);
+	}
+
+	void EmitScheduleGuard(MacroAssembler& a)
+	{
+		Label done, loop, ready;
+		a.Mov(w25, 0);
+		// XGKICK may call C++ and change state during the prefix. Never promote
+		// those blocks, even if the pending transfer finishes before the suffix.
+		a.Ldr(w9, Field(offsetof(VURegs, xgkickenable)));
+		a.Cbnz(w9, &done);
 		a.Ldr(x9, Field(offsetof(VURegs, cycle)));
-		// A block issues at most 32 pairs, each with at most three stall cycles.
-		a.Cmn(x9, 256);
+		// Each pair can advance four cycles, including dependency stalls.
+		a.Cmn(x9, MaxInstructions * 4 + 4);
 		a.B(hs, &done);
 		a.Ldr(w10, Field(offsetof(VURegs, fmaccount)));
 		a.Cmp(w10, 4);
@@ -818,6 +832,7 @@ namespace
 		a.B(ne, &loop);
 		a.Bind(&ready);
 		a.Mov(w25, 1);
+		EmitScheduleReadiness(a);
 		a.Bind(&done);
 	}
 
@@ -873,7 +888,7 @@ namespace
 			StoreWord(a, plan.remaining, offsetof(VURegs, fmaccount));
 		}
 		// No division/EFU/IALU or GIF work can arise inside a supported block
-		// admitted by the entry guard. Broader game coverage still needs proper testing.
+		// admitted by the readiness check. Broader game coverage still needs proper testing.
 		EmitBackupCountdown(a, plan.cycles);
 	}
 
@@ -907,7 +922,7 @@ namespace
 			u32 issue_cycle = 0;
 		};
 		std::array<Slot, 4> slots{};
-		u32 issued = 0, elapsed = 0;
+		u32 issued = 0, elapsed = 0, backup_cycles = 0;
 		for (u32 i = first; i < block.count; i++)
 		{
 			const auto& plan = block.schedule[i];
@@ -926,7 +941,14 @@ namespace
 				if (j + 1 == plan.retired)
 					a.Umov(w28, flags.V4S(), 0);
 			}
-			EmitBackupCountdown(a, plan.cycles);
+			// Only an integer write can inspect/reset the backup countdown in a
+			// supported pair. Accumulate time until that observer or the block exit.
+			backup_cycles += plan.cycles;
+			if (ins.lregs.VIwrite & 0xffff)
+			{
+				EmitBackupCountdown(a, std::min(backup_cycles, 255u));
+				backup_cycles = 0;
+			}
 			EmitPair(a, block.cache, ins, false);
 			if (HasFmac(ins))
 			{
@@ -937,6 +959,8 @@ namespace
 				slots[slot].issue_cycle = elapsed;
 			}
 		}
+		if (backup_cycles)
+			EmitBackupCountdown(a, std::min(backup_cycles, 255u));
 		// Restore even inactive overwritten slots: save states and differential
 		// execution observe the complete architectural queue, not just live entries.
 		for (u32 slot = 0; slot < 4; slot++)
@@ -1089,13 +1113,20 @@ namespace
 			a.Mov(x22, reinterpret_cast<uintptr_t>(prepare[shared_prepare]));
 			a.Mov(x23, reinterpret_cast<uintptr_t>(block->instructions.data()));
 			bool cycle_dirty = false;
+			bool readiness_checked = false;
 			for (u32 i = 0; i < block->count; i++)
 			{
 				const auto& ins = block->instructions[i];
+				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
+				if (schedule_pair && (!readiness_checked || (deferred && i == suffix_start)))
+				{
+					EmitScheduleReadiness(a);
+					readiness_checked = true;
+				}
 				if (deferred && i == suffix_start)
 				{
 					Label partial;
-					a.Cbz(w25, &partial);
+					a.Tbz(w25, 1, &partial);
 					a.Sub(x9, x26, x20);
 					a.Sub(x9, x21, x9);
 					a.Cmp(x9, suffix_cycles);
@@ -1103,10 +1134,9 @@ namespace
 					a.Bind(&partial);
 				}
 				Label generic_prepare, prepared;
-				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair)
 				{
-					a.Cbz(w25, &generic_prepare);
+					a.Tbz(w25, 1, &generic_prepare);
 					EmitScheduledPrepare(a, *block, i);
 					a.B(&prepared);
 					a.Bind(&generic_prepare);
