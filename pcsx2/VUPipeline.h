@@ -6,8 +6,8 @@
 #include "VUops.h"
 #include "DebugTools/Debug.h"
 
-// Shared retirement rules, visible to the ARM64 preparation helpers so the
-// compiler can specialize accesses to VU1 without duplicating timing semantics.
+// Reference pipeline retirement rules. The ARM64 emitter in VU1Pipeline.cpp
+// mirrors this order and is checked against it through interpreter comparisons.
 namespace VUPipeline
 {
 	__forceinline_odr bool FlushFMAC(VURegs* VU)

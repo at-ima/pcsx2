@@ -3,7 +3,7 @@
 
 #include "Common.h"
 #include "arm64/VU1Recompiler.h"
-#include "VUPipeline.h"
+#include "arm64/VU1Pipeline.h"
 #include "common/HostSys.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
 
@@ -17,17 +17,25 @@ namespace
 	constexpr u32 MaxInstructions = 32;
 	constexpr size_t MaxBlockBytes = 64 * 1024;
 
-	struct Instruction
+	using Arm64VU1::Instruction;
+
+	constexpr size_t VectorOffset(u32 reg)
 	{
-		u32 pc;
-		u32 lower;
-		u32 upper;
-		_VURegsNum uregs{};
-		_VURegsNum lregs{};
-		std::array<u8, 32> readMasks{};
-		bool readsVF = false;
-		// -1: inspect incoming pipeline; 0: no dependency; 1..3: FMAC slots back.
-		int8_t dependency = -1;
+		return reg == 32 ? offsetof(VURegs, ACC) : offsetof(VURegs, VF) + sizeof(VECTOR) * reg;
+	}
+
+	struct VectorCache
+	{
+		std::array<int, 33> slots;
+		std::array<u32, 8> offsets;
+		u32 count = 0;
+
+		VectorCache()
+		{
+			slots.fill(-1);
+			offsets.fill(~u32(0));
+		}
+		VRegister Host(u32 reg) const { return VRegister(8 + slots[reg], 128); }
 	};
 
 	struct Block
@@ -36,6 +44,7 @@ namespace
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<u32, MaxInstructions * 2> words{};
 		u32 count = 0;
+		VectorCache cache;
 		Function function = nullptr;
 	};
 
@@ -44,6 +53,7 @@ namespace
 	u8* s_write = nullptr;
 	u8* s_end = nullptr;
 	u32 s_options = 0;
+	Arm64VU1::PipelineCode s_pipeline;
 
 	constexpr size_t VF(u32 reg) { return offsetof(VURegs, VF) + sizeof(VECTOR) * reg; }
 	constexpr size_t VI(u32 reg) { return offsetof(VURegs, VI) + sizeof(REG_VI) * reg; }
@@ -60,51 +70,8 @@ namespace
 		for (auto& block : s_blocks)
 			block.reset();
 		s_write = s_base;
+		s_pipeline = {};
 		s_options = Options();
-	}
-
-	// Keep pipeline retirement shared with the interpreter until static scheduling
-	// has differential coverage. Game-level XGKICK timing still needs proper testing.
-	// -2 skips VF hazards; -1 scans incoming entries; 0..3 are scheduled.
-	template <int Dependency>
-	void PrepareInstruction(const Instruction* ins)
-	{
-		VU1.cycle++;
-		VU1.VI[REG_TPC].UL = ins->pc + 8;
-		const u32 before = VU1.cycle - 1;
-		if constexpr (Dependency != -2)
-		{
-			if (Dependency >= 0 && VU1.cycle < ~u64(0) - 4)
-			{
-				if constexpr (Dependency > 0)
-				{
-					const fmacPipe& pipe = VU1.fmac[(VU1.fmacwritepos - Dependency) & 3];
-					if ((VU1.cycle - pipe.sCycle) < pipe.Cycle)
-						VU1.cycle = std::max(VU1.cycle, pipe.sCycle + pipe.Cycle);
-				}
-			}
-			else
-			{
-				// Both halves read the same pending FMAC results. Merge their read masks
-				// at compile time instead of scanning the queue once per source register.
-				for (u32 n = 0, pos = VU1.fmacreadpos; n < VU1.fmaccount; n++, pos = (pos + 1) & 3)
-				{
-					const fmacPipe& pipe = VU1.fmac[pos];
-					if ((VU1.cycle - pipe.sCycle) < pipe.Cycle &&
-						((ins->readMasks[pipe.regupper] & pipe.xyzwupper) ||
-							(ins->readMasks[pipe.reglower] & pipe.xyzwlower)))
-					{
-						const u64 ready = pipe.sCycle + pipe.Cycle;
-						if (ready > VU1.cycle)
-							VU1.cycle = ready;
-					}
-				}
-			}
-		}
-		VU1.code = (ins->upper & 0x80000000) ? ins->upper : ins->lower;
-		VUPipeline::Retire(&VU1);
-		if (VU1.VIBackupCycles)
-			VU1.VIBackupCycles -= std::min(static_cast<u8>(VU1.cycle - before), VU1.VIBackupCycles);
 	}
 
 
@@ -276,6 +243,63 @@ namespace
 		}
 	}
 
+	void LoadVector(MacroAssembler& a, const VectorCache& cache, VRegister value, u32 reg)
+	{
+		if (cache.slots[reg] >= 0)
+			a.Mov(value.V16B(), cache.Host(reg).V16B());
+		else
+			a.Ldr(value.Q(), Field(VectorOffset(reg)));
+	}
+
+	void StoreVector(MacroAssembler& a, const VectorCache& cache, VRegister value, u32 reg, u32 mask = 15)
+	{
+		if (cache.slots[reg] < 0)
+		{
+			StoreMasked(a, value, Field(VectorOffset(reg)), mask);
+			return;
+		}
+		const VRegister dest = cache.Host(reg);
+		if (mask == 15)
+			a.Mov(dest.V16B(), value.V16B());
+		else
+			for (u32 lane = 0; lane < 4; lane++)
+				if (mask & (8 >> lane))
+					a.Ins(dest.V4S(), lane, value.V4S(), lane);
+	}
+
+	void AssignVectorCache(Block& block)
+	{
+		std::array<u32, 33> uses{};
+		for (u32 i = 0; i < block.count; i++)
+		{
+			const auto& ins = block.instructions[i];
+			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
+			{
+				if (regs->VFread0)
+					uses[regs->VFread0]++;
+				if (regs->VFread1)
+					uses[regs->VFread1]++;
+				if (regs->VFwrite)
+					uses[regs->VFwrite]++;
+				if (regs->VIread & (1 << REG_ACC_FLAG))
+					uses[32]++;
+				if (regs->VIwrite & (1 << REG_ACC_FLAG))
+					uses[32]++;
+			}
+		}
+		for (u32 slot = 0; slot < block.cache.offsets.size(); slot++)
+		{
+			const auto best = std::max_element(uses.begin(), uses.end());
+			if (*best < 2)
+				break;
+			const u32 reg = best - uses.begin();
+			block.cache.slots[reg] = slot;
+			block.cache.offsets[slot] = VectorOffset(reg);
+			block.cache.count++;
+			*best = 0;
+		}
+	}
+
 	void ClampInput(MacroAssembler& a, VRegister reg)
 	{
 		// Arithmetic flushes signed denormal inputs in hardware when FPCR.FZ is
@@ -301,26 +325,32 @@ namespace
 		}
 	}
 
-	void StoreMAC(MacroAssembler& a, const Upper& op, u32 code)
+	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code)
 	{
 		const u32 mask = (code >> 21) & 15;
+		const bool flush = EmuConfig.Cpu.VU1FPCR.GetFlushToZero();
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
 		a.Movi(v16.V4S(), 0x7f800000);
 		a.And(v17.V16B(), v0.V16B(), v16.V16B());
 		a.Fcmeq(v18.V4S(), v0.V4S(), 0.0);
-		a.Cmeq(v19.V4S(), v17.V4S(), 0);
-		a.Bic(v19.V16B(), v19.V16B(), v18.V16B()); // underflow
+		if (!flush)
+		{
+			a.Cmeq(v19.V4S(), v17.V4S(), 0);
+			a.Bic(v19.V16B(), v19.V16B(), v18.V16B()); // underflow
+			a.Orr(v21.V16B(), v18.V16B(), v19.V16B());
+		}
 		a.Cmeq(v20.V4S(), v17.V4S(), v16.V4S()); // overflow
-		a.Bic(v20.V16B(), v20.V16B(), v18.V16B());
-		a.Orr(v21.V16B(), v18.V16B(), v19.V16B());
 		a.Movi(v22.V4S(), 1);
-		a.And(v21.V16B(), v21.V16B(), v22.V16B());
+		a.And(v21.V16B(), flush ? v18.V16B() : v21.V16B(), v22.V16B());
 		a.Ushr(v23.V4S(), v0.V4S(), 31);
 		a.Shl(v23.V4S(), v23.V4S(), 4);
 		a.Orr(v21.V16B(), v21.V16B(), v23.V16B());
-		a.Movi(v22.V4S(), 0x100);
-		a.And(v22.V16B(), v19.V16B(), v22.V16B());
-		a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
+		if (!flush)
+		{
+			a.Movi(v22.V4S(), 0x100);
+			a.And(v22.V16B(), v19.V16B(), v22.V16B());
+			a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
+		}
 		a.Movi(v22.V4S(), 0x1000);
 		a.And(v22.V16B(), v20.V16B(), v22.V16B());
 		a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
@@ -344,30 +374,35 @@ namespace
 		a.Orr(w11, w11, Operand(w11, LSR, 6));
 		a.And(w11, w11, 15);
 		a.Str(w11, Field(offsetof(VURegs, statusflag)));
-		a.Movi(v22.V4S(), 0x80000000);
-		a.And(v22.V16B(), v0.V16B(), v22.V16B());
-		a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
-		a.Mov(v0.V16B(), v19.V16B());
+		// FZ arithmetic has already produced signed zero for tiny results. The
+		// reference FP comparison consequently reports zero, not underflow.
+		if (!flush)
+		{
+			a.Movi(v22.V4S(), 0x80000000);
+			a.And(v22.V16B(), v0.V16B(), v22.V16B());
+			a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
+			a.Mov(v0.V16B(), v19.V16B());
+		}
 		if (CHECK_VU_OVERFLOW(1))
 		{
-			a.Movi(v23.V4S(), 0x7f7fffff);
-			a.Orr(v22.V16B(), v22.V16B(), v23.V16B());
-			a.Bsl(v20.V16B(), v22.V16B(), v0.V16B());
-			a.Mov(v0.V16B(), v20.V16B());
+			a.Movi(v22.V4S(), 0x7f7fffff);
+			a.Movi(v23.V4S(), 0xff7fffff);
+			a.Smin(v0.V4S(), v0.V4S(), v22.V4S());
+			a.Umin(v0.V4S(), v0.V4S(), v23.V4S());
 		}
 		const u32 fd = (code >> 6) & 31;
 		if (op.acc || fd)
-			StoreMasked(a, v0, Field(op.acc ? offsetof(VURegs, ACC) : VF(fd)), mask);
+			StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
 	}
 
-	void EmitUpper(MacroAssembler& a, u32 code)
+	void EmitUpper(MacroAssembler& a, const VectorCache& cache, u32 code)
 	{
 		const Upper op = DecodeUpper(code);
 		if (op.op == Op::None)
 			return;
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, fd = (code >> 6) & 31;
 		const u32 mask = (code >> 21) & 15;
-		a.Ldr(q0, Field(VF(fs)));
+		LoadVector(a, cache, q0, fs);
 		if (op.op == Op::Abs || op.op == Op::Itof || op.op == Op::Ftoi)
 		{
 			if (!ft)
@@ -404,12 +439,12 @@ namespace
 				a.Bsl(v2.V16B(), v4.V16B(), v0.V16B());
 				a.Mov(v0.V16B(), v2.V16B());
 			}
-			StoreMasked(a, v0, Field(VF(ft)), mask);
+			StoreVector(a, cache, v0, ft, mask);
 			return;
 		}
 		if (op.broadcast < 4)
 		{
-			a.Ldr(q1, Field(VF(ft)));
+			LoadVector(a, cache, q1, ft);
 			if (op.broadcast >= 0)
 				a.Dup(v1.V4S(), v1.V4S(), op.broadcast);
 		}
@@ -430,7 +465,7 @@ namespace
 				a.Bsl(v2.V16B(), v0.V16B(), v4.V16B());
 			else
 				a.Bsl(v2.V16B(), v4.V16B(), v0.V16B());
-			StoreMasked(a, v2, Field(VF(fd)), mask);
+			StoreVector(a, cache, v2, fd, mask);
 			return;
 		}
 		ClampInput(a, v0);
@@ -448,7 +483,7 @@ namespace
 				break;
 			case Op::Madd:
 			case Op::Msub:
-				a.Ldr(q2, Field(offsetof(VURegs, ACC)));
+				LoadVector(a, cache, q2, 32);
 				ClampInput(a, v2);
 				// Match the ARM64 interpreter's contracted multiply/add operations.
 				if (op.op == Op::Madd)
@@ -460,7 +495,7 @@ namespace
 			default:
 				break;
 		}
-		StoreMAC(a, op, code);
+		StoreMAC(a, cache, op, code);
 	}
 
 	void BackupVI(MacroAssembler& a, u32 reg)
@@ -479,7 +514,7 @@ namespace
 		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
 	}
 
-	void EmitLower(MacroAssembler& a, u32 code)
+	void EmitLower(MacroAssembler& a, const VectorCache& cache, u32 code)
 	{
 		const Lower op = DecodeLower(code);
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, id = (code >> 6) & 15;
@@ -495,11 +530,11 @@ namespace
 			}
 			else
 			{
-				a.Ldr(q0, Field(VF(fs)));
+				LoadVector(a, cache, q0, fs);
 				if (op == Lower::Mr32)
 					a.Ext(v0.V16B(), v0.V16B(), v0.V16B(), 4);
 			}
-			StoreMasked(a, v0, Field(VF(ft)), mask);
+			StoreVector(a, cache, v0, ft, mask);
 			return;
 		}
 		if (op == Lower::Lq || op == Lower::Sq)
@@ -515,11 +550,11 @@ namespace
 			if (op == Lower::Lq)
 			{
 				a.Ldr(q0, MemOperand(x1));
-				StoreMasked(a, v0, Field(VF(ft)), mask);
+				StoreVector(a, cache, v0, ft, mask);
 			}
 			else
 			{
-				a.Ldr(q0, Field(VF(fs)));
+				LoadVector(a, cache, q0, fs);
 				StoreMasked(a, v0, MemOperand(x1), mask);
 			}
 			return;
@@ -530,7 +565,12 @@ namespace
 			return;
 		BackupVI(a, dest);
 		if (op == Lower::Mtir)
-			a.Ldrh(w0, Field(VF(fs) + ((code >> 21) & 3) * 4));
+		{
+			if (cache.slots[fs] >= 0)
+				a.Umov(w0, cache.Host(fs).V8H(), ((code >> 21) & 3) * 2);
+			else
+				a.Ldrh(w0, Field(VF(fs) + ((code >> 21) & 3) * 4));
+		}
 		else
 		{
 			a.Ldrh(w0, Field(VI(is)));
@@ -670,20 +710,36 @@ namespace
 		VU1.code = saved_code;
 		if (block->count)
 		{
+			AssignVectorCache(*block);
+			const VectorCache& cache = block->cache;
+			if (!s_pipeline.prepare[0])
+			{
+				HostSys::BeginCodeWrite();
+				s_pipeline = Arm64VU1::CompilePipeline(s_write, s_end - s_write);
+				HostSys::EndCodeWrite();
+				HostSys::FlushInstructionCache(s_write, static_cast<u32>(s_pipeline.size));
+				s_write += (s_pipeline.size + 15) & ~size_t(15);
+			}
 			HostSys::BeginCodeWrite();
 			MacroAssembler a(s_write, s_end - s_write);
 			Label exit;
-			a.Stp(x19, x20, MemOperand(sp, -48, PreIndex));
+			const int frame_size = cache.count ? 128 : 64;
+			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
-			a.Stp(x23, lr, MemOperand(sp, 32));
+			a.Stp(x23, x24, MemOperand(sp, 32));
+			a.Str(lr, MemOperand(sp, 48));
+			if (cache.count)
+				for (u32 slot = 0; slot < 8; slot += 2)
+					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
+			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
+			for (u32 slot = 0; slot < cache.count; slot++)
+				a.Ldr(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			// Share the most frequent helper address in x22; keep preparation code
 			// outside the emitted instruction stream to avoid instruction-cache growth.
-			using PrepareFunction = void (*)(const Instruction*);
-			constexpr PrepareFunction prepare[] = {&PrepareInstruction<-2>, &PrepareInstruction<-1>,
-				&PrepareInstruction<0>, &PrepareInstruction<1>, &PrepareInstruction<2>, &PrepareInstruction<3>};
+			const auto& prepare = s_pipeline.prepare;
 			std::array<u32, std::size(prepare)> uses{};
 			for (u32 i = 0; i < block->count; i++)
 			{
@@ -712,22 +768,22 @@ namespace
 				                       ins.uregs.VFwrite :
 				                       0;
 				if (backup)
-					a.Ldr(q27, Field(VF(backup)));
+					LoadVector(a, cache, q27, backup);
 				StoreWord(a, ins.upper, offsetof(VURegs, code));
-				EmitUpper(a, ins.upper);
+				EmitUpper(a, cache, ins.upper);
 				if (immediate)
 					StoreWord(a, ins.lower, VI(REG_I));
 				else if (!discard)
 				{
 					if (backup)
 					{
-						a.Ldr(q26, Field(VF(backup)));
-						a.Str(q27, Field(VF(backup)));
+						LoadVector(a, cache, q26, backup);
+						StoreVector(a, cache, q27, backup);
 					}
 					StoreWord(a, ins.lower, offsetof(VURegs, code));
-					EmitLower(a, ins.lower);
+					EmitLower(a, cache, ins.lower);
 					if (backup)
-						a.Str(q26, Field(VF(backup)));
+						StoreVector(a, cache, q26, backup);
 				}
 				EmitFinish(a, ins);
 				a.Ldr(x9, Field(offsetof(VURegs, cycle)));
@@ -736,9 +792,15 @@ namespace
 				a.B(hs, &exit);
 			}
 			a.Bind(&exit);
-			a.Ldp(x23, lr, MemOperand(sp, 32));
+			for (u32 slot = 0; slot < cache.count; slot++)
+				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+			if (cache.count)
+				for (u32 slot = 0; slot < 8; slot += 2)
+					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 64 + slot * 8));
+			a.Ldr(lr, MemOperand(sp, 48));
+			a.Ldp(x23, x24, MemOperand(sp, 32));
 			a.Ldp(x21, x22, MemOperand(sp, 16));
-			a.Ldp(x19, x20, MemOperand(sp, 48, PostIndex));
+			a.Ldp(x19, x20, MemOperand(sp, frame_size, PostIndex));
 			a.Ret();
 			a.FinalizeCode();
 			const size_t size = a.GetSizeOfCodeGenerated();

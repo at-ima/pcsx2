@@ -5,12 +5,40 @@
 
 #if defined(ARCH_ARM64)
 #include "arm64/VU1Recompiler.h"
+#include "arm64/VU1Pipeline.h"
+#include "common/HostSys.h"
+#include "vixl/aarch64/macro-assembler-aarch64.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <cstring>
 
 namespace
 {
+	std::array<VECTOR, 8> s_seen_vectors;
+	s32 s_transfer_cycles;
+	bool s_transfer_flush;
+	u32 s_transfer_calls;
+
+	void ObservePipelineCallout(s32 cycles, bool flush)
+	{
+		s_transfer_cycles = cycles;
+		s_transfer_flush = flush;
+		s_transfer_calls++;
+		for (u32 slot = 0; slot < 8; slot++)
+		{
+			VECTOR& value = slot == 7 ? VU1.ACC : VU1.VF[1 + slot];
+			s_seen_vectors[slot] = value;
+			for (u32 lane = 0; lane < 4; lane++)
+				value.UL[lane] = 0xa5000000 | (slot << 8) | lane;
+		}
+		VU1.cycle += 257;
+		// AAPCS64 preserves only the low halves of v8..v15. Exercise the upper
+		// half clobbers which the generated call boundary must handle itself.
+		asm volatile("movi v8.16b, #17\n movi v9.16b, #17\n movi v10.16b, #17\n movi v11.16b, #17\n"
+					 "movi v12.16b, #17\n movi v13.16b, #17\n movi v14.16b, #17\n movi v15.16b, #17"
+			: : : "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15");
+	}
+
 	class VU1RecompilerTest : public testing::Test
 	{
 	protected:
@@ -315,6 +343,193 @@ TEST_F(VU1RecompilerTest, RecompilesInputFlushWhenFpcrChanges)
 		Compare(1);
 		if (HasFailure())
 			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, CachedVectorsAndAccumulatorAtEveryPrefixExit)
+{
+	const VURegs initial = VU1;
+	for (u32 i = 0; i < 64; i++)
+	{
+		const u32 mask = i % 16;
+		const u32 dest = 1 + i % 7;
+		const u32 source = 1 + (i + 1) % 7;
+		const u32 upper = (mask << 21) | (source << 16) | (dest << 11) |
+		                  (i % 3 == 0 ? 0x2bd : (dest << 6) | 0x29); // MADDA / MADD
+		u32 lower;
+		if (i % 3 == 0)
+			lower = (mask << 21) | (source << 11) | 0x02000000; // SQ
+		else if (i % 3 == 1)
+			lower = (mask << 21) | (source << 16) | (dest << 11) | 0x8000033c; // MOVE
+		else
+			lower = ((i % 4) << 21) | (3 << 16) | (dest << 11) | 0x800003fc; // MTIR
+		Put(i * 8, upper, lower);
+	}
+	for (u32 budget = 1; budget <= 160; budget++)
+	{
+		SCOPED_TRACE(budget);
+		VU1 = initial;
+		Compare(budget);
+		if (HasFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, NativePreparationRetiresRandomizedIncomingPipelines)
+{
+	const VURegs initial = VU1;
+	u32 random = 0xa5b467c9;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random; };
+	for (u64 cycle : {u64(0), u64(0xffffffff), u64(0x100000000), ~u64(0) - 1, ~u64(0)})
+	{
+		for (u32 seed = 0; seed < 128; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "cycle=" << cycle << " seed=" << seed);
+			VU1 = initial;
+			VU1.cycle = cycle;
+			VU1.VIBackupCycles = next() & 255;
+			VU1.VI[REG_STATUS_FLAG].UL = next();
+			VU1.VI[REG_CLIP_FLAG].UL = next();
+			VU1.fmaccount = seed % 5;
+			VU1.ialucount = (seed / 5) % 5;
+			VU1.fmacreadpos = VU1.ialureadpos = seed % 4;
+			VU1.fmacwritepos = (VU1.fmacreadpos + VU1.fmaccount) & 3;
+			VU1.ialuwritepos = (VU1.ialureadpos + VU1.ialucount) & 3;
+			for (u32 n = 0; n < 4; n++)
+			{
+				auto& fmac = VU1.fmac[(VU1.fmacreadpos + n) & 3];
+				fmac.sCycle = cycle - (next() % 8);
+				fmac.Cycle = 1 + next() % 8;
+				fmac.flagreg = next();
+				fmac.statusflag = next();
+				fmac.macflag = next();
+				fmac.clipflag = next();
+				auto& ialu = VU1.ialu[(VU1.ialureadpos + n) & 3];
+				ialu.sCycle = cycle - (next() % 8);
+				ialu.Cycle = 1 + next() % 8;
+			}
+			VU1.fdiv.enable = seed & 1;
+			VU1.efu.enable = seed & 2;
+			VU1.fdiv.sCycle = cycle - next() % 8;
+			VU1.efu.sCycle = cycle - next() % 8;
+			VU1.fdiv.Cycle = 1 + next() % 8;
+			VU1.efu.Cycle = 1 + next() % 8;
+			VU1.fdiv.reg.UL = next();
+			VU1.efu.reg.UL = next();
+			VU1.fdiv.statusflag = next();
+			// I-bit NOP creates no new pipe entry: isolate arbitrary incoming queues.
+			Compare(1);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, XgkickCreditTicksPreserveCycleWrapAndCachedValues)
+{
+	const VURegs initial = VU1;
+	for (u32 i = 0; i < 32; i++)
+		Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | ((3 + i % 4) << 6) | 0x28, 0x3f800000);
+	for (u64 cycle : {u64(0), u64(100), u64(0xffffffff), ~u64(0) - 1, ~u64(0)})
+	{
+		for (u32 ahead : {0u, 1u})
+		{
+			SCOPED_TRACE(testing::Message() << "cycle=" << cycle << " ahead=" << ahead);
+			VU1 = initial;
+			VU1.cycle = cycle;
+			VU1.VIBackupCycles = 2;
+			VU1.xgkickenable = 1;
+			VU1.xgkicklastcycle = cycle + ahead;
+			VU1.xgkickcyclecount = ahead;
+			// Never accumulate two transfer cycles; no GIF packet is required.
+			Compare(2);
+			if (HasFailure())
+				return;
+			EXPECT_EQ(VU1.xgkickcyclecount, 1u);
+			EXPECT_EQ(VU1.xgkicklastcycle, cycle + 1);
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
+{
+	using namespace vixl::aarch64;
+	using Wrapper = void (*)(VURegs*, const Arm64VU1::Instruction*, const u32*, const VECTOR*, VECTOR*);
+	std::array<Wrapper, 6> wrappers;
+	u8* const base = SysMemory::GetVU1Rec();
+	HostSys::BeginCodeWrite();
+	const auto pipeline = Arm64VU1::CompilePipeline(base, SysMemory::GetVU1RecEnd() - base, &ObservePipelineCallout);
+	u8* write = base + ((pipeline.size + 15) & ~size_t(15));
+	for (u32 entry = 0; entry < wrappers.size(); entry++)
+	{
+		wrappers[entry] = reinterpret_cast<Wrapper>(write);
+		MacroAssembler a(write, SysMemory::GetVU1RecEnd() - write);
+		a.Stp(x19, x24, MemOperand(sp, -96, PreIndex));
+		a.Stp(x25, lr, MemOperand(sp, 16));
+		for (u32 slot = 0; slot < 8; slot += 2)
+			a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 32 + slot * 8));
+		a.Mov(x19, x0);
+		a.Mov(x0, x1);
+		a.Mov(x24, x2);
+		a.Mov(x25, x4);
+		for (u32 slot = 0; slot < 8; slot++)
+			a.Ldr(VRegister(8 + slot, 128), MemOperand(x3, sizeof(VECTOR) * slot));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(pipeline.prepare[entry]));
+		a.Blr(x16);
+		for (u32 slot = 0; slot < 8; slot++)
+			a.Str(VRegister(8 + slot, 128), MemOperand(x25, sizeof(VECTOR) * slot));
+		for (u32 slot = 0; slot < 8; slot += 2)
+			a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, 32 + slot * 8));
+		a.Ldp(x25, lr, MemOperand(sp, 16));
+		a.Ldp(x19, x24, MemOperand(sp, 96, PostIndex));
+		a.Ret();
+		a.FinalizeCode();
+		write += (a.GetSizeOfCodeGenerated() + 15) & ~size_t(15);
+	}
+	HostSys::EndCodeWrite();
+	HostSys::FlushInstructionCache(base, static_cast<u32>(write - base));
+
+	const VURegs initial = VU1;
+	Arm64VU1::Instruction ins{};
+	ins.pc = 40;
+	ins.upper = 0x800002ff;
+	ins.lower = 0x3f800000;
+	for (u32 entry = 0; entry < wrappers.size(); entry++)
+	{
+		for (u32 count : {0u, 1u, 8u})
+		{
+			SCOPED_TRACE(testing::Message() << "entry=" << entry << " count=" << count);
+			VU1 = initial;
+			VU1.cycle = 100;
+			VU1.VIBackupCycles = 3;
+			VU1.xgkickenable = 1;
+			VU1.xgkicklastcycle = 98;
+			s_transfer_calls = 0;
+			std::array<u32, 8> offsets;
+			offsets.fill(~u32(0));
+			std::array<VECTOR, 8> cached{}, output{};
+			for (u32 slot = 0; slot < 8; slot++)
+			{
+				if (slot < count)
+					offsets[slot] = slot == 7 ? offsetof(VURegs, ACC) : offsetof(VURegs, VF) + sizeof(VECTOR) * (1 + slot);
+				for (u32 lane = 0; lane < 4; lane++)
+					cached[slot].UL[lane] = 0x5a000000 | (slot << 8) | lane;
+			}
+			wrappers[entry](&VU1, &ins, offsets.data(), cached.data(), output.data());
+			ASSERT_EQ(s_transfer_calls, 1u);
+			EXPECT_EQ(s_transfer_cycles, 2);
+			EXPECT_FALSE(s_transfer_flush);
+			EXPECT_EQ(VU1.cycle, 358u);
+			EXPECT_EQ(VU1.VIBackupCycles, 1u);
+			EXPECT_EQ(VU1.VI[REG_TPC].UL, 48u);
+			EXPECT_EQ(VU1.code, ins.upper);
+			for (u32 slot = 0; slot < count; slot++)
+			{
+				EXPECT_EQ(std::memcmp(&s_seen_vectors[slot], &cached[slot], sizeof(VECTOR)), 0);
+				for (u32 lane = 0; lane < 4; lane++)
+					EXPECT_EQ(output[slot].UL[lane], 0xa5000000u | (slot << 8) | lane);
+			}
+		}
 	}
 }
 

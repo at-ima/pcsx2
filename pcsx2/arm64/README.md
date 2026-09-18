@@ -84,18 +84,33 @@ Within a block, the first three pairs inspect the incoming FMAC queue. Later
 pairs can use a dependency calculated during compilation: incoming four-cycle
 FMAC results have matured, and only producers in the preceding three pairs can
 still stall. Cycle-wrap boundaries retain the general queue scan. Preparation
-helpers are specialized for read-free pairs, incoming dependencies,
-and each scheduled producer distance. Pipeline retirement lives in the shared
-`VUPipeline.h` implementation, allowing the compiler to combine preparation and
-retirement without expanding the same logic at every generated instruction.
+entry points are specialized for read-free pairs, incoming dependencies,
+and each scheduled producer distance. `VU1Pipeline.cpp` emits these entry stubs
+and one shared ARM64 retirement body per code-cache generation. It mirrors the
+reference retirement order in `VUPipeline.h`; generated blocks do not each contain
+a copy of the retirement routine. Native retirement omits interpreter trace logs.
+
+Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
+The assignment is fixed for the block, including every budget exit. Entry loads
+these values; exit publishes them before returning to the shared driver or
+interpreter. The generated preparation routine preserves full cached vectors
+through its private ABI. Actual XGKICK transfers publish the cache, call the
+original C++ transfer routine, then reload it; this also handles AAPCS64's
+caller-clobbered upper vector halves. Credit-only XGKICK ticks stay native.
+
 This does not enable MTVU or adopt microVU's separate execution and synchronization
-protocol.
+protocol. ARM64's current fallback still updates EE/VIF state and interrupts
+synchronously. Moving it to the MTVU worker requires an explicit completion and
+interrupt handoff, not just enabling the thread setting.
 
 Arithmetic input clamping uses signed/unsigned NEON min operations to clamp both
 signs of infinity/NaN. When VU1's FPCR flushes denormals, arithmetic supplies the
 input flush directly; other modes retain explicit signed-zero conversion. The
 code-cache options include this FPCR setting so changing it recompiles affected
-blocks. Output clamping and MAC/status flag classification remain unchanged.
+blocks. Output overflow clamping uses the same signed/unsigned min technique.
+FZ arithmetic already produces signed zero for tiny results, so that mode omits
+redundant software underflow classification and conversion. Other FPCR modes
+retain them, with the same MAC/status results as the interpreter.
 
 ## Validation
 
@@ -111,5 +126,9 @@ transfers and delay slots. They also check unchanged host FPSR and fallback for
 unsupported packed selectors. Broader game coverage still needs proper testing.
 `vu1_recompiler_tests.cpp` compares complete VU state and memory, including live
 pipeline entries and execution-budget boundaries, including overlapping FMAC,
-FDIV, EFU and IALU retirement and cycle wrap. Synthetic timing results are
-kept under the ignored build directory; they are not game-performance guarantees.
+FDIV, EFU and IALU retirement and cycle wrap. Register-cache tests cover partial
+writes, ACC, paired upper/lower hazards and exits at every instruction prefix.
+A generated wrapper checks all preparation entries across C++ callouts, including
+cached-value publication, callback modifications and upper-vector ABI clobbers.
+Synthetic timing results are kept under the ignored build directory; they are
+not game-performance guarantees.
