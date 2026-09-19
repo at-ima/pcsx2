@@ -184,6 +184,20 @@ IBLTZ, IBLEZ and IBGEZ reuse the existing integer-branch path, including the VI
 backup lookup and the combined FMAC/IALU waits, and differ only in the condition
 that skips the taken edge.
 
+ILWR is ILW without the immediate offset: VI[Is] is already the quadword index,
+so it shares ILW's IALU pipe timing and lane-priority selection exactly.
+
+FCSET, FCGET, FSEQ, FSSET, FSAND, FSOR, FMEQ, FMAND and FMOR extend FCAND/FCEQ/
+FCOR's pattern to the status and MAC flag instances: read a retired flag,
+combine it with an encoded immediate or VI[Is], and write VI[It]'s low halfword,
+or (FCSET/FSSET) write a staging flag field for the existing FMAC-pipe
+retirement to publish. Needs proper testing across games.
+
+ISW writes each masked lane independently (X/Y/Z/W are separate destination
+addresses, unlike ILW's single priority-selected lane), so it does not skip
+when It == 0. It broadcasts VI[It] into all four lanes and reuses the existing
+StoreMasked helper.
+
 ILW reads the low halfword of the final selected component, wraps VU1 data memory,
 and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic

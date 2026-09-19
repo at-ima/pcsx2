@@ -1403,3 +1403,67 @@ the per-step counter itself cost roughly 7%.
 the remaining work: the outer products are now the largest single item, followed
 by ILWR, FMAND/FSAND, ISW and the rest of the FDIV/EFU families. No visual,
 long-gameplay or x64 runtime validation was performed.
+
+
+## VU1 ILWR, the status/MAC/CLIP flag-test family, and ISW
+
+Continuing the same attribution table: ILWR (38.9M fallback pairs), the FMAND
+family (31.3M), and ISW (17.8M) were the next three largest sources after DIV.
+All three reuse existing infrastructure rather than adding any:
+
+ILWR is ILW without the immediate offset (VI[Is] is already the quadword
+index) and shares ILW's IALU pipe timing and lane-priority selection exactly,
+so it needed no scheduler changes.
+
+FCSET, FCGET, FSEQ, FSSET, FSAND, FSOR, FMEQ, FMAND and FMOR all read a
+retired flag instance (status, MAC or CLIP) and combine it with either an
+encoded immediate or VI[Is], or write a staging flag field for later FMAC-pipe
+retirement (FCSET, FSSET). The existing FCAND/FCEQ/FCOR code already
+established this shape and already forces deferred regions to end before an
+instruction reads STATUS/MAC/CLIP, so these needed no new scheduling logic
+either — just the same pattern nine more times.
+
+ISW differs from ILW/ILWR in that it writes each masked lane independently
+(X/Y/Z/W are separate destination addresses, not a single priority-selected
+lane), so it does not skip when It == 0. It reduces to broadcasting VI[It]
+into all four lanes and reusing the existing StoreMasked helper.
+
+Two hundred and seven tests pass, including new differential coverage for
+each of these instructions (edge-value sweeps, mask/register/offset sweeps,
+and budget sweeps through the FMAC-pipe retirement boundary for FCSET/FSSET).
+
+Serial unsampled interleaved runs of the supplied state (frames 120-420):
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| base-a | 33.01 | 30.25 | 1.16 |
+| new-a | 34.89 | 28.58 | 1.17 |
+| base-b | 33.31 | 29.96 | 1.18 |
+| new-b | 35.03 | 28.49 | 1.18 |
+
+Two-run means are **33.16 -> 34.96 VPS (+5.4%)**, CPU time 30.10 -> 28.54
+ms/frame.
+
+OPMULA/OPMSUB (56.6M pairs, the single largest remaining item) were attempted
+in this session and reverted. Classifying OPMSUB as supported in DecodeUpper
+reproduces a VF-register corruption in the existing
+`SpecialFloatsAndChangedFloatingPointOptions` differential test **even with a
+completely empty emission body** (`return;` with no LoadVector, no arithmetic,
+no store at all) — so the bug is in the block scheduler's response to this
+opcode's classification and real interpreter-provided register metadata
+(VFwxyzw fixed at 0xE rather than derived from the encoded mask; VIread
+carries REG_ACC_FLAG, which the structurally-identical existing MSUB opcode
+also carries, so that alone does not explain it), not in anything this
+session emitted for it. Substituting a pre-existing opcode into the same slot
+in the same 64-pair trace does not reproduce the corruption. Forcing the pair
+to end a deferred region did not resolve it either. This needs a proper
+root-cause before OPMULA/OPMSUB can be added; it may be a pre-existing
+scheduler gap that simply had no supported opcode long/unusual enough to
+reach before now, and may be resolved by the static-scheduling pipeline
+redesign already outlined for this backend, rather than by patching the
+per-op path further.
+
+The state still runs far below 60 VPS. Remaining large items by measured
+frequency: OPMULA/OPMSUB (blocked, see above), RSQRT (~15.7M), WAITQ (~9.3M),
+IBLTZ/IBGEZ (~11.4M, now implemented alongside DIV in the previous commit).
+No visual, long-gameplay or x64 runtime validation was performed.

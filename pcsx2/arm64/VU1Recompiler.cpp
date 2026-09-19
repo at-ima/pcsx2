@@ -206,9 +206,20 @@ namespace
 		Mfir,
 		Mtir,
 		Ilw,
+		Ilwr,
+		Isw,
 		Fcand,
 		Fceq,
 		Fcor,
+		Fcset,
+		Fcget,
+		Fseq,
+		Fsset,
+		Fsand,
+		Fsor,
+		Fmeq,
+		Fmand,
+		Fmor,
 		Div,
 		Ibeq,
 		Ibne,
@@ -230,12 +241,32 @@ namespace
 				return Lower::Sq;
 			case 4:
 				return Lower::Ilw;
+			case 5:
+				return Lower::Isw;
 			case 0x10:
 				return Lower::Fceq;
+			case 0x11:
+				return Lower::Fcset;
 			case 0x12:
 				return Lower::Fcand;
 			case 0x13:
 				return Lower::Fcor;
+			case 0x14:
+				return Lower::Fseq;
+			case 0x15:
+				return Lower::Fsset;
+			case 0x16:
+				return Lower::Fsand;
+			case 0x17:
+				return Lower::Fsor;
+			case 0x18:
+				return Lower::Fmeq;
+			case 0x1a:
+				return Lower::Fmand;
+			case 0x1b:
+				return Lower::Fmor;
+			case 0x1c:
+				return Lower::Fcget;
 			case 0x28:
 				return Lower::Ibeq;
 			case 0x29:
@@ -288,6 +319,8 @@ namespace
 						return Lower::Mtir;
 					case 0x3bc:
 						return Lower::Div;
+					case 0x3fe:
+						return Lower::Ilwr;
 					case 0x6fc:
 						return CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? Lower::Xgkick : Lower::Unsupported;
 				}
@@ -650,6 +683,71 @@ namespace
 			a.Strh(w0, Field(VI(1)));
 			return;
 		}
+		if (op == Lower::Fseq || op == Lower::Fsand || op == Lower::Fsor)
+		{
+			// Reads the retired status instance's low 12 bits, same as FCAND/FCEQ/FCOR
+			// read the retired CLIP instance.
+			if (!it)
+				return;
+			a.Ldr(w0, Field(VI(REG_STATUS_FLAG)));
+			a.And(w0, w0, 0xfff);
+			a.Mov(w1, (((code >> 21) & 1) << 11) | (code & 0x7ff));
+			if (op == Lower::Fseq)
+			{
+				a.Cmp(w0, w1);
+				a.Cset(w0, eq);
+			}
+			else if (op == Lower::Fsand)
+				a.And(w0, w0, w1);
+			else
+				a.Orr(w0, w0, w1);
+			a.Strh(w0, Field(VI(it)));
+			return;
+		}
+		if (op == Lower::Fmeq || op == Lower::Fmand || op == Lower::Fmor)
+		{
+			if (!it)
+				return;
+			a.Ldr(w0, Field(VI(REG_MAC_FLAG)));
+			a.And(w0, w0, 0xffff);
+			a.Ldrh(w1, Field(VI(is)));
+			if (op == Lower::Fmeq)
+			{
+				a.Cmp(w0, w1);
+				a.Cset(w0, eq);
+			}
+			else if (op == Lower::Fmand)
+				a.And(w0, w0, w1);
+			else
+				a.Orr(w0, w0, w1);
+			a.Strh(w0, Field(VI(it)));
+			return;
+		}
+		if (op == Lower::Fcget)
+		{
+			if (!it)
+				return;
+			a.Ldr(w0, Field(VI(REG_CLIP_FLAG)));
+			a.And(w0, w0, 0xfff);
+			a.Strh(w0, Field(VI(it)));
+			return;
+		}
+		if (op == Lower::Fcset)
+		{
+			// Writes the staging clipflag, same as CLIP; the generic FMAC-pipe path
+			// retires it into VI(REG_CLIP_FLAG) after four cycles.
+			a.Mov(w0, code & 0xffffff);
+			a.Str(w0, Field(offsetof(VURegs, clipflag)));
+			return;
+		}
+		if (op == Lower::Fsset)
+		{
+			a.Ldr(w0, Field(offsetof(VURegs, statusflag)));
+			a.And(w0, w0, 0x3f);
+			a.Orr(w0, w0, (((code >> 21) & 1) << 11 | (code & 0x7ff)) & 0xfc0);
+			a.Str(w0, Field(offsetof(VURegs, statusflag)));
+			return;
+		}
 		if (op == Lower::Div)
 		{
 			// Mirrors _vuDIV/_vuFDIVAdd: compute now (matching the interpreter's
@@ -735,13 +833,17 @@ namespace
 			a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
 			return;
 		}
-		if (op == Lower::Ilw)
+		if (op == Lower::Ilw || op == Lower::Ilwr)
 		{
 			if (!it || !mask)
 				return;
-			const s32 imm = static_cast<s32>(code << 21) >> 21;
 			a.Ldrh(w0, Field(VI(is)));
-			a.Add(w0, w0, imm);
+			if (op == Lower::Ilw)
+			{
+				const s32 imm = static_cast<s32>(code << 21) >> 21;
+				a.Add(w0, w0, imm);
+			}
+			// ILWR has no immediate: VI[Is] is already the quadword index.
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
 			a.Add(x1, x1, Operand(x0, LSL, 4));
@@ -749,7 +851,23 @@ namespace
 			                              (mask & 4)     ? 1 :
 			                                               0;
 			a.Ldrh(w0, MemOperand(x1, lane * 4));
-			a.Strh(w0, Field(VI(it))); // ILW does not create an arithmetic VI backup.
+			a.Strh(w0, Field(VI(it))); // Neither instruction creates an arithmetic VI backup.
+			return;
+		}
+		if (op == Lower::Isw)
+		{
+			// Unlike ILW's single selected lane, ISW writes each masked lane
+			// independently (X/Y/Z/W are separate addresses), so it still writes
+			// when It == 0 and StoreMasked's usual broadcast-then-mask fits directly.
+			const s32 imm = static_cast<s32>(code << 21) >> 21;
+			a.Ldrh(w0, Field(VI(is)));
+			a.Add(w0, w0, imm);
+			a.And(w0, w0, 0x3ff);
+			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
+			a.Add(x1, x1, Operand(x0, LSL, 4));
+			a.Ldrh(w0, Field(VI(it)));
+			a.Dup(v0.V4S(), w0);
+			StoreMasked(a, v0, MemOperand(x1), mask);
 			return;
 		}
 		if (op == Lower::Move || op == Lower::Mr32 || op == Lower::Mfir)

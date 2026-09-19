@@ -2206,4 +2206,103 @@ TEST_F(VU1RecompilerTest, DivSharesFsAndFtAndPipeRetiresAcrossBudgets)
 			}
 }
 
+TEST_F(VU1RecompilerTest, IlwrMatchesIlwPipelineTimingWithoutImmediate)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 mask = 0; mask < 16; mask++)
+	{
+		for (u32 dest : {0u, 1u, 2u})
+		{
+			for (u32 vi_value : {0u, 0x0001u, 0x03ffu, 0xabcdu, 0xffffu})
+			{
+				for (u32 budget = 1; budget <= 12; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << mask << "/" << dest << "/" << vi_value << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = vi_value;
+					VU1.ialureadpos = VU1.ialuwritepos = 3;
+					std::memset(VU1.ialu, 0xa5, sizeof(VU1.ialu));
+					VU1.VIBackupCycles = 3;
+					VU1.VIRegNumber = dest;
+					VU1.VIOldValue = 0xffff;
+					// ILWR: top=0x40, T3_10 (code&0x3f=0x3e), index 0xf, no immediate.
+					Put(0, 0x2ff, 0x3fe | (mask << 21) | (dest << 16) | (1 << 11));
+					Put(8, 0x800002ff, 0x40000000);
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
+
+TEST_F(VU1RecompilerTest, StatusMacClipFlagTestsMatchRetiredValues)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// top7 values: FCSET=0x11, FSEQ=0x14, FSSET=0x15, FSAND=0x16, FSOR=0x17,
+	// FMEQ=0x18, FMAND=0x1a, FMOR=0x1b, FCGET=0x1c.
+	for (u32 top : {0x11u, 0x14u, 0x15u, 0x16u, 0x17u, 0x18u, 0x1au, 0x1bu, 0x1cu})
+		for (u32 it : {0u, 1u, 2u})
+			for (u32 is : {0u, 1u, 3u})
+				for (u32 immediate : {0u, 1u, 0x555u, 0xaaau, 0xfffu})
+				{
+					SCOPED_TRACE(testing::Message() << top << "/" << it << "/" << is << "/" << immediate);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.statusflag = 0xabcdef;
+					VU1.macflag = 0x89ab1234;
+					VU1.clipflag = 0x654321;
+					VU1.VI[REG_STATUS_FLAG].UL = 0xfedc9876;
+					VU1.VI[REG_MAC_FLAG].UL = 0x13572468;
+					VU1.VI[REG_CLIP_FLAG].UL = 0xff123456;
+					VU1.VI[3].UL = 0xabcd5678;
+					const u32 imm11 = immediate & 0x7ff;
+					const u32 imm_bit11 = (immediate >> 11) & 1;
+					const u32 code = (top << 25) | (imm_bit11 << 21) | (it << 16) | (is << 11) | imm11;
+					Put(0, 0x2ff, code);
+					for (u32 pc = 8; pc < 64; pc += 8)
+						Put(pc, 0x800002ff, 0);
+					Compare(1);
+					ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+					Compare(9);
+					if (HasFatalFailure())
+						return;
+				}
+}
+
+
+TEST_F(VU1RecompilerTest, IswWritesEachMaskedLaneIndependently)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 mask = 0; mask < 16; mask++)
+	{
+		for (u32 it : {0u, 1u, 2u})
+		{
+			for (s32 offset : {0, 1, -1, 0x3ff, -0x400})
+			{
+				for (u32 budget = 1; budget <= 6; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << mask << "/" << it << "/" << offset << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0x0010; // quadword index 16, well clear of wrap either direction
+					VU1.VI[it].UL = 0xbeef;
+					const u32 imm = static_cast<u32>(offset) & 0x7ff;
+					// ISW: top7 = 5.
+					Put(0, 0x2ff, (5u << 25) | (mask << 21) | (it << 16) | (1 << 11) | imm);
+					for (u32 pc = 8; pc < 64; pc += 8)
+						Put(pc, 0x800002ff, 0);
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
+
 #endif
