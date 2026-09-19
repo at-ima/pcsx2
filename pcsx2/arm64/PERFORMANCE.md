@@ -1572,3 +1572,123 @@ are considerably fewer than OPMULA/OPMSUB's 56.6M, so a smaller and noisier
 measured effect than the previous session's is expected rather than a sign
 of a problem. A 25-second unmeasured run exited cleanly on SIGTERM with no
 crash. No visual, long-gameplay or x64 runtime validation was performed.
+
+
+## WAITQ
+
+The last item keeping VU1 out of `_vuTestFDIVStalls`-adjacent fallback
+entirely. Shares `EmitFDIVStall`'s pending-entry stall with DIV/SQRT/RSQRT
+but issues nothing of its own, so its body is just that one call.
+
+This one round-tripped through visual corruption in real gameplay (a
+severely exploded triangle-fan mesh in Saru! Get You! 2) twice before
+landing, both times passing the full differential suite. Two distinct, real
+bugs were found and fixed, plus one self-inflicted regression along the way:
+
+- **Scheduling-eligibility gap.** `_vuRegsWAITQ` (shared with the
+  interpreter/x86) declares no VF/VI reads or writes at all — its only
+  effect is forcing the FDIV pipe's pending entry to retire early, which
+  isn't expressed anywhere in that metadata. Without an explicit tag,
+  `AnalyzeRetirement` treated it like an ordinary fixed-timing, no-hazard
+  pair once it reached the precomputed-schedule range, letting it be swept
+  into scheduled execution or a deferred region that never runs the runtime
+  stall check that actually settles Q. Fixed by OR-ing `VIwrite |= 1 <<
+  REG_Q` onto WAITQ's decoded `_VURegsNum` right after the interpreter's own
+  table populates it, exactly mirroring the tag DIV/SQRT/RSQRT already carry
+  for the same reason. `WaitqExcludedFromPrecomputedSchedule` (eight filler
+  pairs push a DIV/WAITQ pair to index 8/9, past the precomputed-schedule
+  threshold) fails without this fix and passes with it.
+- **Residual queue entries after a forced stall.** Even fixed above, a
+  dedicated test still failed: byte-diffing native against the interpreter
+  traced it to `fmacreadpos`/`fmaccount` staying non-zero natively while the
+  interpreter's queue was fully drained. Root cause is an ordering mismatch
+  between the two implementations' per-instruction dispatch: the interpreter
+  calls `_vuTestLowerStalls` (which can force `VU->cycle` forward) *before*
+  `_vuTestPipes` (which drains FMAC/FDIV/EFU/IALU at that now-current cycle),
+  so a queue entry that only becomes ready *because of* that forcing still
+  gets drained the same instruction. Native calls the shared per-pair
+  `prepare`/retire stub *before* the pair's own body — where DIV/SQRT/RSQRT/
+  WAITQ's own stall logic lives — so the same forcing happens one call too
+  late to be swept up by anything, and a run of unrelated pairs right after
+  can enter a deferred region that skips the runtime retire path entirely,
+  leaving the entry stuck until the block ends. Fixed by adding a standalone
+  `PipelineCode::retire_queues` entry point to `VU1Pipeline.cpp` — the
+  existing retire body's FMAC/FDIV/EFU/IALU drain plus XGKICK crediting/
+  transfer, factored out behind their own callable label, deliberately
+  excluding `VIBackupCycles` (it uses a pre-pair register snapshot and must
+  run at most once per pair; the ordinary prepare stub already does so) —
+  and calling it from `EmitFDIVStall` right after forcing the cycle forward.
+  Getting this right took two attempts: the first (FMAC/FDIV/EFU/IALU only,
+  no XGKICK) still showed corruption in-game despite passing every test,
+  which turned out to mean the corruption had a second, independent cause
+  (below); XGKICK's credit/transfer accounting was checked algebraically for
+  idempotence before being folded in (the same pair's post-stall cycle can
+  now run it a second time), since `VIBackupCycles` cannot safely be treated
+  the same way.
+  - **Self-inflicted regression.** `VU1Pipeline.cpp`'s scan loop used to fall
+    into `retire:` implicitly — there was no branch, just adjacent code.
+    Inserting the new `retire_queues` block between them redirected that
+    fall-through into the middle of it, breaking roughly 30 unrelated tests
+    (Clip, XGKICK, transfer). Confirmed the bug was in this refactor itself,
+    not in how the new entry point was invoked, by disabling the call site
+    in `VU1Recompiler.cpp` and rebuilding: the same 30 tests still failed.
+    Fixed with an explicit `a.B(&retire)`.
+- **Upper/lower emission order.** With both fixes above, the full
+  differential suite passed (210/211, the one pre-existing unrelated
+  failure) but the real game was *still* visibly broken, identically, after
+  a rebuild. `VU1microInterp.cpp` runs `_vuTestLowerStalls`/`_vuTestPipes` —
+  WAITQ's entire stall-and-retire effect — *before* `_vu1ExecUpper`,
+  specifically so an upper instruction in the same pair that broadcasts Q
+  (pairing WAITQ with a Q-broadcast MULq/MADDq/etc. to consume a division
+  result is a common real idiom, and is exactly what Saru! Get You! 2 does)
+  observes the freshly retired value. `EmitPair` ran `EmitUpper` before
+  `EmitLower` unconditionally, so that same-pair upper read the stale
+  architectural Q left over from before the wait instead. Found by bisecting
+  empirically rather than theorizing further, per direction received
+  mid-session: a build with WAITQ's decode forced back to
+  `Lower::Unsupported` (interpreter fallback), with every other change from
+  this session left in place, rendered correctly, which pinned the bug to
+  WAITQ's own code generation rather than the shared retirement-queue
+  changes above. Fixed in `EmitPair` by running `EmitFDIVStall` ahead of
+  `EmitUpper` specifically when the lower op is WAITQ; `EmitLower`'s own call
+  to it afterward is then a no-op (`fdiv.enable` already clear). A dedicated
+  test (`WaitqRetiresQBeforePairedUpperBroadcastRead`: DIV then a same-pair
+  WAITQ/MULq, with a distinct pre-existing architectural Q value) was
+  confirmed to fail without this fix and pass with it, closing the loop the
+  user asked for at the very start of this investigation — a real-game
+  rendering bug now has a differential-test regression guard.
+
+An unrelated build/packaging issue surfaced partway through and cost real
+time before being identified as such: this checkout's `PCSX2` executable
+links Qt directly against `/opt/homebrew/opt/qtbase/...` while every other
+bundled binary (`libkddockwidgets`, plugins) references the app's own
+bundled `Frameworks/Qt*.framework` copies via `@executable_path`, so dyld
+loaded both, which is usually just noisy ObjC class-collision warnings but
+intermittently hit a hard `abort()` inside `QGuiApplicationPrivate::
+createPlatformIntegration()`. Worked around locally per rebuild with
+`install_name_tool -change ... @executable_path/../Frameworks/...` on the
+three Qt frameworks; not a code change and not committed.
+
+211 of 212 tests pass; `SpecialFloatsAndChangedFloatingPointOptions` remains
+the one known, pre-existing, unrelated failure.
+
+Serial interleaved runs of the supplied state (frames 120-420):
+
+| Run | VPS | ms/frame |
+| --- | ---: | ---: |
+| old-a | 36.61 | 27.32 |
+| new-a | 36.73 | 27.22 |
+| old-b | 37.04 | 27.00 |
+| new-b | 36.88 | 27.12 |
+
+Two-run means are **36.83 -> 36.81 VPS**, flat within noise. Unlike
+OPMULA/OPMSUB and RSQRT/SQRT, WAITQ's body is a single pending-entry check
+that is usually already empty (`fdiv.enable == 0`) by the time it runs, so
+removing its interpreter-fallback cost was never expected to move VPS by
+itself; this session's value is the correctness fix, not throughput. Also
+consistent with the standing observation that this workload is EE-bound
+with GS mostly idle (VPS tracking FPS closely) — shaving VU1 fallback
+further keeps chipping at the actual bottleneck even when a single
+instruction's own share is too small to see. A 25-second unmeasured run
+exited cleanly on SIGTERM with no crash. No long-gameplay or x64 runtime
+validation was performed.

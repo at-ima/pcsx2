@@ -227,6 +227,7 @@ namespace
 		Div,
 		Sqrt,
 		Rsqrt,
+		Waitq,
 		Ibeq,
 		Ibne,
 		Ibgtz,
@@ -329,6 +330,8 @@ namespace
 						return Lower::Sqrt;
 					case 0x3be:
 						return Lower::Rsqrt;
+					case 0x3bf:
+						return Lower::Waitq;
 					case 0x3fe:
 						return Lower::Ilwr;
 					case 0x6fc:
@@ -724,6 +727,22 @@ namespace
 		a.And(w11, w11, 0xc30);
 		a.Orr(w10, w10, w11);
 		a.Str(w10, Field(VI(REG_STATUS_FLAG)));
+		// The forced advance above always reaches at least the entry's own
+		// ready cycle, so it is fully retired now. DIV/SQRT/RSQRT immediately
+		// re-arm the pipe below and would overwrite this either way, but
+		// WAITQ issues nothing further and needs the pipe left empty, matching
+		// _vuTestPipes retiring it once _vuTestFDIVStalls has advanced VU->cycle.
+		a.Str(wzr, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+		// The ordinary per-pair prepare/retire already drained the FMAC ring
+		// once, before this pair's own body could force the clock forward
+		// above; entries that only became ready because of that forcing are
+		// otherwise never drained (a run of unrelated pairs right after can
+		// be swept into a deferred region that skips the runtime retire path
+		// entirely, leaving them stuck until the block ends). This mirrors
+		// _vuTestPipes running again, after _vuTestFDIVStalls, in the
+		// interpreter's own per-instruction dispatch order.
+		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.retire_queues));
+		a.Blr(x16);
 		a.Bind(&not_pending);
 	}
 
@@ -961,6 +980,14 @@ namespace
 			EmitFDIVFinish(a, 13);
 			return;
 		}
+		if (op == Lower::Waitq)
+		{
+			// _vuWAITQ's body is empty; its only effect is the pending-FDIV
+			// stall every FDIV-pipe op takes before doing anything else. It
+			// does not issue a new pipe entry, so there is nothing to finish.
+			EmitFDIVStall(a);
+			return;
+		}
 		if (op == Lower::Ilw || op == Lower::Ilwr)
 		{
 			if (!it || !mask)
@@ -1133,6 +1160,14 @@ namespace
 		                       0;
 		if (backup)
 			LoadVector(a, cache, q27, backup);
+		// WAITQ's stall-and-retire must land before the paired upper instruction
+		// runs: VU1microInterp.cpp calls _vuTestLowerStalls/_vuTestPipes ahead of
+		// _vu1ExecUpper, precisely so an upper op broadcasting Q in the same pair
+		// observes the freshly retired value instead of whatever was pending
+		// beforehand. EmitLower's own Waitq case still runs afterward but is then
+		// a no-op (fdiv.enable is already clear by the time it gets there).
+		if (!immediate && DecodeLower(ins.lower) == Lower::Waitq)
+			EmitFDIVStall(a);
 		if (publish_code)
 			StoreWord(a, ins.upper, offsetof(VURegs, code));
 		EmitUpper(a, cache, ins.upper);
@@ -1705,6 +1740,17 @@ namespace
 			{
 				VU1.code = ins.lower;
 				VU1regs_LOWER_OPCODE[ins.lower >> 25](&ins.lregs);
+				// _vuRegsWAITQ (shared with the interpreter/x86) declares no
+				// reads or writes at all, since its only effect is forcing the
+				// pending FDIV entry to retire early. Without a VIwrite(Q) of
+				// its own, nothing below treats it differently from a plain
+				// 1-cycle op, so it can be scheduled or swept into a deferred
+				// region as if its timing were fixed and it touched no
+				// architectural state — neither is true. Tag it exactly like
+				// DIV/SQRT/RSQRT so the existing Q/STATUS/MAC/CLIP exclusion
+				// keeps it on the generic (non-deferred) path.
+				if (DecodeLower(ins.lower) == Lower::Waitq)
+					ins.lregs.VIwrite |= 1 << REG_Q;
 			}
 			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
 			{

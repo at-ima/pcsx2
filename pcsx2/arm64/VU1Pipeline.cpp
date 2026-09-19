@@ -107,173 +107,151 @@ namespace Arm64VU1
 			a.Subs(w10, w10, 1);
 			a.B(ne, &loop);
 		}
+		a.B(&retire);
 
-		// Mirror VUPipeline::Retire, including flag writeback order. Architectural
-		// queue contents remain intact for prefix exits and interpreter fallback.
-		a.Bind(&retire);
-		{
-			// Branches wait for matching integer loads after upper FMAC stalls.
-			Label loop, next, end;
-			a.Cbz(w2, &end);
-			a.Ldr(w10, field(offsetof(VURegs, ialucount)));
-			a.Cbz(w10, &end);
-			a.Ldr(w11, field(offsetof(VURegs, ialureadpos)));
-			a.Bind(&loop);
-			a.Mov(w12, sizeof(ialuPipe));
-			a.Madd(x12, x11, x12, x19);
-			a.Add(x12, x12, offsetof(VURegs, ialu));
-			a.Ldr(x13, MemOperand(x12, offsetof(ialuPipe, sCycle)));
-			a.Ldr(w14, MemOperand(x12, offsetof(ialuPipe, Cycle)));
-			a.Sub(x16, x9, x13);
-			a.Cmp(x16, x14);
-			a.B(hs, &next);
-			a.Ldr(w17, MemOperand(x12, offsetof(ialuPipe, reg)));
-			a.Tst(w17, w2);
-			a.B(eq, &next);
-			a.Add(x13, x13, x14);
-			a.Cmp(x9, x13);
-			a.Csel(x9, x9, x13, hs);
-			a.Bind(&next);
-			a.Add(w11, w11, 1);
-			a.And(w11, w11, 3);
-			a.Subs(w10, w10, 1);
-			a.B(ne, &loop);
-			a.Bind(&end);
-		}
-		a.Str(x9, field(offsetof(VURegs, cycle)));
-		{
-			Label loop, end, no_clip, normal_flags, store_flags;
-			a.Ldr(w10, field(offsetof(VURegs, fmaccount)));
-			a.Cbz(w10, &end);
-			a.Ldr(w11, field(offsetof(VURegs, fmacreadpos)));
-			a.Bind(&loop);
-			a.Mov(w12, sizeof(fmacPipe));
-			a.Madd(x12, x11, x12, x19);
-			a.Add(x12, x12, offsetof(VURegs, fmac));
-			a.Ldr(x13, MemOperand(x12, offsetof(fmacPipe, sCycle)));
-			a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, Cycle)));
-			a.Sub(x13, x9, x13);
-			a.Cmp(x13, x14);
-			a.B(lo, &end);
-			a.Ldr(w13, MemOperand(x12, offsetof(fmacPipe, flagreg)));
-			a.Tbz(w13, REG_CLIP_FLAG, &no_clip);
-			a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, clipflag)));
-			a.Str(w14, vi(REG_CLIP_FLAG));
-			a.Bind(&no_clip);
-			a.Ldr(w14, vi(REG_STATUS_FLAG));
-			a.Ldr(w16, MemOperand(x12, offsetof(fmacPipe, statusflag)));
-			a.Tbz(w13, REG_STATUS_FLAG, &normal_flags);
-			a.And(w14, w14, 0x30);
-			a.And(w13, w16, 0xfc0);
-			a.Orr(w14, w14, w13);
-			a.And(w16, w16, 0xf);
-			a.Orr(w14, w14, w16);
-			a.B(&store_flags);
-			a.Bind(&normal_flags);
-			a.And(w14, w14, 0xff0);
-			a.And(w16, w16, 0xf);
-			a.Orr(w14, w14, w16);
-			a.Orr(w14, w14, Operand(w16, LSL, 6));
-			a.Bind(&store_flags);
-			a.Str(w14, vi(REG_STATUS_FLAG));
-			a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, macflag)));
-			a.Str(w14, vi(REG_MAC_FLAG));
-			a.Add(w11, w11, 1);
-			a.And(w11, w11, 3);
-			a.Sub(w10, w10, 1);
-			a.Str(w11, field(offsetof(VURegs, fmacreadpos)));
-			a.Str(w10, field(offsetof(VURegs, fmaccount)));
-			a.Cbnz(w10, &loop);
-			a.Bind(&end);
-		}
-		{
-			Label end;
-			constexpr size_t offset = offsetof(VURegs, fdiv);
-			a.Ldr(w10, field(offset + offsetof(fdivPipe, enable)));
-			a.Cbz(w10, &end);
-			a.Ldr(x10, field(offset + offsetof(fdivPipe, sCycle)));
-			a.Ldr(w11, field(offset + offsetof(fdivPipe, Cycle)));
-			a.Sub(x10, x9, x10);
-			a.Cmp(x10, x11);
-			a.B(lo, &end);
-			a.Str(wzr, field(offset + offsetof(fdivPipe, enable)));
-			a.Ldr(w10, field(offset + offsetof(fdivPipe, reg)));
-			a.Str(w10, vi(REG_Q));
-			a.Ldr(w10, vi(REG_STATUS_FLAG));
-			a.And(w10, w10, 0xfcf);
-			a.Ldr(w11, field(offset + offsetof(fdivPipe, statusflag)));
-			a.And(w11, w11, 0xc30);
-			a.Orr(w10, w10, w11);
-			a.Str(w10, vi(REG_STATUS_FLAG));
-			a.Bind(&end);
-		}
-		{
-			Label end;
-			constexpr size_t offset = offsetof(VURegs, efu);
-			a.Ldr(w10, field(offset + offsetof(efuPipe, enable)));
-			a.Cbz(w10, &end);
-			a.Ldr(x10, field(offset + offsetof(efuPipe, sCycle)));
-			a.Ldr(w11, field(offset + offsetof(efuPipe, Cycle)));
-			a.Sub(x10, x9, x10);
-			a.Cmp(x10, x11);
-			a.B(lo, &end);
-			a.Str(wzr, field(offset + offsetof(efuPipe, enable)));
-			a.Ldr(w10, field(offset + offsetof(efuPipe, reg)));
-			a.Str(w10, vi(REG_P));
-			a.Bind(&end);
-		}
-		{
-			Label loop, end;
-			a.Ldr(w10, field(offsetof(VURegs, ialucount)));
-			a.Cbz(w10, &end);
-			a.Ldr(w11, field(offsetof(VURegs, ialureadpos)));
-			a.Bind(&loop);
-			a.Mov(w12, sizeof(ialuPipe));
-			a.Madd(x12, x11, x12, x19);
-			a.Add(x12, x12, offsetof(VURegs, ialu));
-			a.Ldr(x13, MemOperand(x12, offsetof(ialuPipe, sCycle)));
-			a.Ldr(w14, MemOperand(x12, offsetof(ialuPipe, Cycle)));
-			a.Sub(x13, x9, x13);
-			a.Cmp(x13, x14);
-			a.B(lo, &end);
-			a.Add(w11, w11, 1);
-			a.And(w11, w11, 3);
-			a.Sub(w10, w10, 1);
-			a.Str(w11, field(offsetof(VURegs, ialureadpos)));
-			a.Str(w10, field(offsetof(VURegs, ialucount)));
-			a.Cbnz(w10, &loop);
-			a.Bind(&end);
-		}
+		// Shared by the ordinary retire flow below and the standalone
+		// retire_queues entry point. Drains FMAC/FDIV/EFU/IALU entries ready
+		// at cycle x9; the integer-branch wait uses w2 (zero outside a
+		// branch prepare stub). Deliberately excludes XGKICK/VIBackupCycles:
+		// those must run at most once per pair, so a caller invoking this a
+		// second time for the same pair (see PipelineCode::retire_queues)
+		// must not fall into them again.
+		auto emit_retire_queues = [&]() {
+			{
+				// Branches wait for matching integer loads after upper FMAC stalls.
+				Label loop, next, end;
+				a.Cbz(w2, &end);
+				a.Ldr(w10, field(offsetof(VURegs, ialucount)));
+				a.Cbz(w10, &end);
+				a.Ldr(w11, field(offsetof(VURegs, ialureadpos)));
+				a.Bind(&loop);
+				a.Mov(w12, sizeof(ialuPipe));
+				a.Madd(x12, x11, x12, x19);
+				a.Add(x12, x12, offsetof(VURegs, ialu));
+				a.Ldr(x13, MemOperand(x12, offsetof(ialuPipe, sCycle)));
+				a.Ldr(w14, MemOperand(x12, offsetof(ialuPipe, Cycle)));
+				a.Sub(x16, x9, x13);
+				a.Cmp(x16, x14);
+				a.B(hs, &next);
+				a.Ldr(w17, MemOperand(x12, offsetof(ialuPipe, reg)));
+				a.Tst(w17, w2);
+				a.B(eq, &next);
+				a.Add(x13, x13, x14);
+				a.Cmp(x9, x13);
+				a.Csel(x9, x9, x13, hs);
+				a.Bind(&next);
+				a.Add(w11, w11, 1);
+				a.And(w11, w11, 3);
+				a.Subs(w10, w10, 1);
+				a.B(ne, &loop);
+				a.Bind(&end);
+			}
+			a.Str(x9, field(offsetof(VURegs, cycle)));
+			{
+				Label loop, end, no_clip, normal_flags, store_flags;
+				a.Ldr(w10, field(offsetof(VURegs, fmaccount)));
+				a.Cbz(w10, &end);
+				a.Ldr(w11, field(offsetof(VURegs, fmacreadpos)));
+				a.Bind(&loop);
+				a.Mov(w12, sizeof(fmacPipe));
+				a.Madd(x12, x11, x12, x19);
+				a.Add(x12, x12, offsetof(VURegs, fmac));
+				a.Ldr(x13, MemOperand(x12, offsetof(fmacPipe, sCycle)));
+				a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, Cycle)));
+				a.Sub(x13, x9, x13);
+				a.Cmp(x13, x14);
+				a.B(lo, &end);
+				a.Ldr(w13, MemOperand(x12, offsetof(fmacPipe, flagreg)));
+				a.Tbz(w13, REG_CLIP_FLAG, &no_clip);
+				a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, clipflag)));
+				a.Str(w14, vi(REG_CLIP_FLAG));
+				a.Bind(&no_clip);
+				a.Ldr(w14, vi(REG_STATUS_FLAG));
+				a.Ldr(w16, MemOperand(x12, offsetof(fmacPipe, statusflag)));
+				a.Tbz(w13, REG_STATUS_FLAG, &normal_flags);
+				a.And(w14, w14, 0x30);
+				a.And(w13, w16, 0xfc0);
+				a.Orr(w14, w14, w13);
+				a.And(w16, w16, 0xf);
+				a.Orr(w14, w14, w16);
+				a.B(&store_flags);
+				a.Bind(&normal_flags);
+				a.And(w14, w14, 0xff0);
+				a.And(w16, w16, 0xf);
+				a.Orr(w14, w14, w16);
+				a.Orr(w14, w14, Operand(w16, LSL, 6));
+				a.Bind(&store_flags);
+				a.Str(w14, vi(REG_STATUS_FLAG));
+				a.Ldr(w14, MemOperand(x12, offsetof(fmacPipe, macflag)));
+				a.Str(w14, vi(REG_MAC_FLAG));
+				a.Add(w11, w11, 1);
+				a.And(w11, w11, 3);
+				a.Sub(w10, w10, 1);
+				a.Str(w11, field(offsetof(VURegs, fmacreadpos)));
+				a.Str(w10, field(offsetof(VURegs, fmaccount)));
+				a.Cbnz(w10, &loop);
+				a.Bind(&end);
+			}
+			{
+				Label end;
+				constexpr size_t offset = offsetof(VURegs, fdiv);
+				a.Ldr(w10, field(offset + offsetof(fdivPipe, enable)));
+				a.Cbz(w10, &end);
+				a.Ldr(x10, field(offset + offsetof(fdivPipe, sCycle)));
+				a.Ldr(w11, field(offset + offsetof(fdivPipe, Cycle)));
+				a.Sub(x10, x9, x10);
+				a.Cmp(x10, x11);
+				a.B(lo, &end);
+				a.Str(wzr, field(offset + offsetof(fdivPipe, enable)));
+				a.Ldr(w10, field(offset + offsetof(fdivPipe, reg)));
+				a.Str(w10, vi(REG_Q));
+				a.Ldr(w10, vi(REG_STATUS_FLAG));
+				a.And(w10, w10, 0xfcf);
+				a.Ldr(w11, field(offset + offsetof(fdivPipe, statusflag)));
+				a.And(w11, w11, 0xc30);
+				a.Orr(w10, w10, w11);
+				a.Str(w10, vi(REG_STATUS_FLAG));
+				a.Bind(&end);
+			}
+			{
+				Label end;
+				constexpr size_t offset = offsetof(VURegs, efu);
+				a.Ldr(w10, field(offset + offsetof(efuPipe, enable)));
+				a.Cbz(w10, &end);
+				a.Ldr(x10, field(offset + offsetof(efuPipe, sCycle)));
+				a.Ldr(w11, field(offset + offsetof(efuPipe, Cycle)));
+				a.Sub(x10, x9, x10);
+				a.Cmp(x10, x11);
+				a.B(lo, &end);
+				a.Str(wzr, field(offset + offsetof(efuPipe, enable)));
+				a.Ldr(w10, field(offset + offsetof(efuPipe, reg)));
+				a.Str(w10, vi(REG_P));
+				a.Bind(&end);
+			}
+			{
+				Label loop, end;
+				a.Ldr(w10, field(offsetof(VURegs, ialucount)));
+				a.Cbz(w10, &end);
+				a.Ldr(w11, field(offsetof(VURegs, ialureadpos)));
+				a.Bind(&loop);
+				a.Mov(w12, sizeof(ialuPipe));
+				a.Madd(x12, x11, x12, x19);
+				a.Add(x12, x12, offsetof(VURegs, ialu));
+				a.Ldr(x13, MemOperand(x12, offsetof(ialuPipe, sCycle)));
+				a.Ldr(w14, MemOperand(x12, offsetof(ialuPipe, Cycle)));
+				a.Sub(x13, x9, x13);
+				a.Cmp(x13, x14);
+				a.B(lo, &end);
+				a.Add(w11, w11, 1);
+				a.And(w11, w11, 3);
+				a.Sub(w10, w10, 1);
+				a.Str(w11, field(offsetof(VURegs, ialureadpos)));
+				a.Str(w10, field(offsetof(VURegs, ialucount)));
+				a.Cbnz(w10, &loop);
+				a.Bind(&end);
+			}
+		};
 
-		// Keep GIF arbitration, copying and interrupts in the existing transfer
-		// implementation. Broader XGKICK/game timing still needs proper testing.
-		a.Ldr(w10, field(offsetof(VURegs, xgkickenable)));
-		a.Cbz(w10, &backup);
-		if (!packet_mode)
-		{
-			// A restored packet marker must downgrade even on a credit-only tick,
-			// just as the reference helper does after enabling XgKickHack.
-			a.Mov(w17, 1);
-			a.Str(w17, field(offsetof(VURegs, xgkickenable)));
-		}
-		// Credit-only ticks need no GIF call or vector-cache spill. Match the
-		// transfer helper's u32 count and sign-extended s32 cycle arithmetic.
-		a.Ldr(x10, field(offsetof(VURegs, xgkicklastcycle)));
-		a.Sub(w0, w9, w10);
-		a.Sub(w0, w0, 1);
-		a.Ldr(w11, field(offsetof(VURegs, xgkickcyclecount)));
-		a.Add(w11, w11, w0);
-		{
-			Label transfer;
-			a.Cmp(w11, 2);
-			a.B(hs, &transfer);
-			a.Str(w11, field(offsetof(VURegs, xgkickcyclecount)));
-			a.Add(x10, x10, Operand(w0, SXTW));
-			a.Str(x10, field(offsetof(VURegs, xgkicklastcycle)));
-			a.B(&backup);
-			a.Bind(&transfer);
-		}
-		a.Stp(x15, lr, MemOperand(sp, -16, PreIndex));
 		// Publish cached VF/ACC values at the C++ boundary. Reload afterwards,
 		// both for ABI clobbers and to observe any changes made by the callback.
 		auto transfer_cache = [&](bool load) {
@@ -290,15 +268,73 @@ namespace Arm64VU1
 			}
 			a.Bind(&end);
 		};
-		transfer_cache(false);
-		a.Ldr(w10, field(offsetof(VURegs, xgkicklastcycle)));
-		a.Sub(w0, w9, w10);
-		a.Sub(w0, w0, 1);
-		a.Mov(w1, 0);
-		a.Mov(x16, reinterpret_cast<uintptr_t>(transfer));
-		a.Blr(x16);
-		transfer_cache(true);
-		a.Ldp(x15, lr, MemOperand(sp, 16, PostIndex));
+
+		// Keep GIF arbitration, copying and interrupts in the existing transfer
+		// implementation. Broader XGKICK/game timing still needs proper testing.
+		// Crediting cycles without transferring is safe to run twice for the
+		// same pair (each call's delta is relative to xgkicklastcycle, which
+		// the previous call already advanced, so the total matches one call
+		// covering the same span); `after` is where retire_queues rejoins
+		// once done, skipping VIBackupCycles below (see emit_retire_queues).
+		auto emit_xgkick = [&](Label& after) {
+			a.Ldr(w10, field(offsetof(VURegs, xgkickenable)));
+			a.Cbz(w10, &after);
+			if (!packet_mode)
+			{
+				// A restored packet marker must downgrade even on a credit-only tick,
+				// just as the reference helper does after enabling XgKickHack.
+				a.Mov(w17, 1);
+				a.Str(w17, field(offsetof(VURegs, xgkickenable)));
+			}
+			// Credit-only ticks need no GIF call or vector-cache spill. Match the
+			// transfer helper's u32 count and sign-extended s32 cycle arithmetic.
+			a.Ldr(x10, field(offsetof(VURegs, xgkicklastcycle)));
+			a.Sub(w0, w9, w10);
+			a.Sub(w0, w0, 1);
+			a.Ldr(w11, field(offsetof(VURegs, xgkickcyclecount)));
+			a.Add(w11, w11, w0);
+			{
+				Label transfer;
+				a.Cmp(w11, 2);
+				a.B(hs, &transfer);
+				a.Str(w11, field(offsetof(VURegs, xgkickcyclecount)));
+				a.Add(x10, x10, Operand(w0, SXTW));
+				a.Str(x10, field(offsetof(VURegs, xgkicklastcycle)));
+				a.B(&after);
+				a.Bind(&transfer);
+			}
+			a.Stp(x15, lr, MemOperand(sp, -16, PreIndex));
+			transfer_cache(false);
+			a.Ldr(w10, field(offsetof(VURegs, xgkicklastcycle)));
+			a.Sub(w0, w9, w10);
+			a.Sub(w0, w0, 1);
+			a.Mov(w1, 0);
+			a.Mov(x16, reinterpret_cast<uintptr_t>(transfer));
+			a.Blr(x16);
+			transfer_cache(true);
+			a.Ldp(x15, lr, MemOperand(sp, 16, PostIndex));
+		};
+
+		// Standalone entry point: no branch wait (w2=0), drain queues, run
+		// XGKICK, return — deliberately skipping VIBackupCycles (see
+		// PipelineCode::retire_queues; it uses w15 from before this pair's
+		// own ordinary prepare call and would double-decrement here).
+		result.retire_queues = code + a.GetCursorOffset();
+		a.Mov(w2, 0);
+		a.Ldr(x9, field(offsetof(VURegs, cycle)));
+		emit_retire_queues();
+		{
+			Label done_here;
+			emit_xgkick(done_here);
+			a.Bind(&done_here);
+		}
+		a.Ret();
+
+		// Mirror VUPipeline::Retire, including flag writeback order. Architectural
+		// queue contents remain intact for prefix exits and interpreter fallback.
+		a.Bind(&retire);
+		emit_retire_queues();
+		emit_xgkick(backup);
 		a.Bind(&backup);
 		a.Ldrb(w10, field(offsetof(VURegs, VIBackupCycles)));
 		a.Cbz(w10, &done);

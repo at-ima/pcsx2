@@ -167,18 +167,32 @@ and reads of architectural flags use the generic path; deferred regions end befo
 these observations so pending flag snapshots remain visible at the correct cycle.
 This retains the shared pipeline design rather than adding a separate flag timeline.
 
-DIV computes its quotient with the interpreter's operand and result clamping,
-including the denormal flush and the optional overflow clamp. A zero divisor
-produces the signed maximum float and sets the I or D status bit, matching
-`_vuDIV`, and the result also lands in the staging Q field the interpreter writes.
-Issue stages Q into the shared single-slot FDIV pipe for its seven-cycle latency,
-where the existing generic retirement publishes it. An outstanding entry stalls
-the next FDIV issue and is retired before being replaced, mirroring
-`_vuTestFDIVStalls` followed by `_vuTestPipes`. FDIV reads also participate in the
-FMAC hazard scan. Because a deferred region skips shared preparation, pairs within
-the pipe's latency stay on the generic path, as ILW already does for the IALU pipe.
-Only DIV is implemented; SQRT, RSQRT and the EFU instructions still fall back.
-This needs proper testing across games rather than only the differential tests.
+DIV, SQRT and RSQRT compute with the interpreter's operand and result clamping,
+including the denormal flush and the optional overflow clamp. A zero divisor (DIV)
+or negative operand (SQRT/RSQRT) produces the signed maximum float or signed zero
+and sets the I or D status bit, matching `_vuDIV`/`_vuSQRT`/`_vuRSQRT`; NaN operands
+use the N-flag-only ARM64 condition codes so an unordered compare stays
+false-for-NaN like the plain C comparisons they mirror. Each result also lands in
+the staging Q field the interpreter writes. Issue stages Q into the shared
+single-slot FDIV pipe for its 7 (DIV/SQRT) or 13 (RSQRT) cycle latency, where the
+existing generic retirement publishes it. An outstanding entry stalls the next
+FDIV issue and is retired before being replaced, mirroring `_vuTestFDIVStalls`
+followed by `_vuTestPipes`. FDIV reads also participate in the FMAC hazard scan.
+Because a deferred region skips shared preparation, pairs within the pipe's
+latency stay on the generic path, as ILW already does for the IALU pipe. The EFU
+instructions still fall back. This needs proper testing across games rather than
+only the differential tests.
+
+WAITQ shares DIV/SQRT/RSQRT's pending-entry stall but issues nothing of its own,
+so it leaves the FDIV pipe empty once retired instead of re-arming it. Its
+`_VURegsNum` declares no reads or writes at all; without an explicit `VIwrite(Q)`
+tag it would look like an ordinary fixed-timing, no-hazard pair and could be
+scheduled or swept into a deferred region, silently skipping the runtime check
+that actually settles Q. The interpreter also runs this stall-and-retire step
+before executing the paired upper instruction, so an upper op that broadcasts Q
+in the same pair (a common idiom pairing WAITQ with a Q-broadcast MULq/MADDq/etc.)
+observes the freshly retired value; native emission orders the same-pair FDIV
+stall ahead of the upper instruction to match.
 
 IBLTZ, IBLEZ and IBGEZ reuse the existing integer-branch path, including the VI
 backup lookup and the combined FMAC/IALU waits, and differ only in the condition

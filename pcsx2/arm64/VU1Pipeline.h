@@ -32,6 +32,21 @@ namespace Arm64VU1
 		std::array<const void*, 6> prepare{};
 		// Same ABI; also waits for lregs.VIread in the incoming IALU queue.
 		const void* branch_prepare = nullptr;
+		// Drains FMAC/FDIV/EFU/IALU entries ready at the current VURegs::cycle,
+		// then XGKICK (crediting or transferring, safe to run again for the
+		// same pair), and returns — no +1/TPC/code publish, no incoming-hazard
+		// scan, and deliberately no VIBackupCycles handling (it uses the
+		// pre-pair cycle snapshot and must run at most once per pair; the
+		// ordinary prepare stubs above already do so). For a pair whose own
+		// body forces VURegs::cycle forward after that ordinary prepare/retire
+		// already ran once for it (DIV/SQRT/RSQRT/WAITQ stalling on an
+		// outstanding FDIV entry): entries that only become ready because of
+		// that forcing are otherwise never drained, and a run of unrelated
+		// pairs right after can be swept into a deferred region that skips
+		// the runtime retire path entirely, leaving them stuck until the
+		// block ends. Mirrors _vuTestPipes running again, after
+		// _vuTestFDIVStalls, in the interpreter's own per-instruction order.
+		const void* retire_queues = nullptr;
 		// Same cache ABI; finish a delayed packet after the pair has committed.
 		const void* finish_packet = nullptr;
 		// Flush any old transfer before issuing another XGKICK.

@@ -2263,6 +2263,100 @@ TEST_F(VU1RecompilerTest, RsqrtComputesQuotientAndDivideByZeroFlags)
 				}
 }
 
+TEST_F(VU1RecompilerTest, WaitqStallsOnPendingFdivPipeAcrossBudgets)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Unlike DIV/SQRT/RSQRT's own timing test, this does not sweep a cycle
+	// value within a few counts of u64 wraparound: _vuTestFDIVStalls computes
+	// sCycle+Cycle (can overflow near wrap) while VUPipeline::Retire computes
+	// cycle-sCycle>=Cycle (wrap-safe), and the two run in the opposite order
+	// here versus the interpreter, so a pending entry's retirement can be
+	// judged differently right at that boundary. DIV/SQRT/RSQRT never expose
+	// this because they unconditionally re-arm the pipe afterward; WAITQ is
+	// the first op that only observes the existing entry. Not reachable at
+	// any real VU cycle count, needs proper testing if that changes.
+	for (u64 cycle : {u64(100), u64(1) << 40})
+		for (u32 budget : {1u, 2u, 4u, 6u, 7u, 8u, 9u, 12u, 20u})
+		{
+			SCOPED_TRACE(testing::Message() << cycle << "/" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = cycle;
+			VU1.VF[1].F[0] = 5.0f;
+			VU1.VF[1].F[1] = 2.0f;
+			// DIV VF1x, VF1y, then WAITQ before anything else reads Q.
+			Put(0, 0x2ff, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11));
+			Put(8, 0x2ff, 0x800003bf);
+			for (u32 pc = 16; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
+TEST_F(VU1RecompilerTest, WaitqExcludedFromPrecomputedSchedule)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// _vuRegsWAITQ declares no VF/VI reads or writes at all, since its only
+	// effect is forcing an outstanding FDIV entry to retire early. Without an
+	// explicit exclusion, AnalyzeRetirement treats it like any other 1-cycle,
+	// no-hazard pair once it reaches the precomputed-schedule range (i >= 7),
+	// letting it be batched through EmitScheduledPrepare/a deferred region
+	// instead of running its own runtime stall check — silently corrupting Q
+	// and downstream VU1 transform state in real gameplay well before this
+	// showed up as a differential-test failure. Eight filler pairs push the
+	// DIV/WAITQ pair here to i=8/9, past that threshold.
+	for (u32 budget : {8u, 9u, 10u, 11u, 14u, 15u, 16u, 20u, 30u})
+	{
+		SCOPED_TRACE(testing::Message() << budget);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VF[1].F[0] = 5.0f;
+		VU1.VF[1].F[1] = 2.0f;
+		for (u32 i = 0; i < 8; i++)
+			Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x3f800000);
+		Put(64, 0x2ff, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y
+		Put(72, 0x2ff, 0x800003bf); // WAITQ
+		for (u32 pc = 80; pc < 200; pc += 8)
+			Put(pc, 0x800002ff, 0);
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, WaitqRetiresQBeforePairedUpperBroadcastRead)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// VU1microInterp.cpp runs _vuTestLowerStalls/_vuTestPipes -- WAITQ's
+	// stall-and-retire -- before _vu1ExecUpper, so an upper op that broadcasts
+	// Q in the very same pair as WAITQ (a common real idiom: "WAITQ" paired
+	// with "MULq"/"MADDq"/etc. to consume a division result) observes the
+	// freshly retired value. EmitPair used to run EmitUpper before EmitLower
+	// unconditionally, so that same-pair upper read the stale architectural Q
+	// left over from before the wait instead — this is what actually broke
+	// real-game rendering, well after WaitqExcludedFromPrecomputedSchedule
+	// above already passed.
+	for (u32 budget : {1u, 2u, 3u})
+	{
+		SCOPED_TRACE(budget);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VI[REG_Q].UL = 0x3f800000; // stale Q == 1.0, must not survive the wait
+		VU1.VF[1].F[0] = 5.0f;
+		VU1.VF[1].F[1] = 2.0f; // DIV VF1x, VF1y -> Q settles to 2.5 once WAITQ retires it
+		Put(0, 0x2ff, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y
+		// upper: VF1.xyzw = VF1 * Q (broadcast); lower: WAITQ, same pair.
+		Put(8, (15 << 21) | (1 << 11) | (1 << 6) | 0x1c, 0x800003bf);
+		for (u32 pc = 16; pc < 64; pc += 8)
+			Put(pc, 0x800002ff, 0);
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, IlwrMatchesIlwPipelineTimingWithoutImmediate)
 {
 	const VURegs initial = VU1, initial0 = VU0;
