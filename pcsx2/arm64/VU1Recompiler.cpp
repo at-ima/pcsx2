@@ -209,9 +209,13 @@ namespace
 		Fcand,
 		Fceq,
 		Fcor,
+		Div,
 		Ibeq,
 		Ibne,
 		Ibgtz,
+		Ibltz,
+		Ibgez,
+		Iblez,
 		Xgkick,
 		Branch,
 		Unsupported
@@ -236,8 +240,14 @@ namespace
 				return Lower::Ibeq;
 			case 0x29:
 				return Lower::Ibne;
+			case 0x2c:
+				return Lower::Ibltz;
 			case 0x2d:
 				return Lower::Ibgtz;
+			case 0x2e:
+				return Lower::Iblez;
+			case 0x2f:
+				return Lower::Ibgez;
 			case 8:
 				return Lower::Iaddiu;
 			case 9:
@@ -276,6 +286,8 @@ namespace
 						return Lower::Mfir;
 					case 0x3fc:
 						return Lower::Mtir;
+					case 0x3bc:
+						return Lower::Div;
 					case 0x6fc:
 						return CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? Lower::Xgkick : Lower::Unsupported;
 				}
@@ -287,7 +299,8 @@ namespace
 
 	bool IsIntegerBranch(Lower op)
 	{
-		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz;
+		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz ||
+		       op == Lower::Ibltz || op == Lower::Ibgez || op == Lower::Iblez;
 	}
 
 	void StoreWord(MacroAssembler& a, u32 value, size_t offset)
@@ -637,6 +650,91 @@ namespace
 			a.Strh(w0, Field(VI(1)));
 			return;
 		}
+		if (op == Lower::Div)
+		{
+			// Mirrors _vuDIV/_vuFDIVAdd: compute now (matching the interpreter's
+			// immediate statusflag write), then stage Q into the shared FDIV pipe
+			// so the generic retirement code publishes it after 7 cycles, needs
+			// proper testing against every division-by-zero/sign combination.
+			// A still-pending previous DIV/SQRT/RSQRT stalls issue (_vuTestFDIVStalls),
+			// same as the generic FMAC-read hazard the caller's prepare stub covers.
+			// The interpreter retires the pipe (_vuTestPipes) between that stall and
+			// _vuFDIVAdd, so the old result must reach Q before this one replaces it.
+			// The stall leaves the entry exactly at or past its ready cycle.
+			{
+				Label not_pending;
+				a.Ldr(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+				a.Cbz(w9, &not_pending);
+				a.Ldr(x9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, sCycle)));
+				a.Ldr(w10, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, Cycle)));
+				a.Add(x9, x9, x10);
+				a.Cmp(x26, x9);
+				a.Csel(x26, x9, x26, lo);
+				// The caller only publishes its cached cycle for scheduled pairs, so
+				// a stall taken here has to reach architectural state on its own.
+				a.Str(x26, Field(offsetof(VURegs, cycle)));
+				a.Ldr(w10, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, reg)));
+				a.Str(w10, Field(VI(REG_Q)));
+				a.Ldr(w10, Field(VI(REG_STATUS_FLAG)));
+				a.And(w10, w10, 0xfcf);
+				a.Ldr(w11, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, statusflag)));
+				a.And(w11, w11, 0xc30);
+				a.Orr(w10, w10, w11);
+				a.Str(w10, Field(VI(REG_STATUS_FLAG)));
+				a.Bind(&not_pending);
+			}
+			const u32 fsf = (code >> 21) & 3, ftf = (code >> 23) & 3;
+			LoadVector(a, cache, q0, fs);
+			LoadVector(a, cache, q1, ft);
+			a.Dup(v2.V4S(), v0.V4S(), fsf);
+			a.Dup(v3.V4S(), v1.V4S(), ftf);
+			ClampInput(a, v2); // fs, after vuDouble
+			ClampInput(a, v3); // ft, after vuDouble
+			a.Umov(w2, v2.V4S(), 0);
+			a.Umov(w3, v3.V4S(), 0);
+			Label is_zero, have_result, done;
+			a.Fcmp(s3, 0.0);
+			a.B(eq, &is_zero);
+			a.Fdiv(s4, s2, s3);
+			a.Dup(v4.V4S(), v4.V4S(), 0);
+			ClampInput(a, v4); // result, after vuDouble
+			a.Umov(w0, v4.V4S(), 0);
+			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+			a.And(w1, w1, 0xffffffcf);
+			a.B(&have_result);
+			a.Bind(&is_zero);
+			{
+				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+				a.And(w1, w1, 0xffffffcf);
+				a.Fcmp(s2, 0.0);
+				Label fs_nonzero;
+				a.B(ne, &fs_nonzero);
+				a.Orr(w1, w1, 0x10); // fs == 0 && ft == 0: invalid (I flag)
+				a.B(&done);
+				a.Bind(&fs_nonzero);
+				a.Orr(w1, w1, 0x20); // fs != 0 && ft == 0: divide-by-zero (D flag)
+				a.Bind(&done);
+			}
+			// Signed max float, matching the sign of fs's numerator over ft's zero.
+			a.Eor(w0, w2, w3);
+			a.Mov(w4, 0x7f7fffff);
+			a.Mov(w5, 0xff7fffff);
+			a.Tst(w0, 0x80000000);
+			a.Csel(w0, w5, w4, ne);
+			a.Bind(&have_result);
+			a.Str(w1, Field(offsetof(VURegs, statusflag)));
+			// _vuDIV also leaves its result in the staging Q field itself, distinct
+			// from the architectural VI(REG_Q) the FDIV pipe retires into later.
+			a.Str(w0, Field(offsetof(VURegs, q)));
+			a.Str(w0, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, reg)));
+			a.Str(w1, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, statusflag)));
+			a.Str(x26, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, sCycle)));
+			a.Mov(w9, 7);
+			a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, Cycle)));
+			a.Mov(w9, 1);
+			a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+			return;
+		}
 		if (op == Lower::Ilw)
 		{
 			if (!it || !mask)
@@ -836,10 +934,27 @@ namespace
 			};
 			load_operand(w0, (ins.lower >> 11) & 15);
 			const Lower op = DecodeLower(ins.lower);
-			if (op == Lower::Ibgtz)
+			if (op == Lower::Ibgtz || op == Lower::Ibltz || op == Lower::Ibgez || op == Lower::Iblez)
 			{
+				// Skip (to done) on the condition opposite the one that takes the branch.
 				a.Cmp(w0, 0);
-				a.B(le, &done);
+				Condition skip;
+				switch (op)
+				{
+					case Lower::Ibgtz:
+						skip = le;
+						break;
+					case Lower::Ibltz:
+						skip = ge;
+						break;
+					case Lower::Ibgez:
+						skip = lt;
+						break;
+					default: // Iblez
+						skip = gt;
+						break;
+				}
+				a.B(skip, &done);
 			}
 			else
 			{
@@ -968,7 +1083,7 @@ namespace
 		// still depends on incoming timing. Every pair advances at least one cycle.
 		std::array<int, MaxInstructions> ages{};
 		ages.fill(-1);
-		u32 integer_ready = 0;
+		u32 integer_ready = 0, fdiv_ready = 0;
 		for (u32 i = 0; i < block.count; i++)
 		{
 			const auto& ins = block.instructions[i];
@@ -999,7 +1114,12 @@ namespace
 				cycles = -1;
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
-			if (i >= 7 && cycles > 0 && i >= integer_ready &&
+			// A deferred region skips the shared preparation, so nothing would retire
+			// the single FDIV slot while its entry is outstanding. Keep those pairs
+			// on the generic path until the pipe has had its full latency.
+			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
+				fdiv_ready = i + ins.lregs.cycles + 1;
+			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= fdiv_ready &&
 				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
@@ -1026,8 +1146,13 @@ namespace
 					}
 				}
 				// Deferred regions keep retired flags in host registers. Materialize
-				// them before a lower instruction observes architectural flag state.
-				if (ins.lregs.VIread & ((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG)))
+				// them before an instruction observes architectural flag or Q state.
+				// Q retires from the FDIV pipe on the same generic per-pair path.
+				// An FDIV issue also stamps its own sCycle and stalls on the previous
+				// entry, so it needs the exact cycle rather than a batched one.
+				if (((ins.uregs.VIread | ins.lregs.VIread) &
+						((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG) | (1 << REG_Q))) ||
+					(ins.lregs.VIwrite & (1 << REG_Q)))
 					plan.cycles = 0;
 				block.schedule[i] = plan;
 			}
@@ -1337,7 +1462,9 @@ namespace
 			}
 			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
 			{
-				if (regs->pipe != VUPIPE_FMAC)
+				// FDIV (DIV/SQRT/RSQRT) reads are also FMAC-hazard checked by the
+				// interpreter's _vuTestLowerStalls, same as ordinary FMAC consumers.
+				if (regs->pipe != VUPIPE_FMAC && regs->pipe != VUPIPE_FDIV)
 					continue;
 				if (regs->VFread0)
 					ins.readMasks[regs->VFread0] |= regs->VFr0xyzw;

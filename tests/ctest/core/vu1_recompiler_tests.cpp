@@ -2123,4 +2123,87 @@ TEST_F(VU1RecompilerTest, ClipHandlesIncomingFlagsAliasesAndCycleWrap)
 				}
 }
 
+TEST_F(VU1RecompilerTest, IntegerBranchesLtzGezLezMatchInterpreter)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// top7: IBLTZ=0x2c, IBLEZ=0x2e, IBGEZ=0x2f (IBGTZ=0x2d is covered elsewhere).
+	for (u32 top : {0x2cu, 0x2eu, 0x2fu})
+		for (u32 value : {0u, 1u, 0x7fffu, 0x8000u, 0xffffu, 0x7fffffffu})
+			for (bool backed_up : {false, true})
+			{
+				SCOPED_TRACE(testing::Message() << top << "/" << value << "/" << backed_up);
+				VU0 = initial0;
+				VU1 = initial;
+				Put(0, 0x2ff, (top << 25) | (2 << 11) | 2);
+				Put(8, 0x800002ff, 0x40000000);
+				Put(16, 0xc00002ff, 0x40400000);
+				Put(24, 0x800002ff, 0x40800000);
+				VU1.VI[2].UL = value;
+				if (backed_up)
+				{
+					VU1.VIRegNumber = 2;
+					VU1.VIOldValue = static_cast<u16>(value + 1);
+					VU1.VIBackupCycles = 2;
+				}
+				Compare(1);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
+TEST_F(VU1RecompilerTest, DivComputesQuotientAndDivideByZeroFlags)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Zero, signed zero, denormals, normals, and non-finite bit patterns on both sides.
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	for (u32 fs_bits : values)
+		for (u32 ft_bits : values)
+			for (u32 fsf : {0u, 3u})
+				for (u32 ftf : {0u, 1u})
+				{
+					SCOPED_TRACE(testing::Message() << fs_bits << "/" << ft_bits << "/" << fsf << "/" << ftf);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VF[1].UL[fsf] = fs_bits;
+					VU1.VF[2].UL[ftf] = ft_bits;
+					VU1.statusflag = 0xa5a5a5a5;
+					Put(0, 0x2ff, 0x800003bc | (fsf << 21) | (ftf << 23) | (2 << 16) | (1 << 11));
+					for (u32 pc = 8; pc < 64; pc += 8)
+						Put(pc, 0x800002ff, 0);
+					Compare(1);
+					ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+					Compare(9);
+					if (HasFatalFailure())
+						return;
+				}
+}
+
+TEST_F(VU1RecompilerTest, DivSharesFsAndFtAndPipeRetiresAcrossBudgets)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 reg : {1u, 2u}) // DIV VF1x, VF1x (aliased) vs distinct registers.
+		for (u64 cycle : {u64(100), ~u64(0) - 2})
+			for (u32 budget : {1u, 2u, 4u, 6u, 7u, 8u, 12u, 20u})
+			{
+				SCOPED_TRACE(testing::Message() << reg << "/" << cycle << "/" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = cycle;
+				VU1.VF[1].F[0] = 5.0f;
+				VU1.VF[1].F[1] = 2.0f;
+				VU1.VF[reg].F[1] = 2.0f;
+				// A second DIV a few pairs later overwrites the still-pending pipe entry.
+				Put(0, 0x2ff, 0x800003bc | (1 << 23) | (reg << 16) | (1 << 11));
+				Put(8, 0x800002ff, 0);
+				Put(16, 0x2ff, 0x800003bc | (2 << 21) | (1 << 16) | (1 << 11));
+				for (u32 pc = 24; pc < 64; pc += 8)
+					Put(pc, 0x800002ff, 0);
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
 #endif

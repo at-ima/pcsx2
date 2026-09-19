@@ -167,6 +167,23 @@ and reads of architectural flags use the generic path; deferred regions end befo
 these observations so pending flag snapshots remain visible at the correct cycle.
 This retains the shared pipeline design rather than adding a separate flag timeline.
 
+DIV computes its quotient with the interpreter's operand and result clamping,
+including the denormal flush and the optional overflow clamp. A zero divisor
+produces the signed maximum float and sets the I or D status bit, matching
+`_vuDIV`, and the result also lands in the staging Q field the interpreter writes.
+Issue stages Q into the shared single-slot FDIV pipe for its seven-cycle latency,
+where the existing generic retirement publishes it. An outstanding entry stalls
+the next FDIV issue and is retired before being replaced, mirroring
+`_vuTestFDIVStalls` followed by `_vuTestPipes`. FDIV reads also participate in the
+FMAC hazard scan. Because a deferred region skips shared preparation, pairs within
+the pipe's latency stay on the generic path, as ILW already does for the IALU pipe.
+Only DIV is implemented; SQRT, RSQRT and the EFU instructions still fall back.
+This needs proper testing across games rather than only the differential tests.
+
+IBLTZ, IBLEZ and IBGEZ reuse the existing integer-branch path, including the VI
+backup lookup and the combined FMAC/IALU waits, and differ only in the condition
+that skips the taken edge.
+
 ILW reads the low halfword of the final selected component, wraps VU1 data memory,
 and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic

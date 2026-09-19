@@ -1340,3 +1340,66 @@ Opening-movie regression check (frames 850–1100): **57.62 → 57.53 VPS (-0.2%
 a single pair rather than a precise regression bound. Logs:
 `diagnostic-clip-{old,new}.log`. Temporary metrics and emitter-offset logging
 were removed before the production build. The installed app was not replaced.
+
+
+## VU1 interpreter fallback attribution and native DIV
+
+Temporary instrumentation counted every VU1 instruction pair reaching
+`Arm64VU1Recompiler::Step()`, keyed by its encoded upper/lower words, over one
+run of the supplied state. It recorded **273,259,728 native block entries against
+298,100,106 interpreter steps**: the interpreter still executed more pairs than
+the generated code. The distribution is extremely narrow, as expected for a hot
+microprogram loop; the twenty most frequent pairs cover 279.6M of the 298.1M
+steps. Decoding those against the interpreter's own opcode tables gives:
+
+| Pairs | Lower | Upper | Status |
+| ---: | --- | --- | --- |
+| 59.9M | DIV | CLIP / NOP | Unsupported lower |
+| 56.6M | LQ, IBEQ | OPMULA, OPMSUB | Unsupported upper |
+| 38.9M | ILWR | NOP | Unsupported lower |
+| 31.3M | FMAND | MULw, NOP | Unsupported lower |
+| 17.8M | ISW | NOP | Unsupported lower |
+| 11.4M | IBLTZ, IBGEZ | CLIP, NOP | Unsupported lower |
+| 9.3M | WAITQ | ADDq | Unsupported lower |
+| 15.7M | RSQRT | ADDq, NOP | Unsupported lower |
+
+An unsupported pair does not merely execute itself through the interpreter: it
+ends the trace being built, so the recompiler cannot span it. DIV was therefore
+the single largest item, and its pipe was already modelled — the generic
+retirement body in `VU1Pipeline.cpp` has always retired the FDIV slot, but
+nothing in generated code ever filled it.
+
+Implementing DIV required three things beyond the arithmetic. The interpreter
+stalls a new FDIV issue on an outstanding entry and then retires that entry
+before overwriting the single slot, so generated code has to do both in order.
+A stall taken inside a pair has to be published to `VURegs.cycle`, because the
+block only writes back its cached cycle register for scheduled pairs. And a
+deferred region skips shared preparation entirely, so nothing would retire the
+FDIV slot while its entry is outstanding; pairs within the pipe's latency now
+stay on the generic path, matching what ILW already does for the IALU pipe. Each
+of these was found by a differential test rather than by reading the reference.
+
+Three differential tests cover division by zero with every sign and zero
+combination, denormal and non-finite operands, both operand lane selectors,
+aliased Fs/Ft, cycle wrap, back-to-back issue inside the latency window, and
+budget prefixes across the retirement boundary. The three missing unary integer
+branches were added alongside, reusing the existing branch path.
+
+Serial unsampled interleaved runs of the supplied state (frames 120-420,
+identical settings and temporary metrics, no concurrent builds or tests):
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| base-a | 30.97 | 32.23 | 1.17 |
+| new-a | 33.07 | 30.19 | 1.16 |
+| base-b | 31.07 | 32.11 | 1.20 |
+| new-b | 32.78 | 30.43 | 1.20 |
+
+Two-run means are **31.02 -> 32.93 VPS (+6.1%)**, CPU time 32.17 -> 30.31
+ms/frame. An earlier 28.81 VPS figure from the instrumented build is excluded:
+the per-step counter itself cost roughly 7%.
+
+204 tests passed. The state still runs far below 60 VPS, and the table above is
+the remaining work: the outer products are now the largest single item, followed
+by ILWR, FMAND/FSAND, ISW and the rest of the FDIV/EFU families. No visual,
+long-gameplay or x64 runtime validation was performed.
