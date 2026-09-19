@@ -2206,6 +2206,63 @@ TEST_F(VU1RecompilerTest, DivSharesFsAndFtAndPipeRetiresAcrossBudgets)
 			}
 }
 
+TEST_F(VU1RecompilerTest, SqrtComputesRootAndNegativeFlag)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Zero, signed zero, denormals, normals, and non-finite bit patterns.
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	for (u32 ft_bits : values)
+		for (u32 ftf : {0u, 1u})
+		{
+			SCOPED_TRACE(testing::Message() << ft_bits << "/" << ftf);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VF[2].UL[ftf] = ft_bits;
+			VU1.statusflag = 0xa5a5a5a5;
+			// SQRT: T3_01 (code&0x3f=0x3d), index 0xe, code&0x7ff=0x3bd.
+			Put(0, 0x2ff, 0x800003bd | (ftf << 23) | (2 << 16));
+			for (u32 pc = 8; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(1);
+			ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+			Compare(9);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
+TEST_F(VU1RecompilerTest, RsqrtComputesQuotientAndDivideByZeroFlags)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Zero, signed zero, denormals, normals, and non-finite bit patterns on both sides.
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	for (u32 fs_bits : values)
+		for (u32 ft_bits : values)
+			for (u32 fsf : {0u, 3u})
+				for (u32 ftf : {0u, 1u})
+				{
+					SCOPED_TRACE(testing::Message() << fs_bits << "/" << ft_bits << "/" << fsf << "/" << ftf);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VF[1].UL[fsf] = fs_bits;
+					VU1.VF[2].UL[ftf] = ft_bits;
+					VU1.statusflag = 0xa5a5a5a5;
+					// RSQRT: T3_10 (code&0x3f=0x3e), index 0xe, code&0x7ff=0x3be.
+					Put(0, 0x2ff, 0x800003be | (fsf << 21) | (ftf << 23) | (2 << 16) | (1 << 11));
+					for (u32 pc = 8; pc < 64; pc += 8)
+						Put(pc, 0x800002ff, 0);
+					Compare(1);
+					ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+					Compare(15);
+					if (HasFatalFailure())
+						return;
+				}
+}
+
 TEST_F(VU1RecompilerTest, IlwrMatchesIlwPipelineTimingWithoutImmediate)
 {
 	const VURegs initial = VU1, initial0 = VU0;

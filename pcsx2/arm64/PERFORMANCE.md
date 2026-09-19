@@ -1524,3 +1524,51 @@ Two-run means are **35.19 -> 36.63 VPS (+4.1%)**, CPU time 28.42 -> 27.30
 ms/frame. A 25-second unmeasured run of the same state exited cleanly on
 SIGTERM with no crash. No visual, long-gameplay or x64 runtime validation
 was performed.
+
+
+## RSQRT and SQRT
+
+The next two largest measured fallback items after OPMULA/OPMSUB. Both share
+the FDIV pipe machinery DIV already established (the stall/retire/overwrite
+handling and the deferred-region `fdiv_ready` exclusion), so the shared
+pending-stall check and pipe-writeback code were pulled out of the DIV
+handler into `EmitFDIVStall`/`EmitFDIVFinish` and reused by all three.
+
+SQRT (`_vuSQRT`) is `q = sqrt(fabs(ft))`, with the I status flag set when
+`ft < 0`; RSQRT (`_vuRSQRT`) is `q = fs / sqrt(fabs(ft))`, with a deeper
+zero-handling case than DIV's own division-by-zero path when `ft == 0`
+(distinguishing `fs == 0` from `fs != 0` for the I/D flag combination and the
+signed-zero/signed-max-float result). Both use plain ARM64 `Fsqrt`/`Fdiv`
+after the usual `ClampInput` denormal/overflow handling.
+
+One correctness detail worth flagging: the `ft < 0` test cannot use the
+`lt`/`ge` condition codes after `Fcmp`, because AArch64 defines those to
+treat an unordered (NaN) comparison as if it were "less than", the opposite
+of the interpreter's plain C `<` (always false for NaN). `pl`/`mi` (which
+key off the N flag alone) give the correct false-for-NaN result and are used
+here instead.
+
+Two new differential tests sweep zero, signed zero, denormals, normals and
+non-finite bit patterns on both operands (matching the existing DIV test's
+coverage), through the same pipe-retirement budget boundaries. 208 of 209
+tests pass; `SpecialFloatsAndChangedFloatingPointOptions` remains the one
+known failure from the previous section, unrelated to this change.
+
+Serial interleaved runs of the supplied state (frames 120-420) were far
+noisier than previous sessions on this machine (up to 9% swing between
+otherwise-identical runs of the *same* binary):
+
+| Run | VPS | ms/frame |
+| --- | ---: | ---: |
+| old-a | 34.44 | 29.04 |
+| new-a | 33.70 | 29.68 |
+| new-b | 36.98 | 27.04 |
+| old-b | 36.36 | 27.50 |
+| new-c | 36.51 | 27.39 |
+
+Old mean (a, b): 35.40 VPS. New mean (a, b, c): 35.73 VPS — roughly **+1%**,
+within this run's noise floor. RSQRT/SQRT's combined ~15.7M fallback pairs
+are considerably fewer than OPMULA/OPMSUB's 56.6M, so a smaller and noisier
+measured effect than the previous session's is expected rather than a sign
+of a problem. A 25-second unmeasured run exited cleanly on SIGTERM with no
+crash. No visual, long-gameplay or x64 runtime validation was performed.
