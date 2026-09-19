@@ -228,6 +228,15 @@ namespace
 		Sqrt,
 		Rsqrt,
 		Waitq,
+		Esadd,
+		Ersadd,
+		Eleng,
+		Erleng,
+		Esum,
+		Ercpr,
+		Esqrt,
+		Ersqrt,
+		Waitp,
 		Ibeq,
 		Ibne,
 		Ibgtz,
@@ -332,6 +341,24 @@ namespace
 						return Lower::Rsqrt;
 					case 0x3bf:
 						return Lower::Waitq;
+					case 0x73c:
+						return Lower::Esadd;
+					case 0x73d:
+						return Lower::Ersadd;
+					case 0x73e:
+						return Lower::Eleng;
+					case 0x73f:
+						return Lower::Erleng;
+					case 0x77e:
+						return Lower::Esum;
+					case 0x7be:
+						return Lower::Ercpr;
+					case 0x7bc:
+						return Lower::Esqrt;
+					case 0x7bd:
+						return Lower::Ersqrt;
+					case 0x7bf:
+						return Lower::Waitp;
 					case 0x3fe:
 						return Lower::Ilwr;
 					case 0x6fc:
@@ -428,20 +455,22 @@ namespace
 		}
 	}
 
-	void ClampInput(MacroAssembler& a, VRegister reg)
+	// Unconditionally: matches vuDouble's denormal flush exactly, ignoring
+	// VU1FPCR. Most callers want ClampInput below instead, which skips this
+	// when hardware FZ makes it redundant -- but that shortcut only holds when
+	// the clamped value is guaranteed to pass through more arithmetic before
+	// being stored; a handful of EFU ops (ERCPR/ESQRT/ERSQRT) can store this
+	// exact value completely unchanged, with no further instruction for
+	// hardware FZ to act on.
+	void ClampInputAlways(MacroAssembler& a, VRegister reg)
 	{
-		// Arithmetic flushes signed denormal inputs in hardware when FPCR.FZ is
-		// enabled. Other FPCR modes still need the interpreter's explicit clamp.
-		if (!EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero())
-		{
-			a.Movi(v16.V4S(), 0x7f800000);
-			a.And(v17.V16B(), reg.V16B(), v16.V16B());
-			a.Movi(v18.V4S(), 0x80000000);
-			a.And(v18.V16B(), reg.V16B(), v18.V16B());
-			a.Cmeq(v19.V4S(), v17.V4S(), 0);
-			a.Bsl(v19.V16B(), v18.V16B(), reg.V16B());
-			a.Mov(reg.V16B(), v19.V16B());
-		}
+		a.Movi(v16.V4S(), 0x7f800000);
+		a.And(v17.V16B(), reg.V16B(), v16.V16B());
+		a.Movi(v18.V4S(), 0x80000000);
+		a.And(v18.V16B(), reg.V16B(), v18.V16B());
+		a.Cmeq(v19.V4S(), v17.V4S(), 0);
+		a.Bsl(v19.V16B(), v18.V16B(), reg.V16B());
+		a.Mov(reg.V16B(), v19.V16B());
 		if (CHECK_VU_OVERFLOW(0))
 		{
 			// Signed min clamps positive infinities/NaNs; unsigned min clamps
@@ -451,6 +480,24 @@ namespace
 			a.Smin(reg.V4S(), reg.V4S(), v16.V4S());
 			a.Umin(reg.V4S(), reg.V4S(), v17.V4S());
 		}
+	}
+
+	void ClampInput(MacroAssembler& a, VRegister reg)
+	{
+		// Arithmetic flushes signed denormal inputs in hardware when FPCR.FZ is
+		// enabled. Other FPCR modes still need the interpreter's explicit clamp.
+		if (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero())
+		{
+			if (CHECK_VU_OVERFLOW(0))
+			{
+				a.Movi(v16.V4S(), 0x7f7fffff);
+				a.Movi(v17.V4S(), 0xff7fffff);
+				a.Smin(reg.V4S(), reg.V4S(), v16.V4S());
+				a.Umin(reg.V4S(), reg.V4S(), v17.V4S());
+			}
+			return;
+		}
+		ClampInputAlways(a, reg);
 	}
 
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
@@ -762,6 +809,49 @@ namespace
 		a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
 	}
 
+	// Shared by every EFU-issuing op (ESADD..EEXP) and WAITP: a still-pending
+	// previous EFU op stalls issue (_vuTestEFUStalls), mirroring EmitFDIVStall's
+	// generic-hazard/pipe-retirement handling for Q, but for P. The interpreter
+	// decrements the pending entry's own Cycle field by one before testing
+	// readiness -- "the stall is released 1 cycle before P is updated"
+	// (VUops.cpp) -- which only affects the forced VURegs::cycle advance below,
+	// since every EFU-issuing op immediately overwrites the entry's Cycle right
+	// after anyway (WAITP leaves it disabled instead); mutate efu.Cycle to
+	// match exactly, needs proper testing right at the cycle-wrap boundary.
+	void EmitEFUStall(MacroAssembler& a)
+	{
+		Label not_pending;
+		a.Ldr(w9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
+		a.Cbz(w9, &not_pending);
+		a.Ldr(w10, Field(offsetof(VURegs, efu) + offsetof(efuPipe, Cycle)));
+		a.Sub(w10, w10, 1);
+		a.Str(w10, Field(offsetof(VURegs, efu) + offsetof(efuPipe, Cycle)));
+		a.Ldr(x9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, sCycle)));
+		a.Add(x9, x9, x10);
+		a.Cmp(x26, x9);
+		a.Csel(x26, x9, x26, lo);
+		a.Str(x26, Field(offsetof(VURegs, cycle)));
+		a.Ldr(w10, Field(offsetof(VURegs, efu) + offsetof(efuPipe, reg)));
+		a.Str(w10, Field(VI(REG_P)));
+		a.Str(wzr, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.retire_queues));
+		a.Blr(x16);
+		a.Bind(&not_pending);
+	}
+
+	// w0 = result bits, already computed by the caller. EFU has no status-flag
+	// interaction at all, unlike the FDIV pipe.
+	void EmitEFUFinish(MacroAssembler& a, u32 cycles)
+	{
+		a.Str(w0, Field(offsetof(VURegs, p)));
+		a.Str(w0, Field(offsetof(VURegs, efu) + offsetof(efuPipe, reg)));
+		a.Str(x26, Field(offsetof(VURegs, efu) + offsetof(efuPipe, sCycle)));
+		a.Mov(w9, cycles);
+		a.Str(w9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, Cycle)));
+		a.Mov(w9, 1);
+		a.Str(w9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
+	}
+
 	void EmitLower(MacroAssembler& a, const VectorCache& cache, u32 code)
 	{
 		const Lower op = DecodeLower(code);
@@ -986,6 +1076,144 @@ namespace
 			// stall every FDIV-pipe op takes before doing anything else. It
 			// does not issue a new pipe entry, so there is nothing to finish.
 			EmitFDIVStall(a);
+			return;
+		}
+		if (op == Lower::Esadd || op == Lower::Ersadd || op == Lower::Eleng || op == Lower::Erleng)
+		{
+			// _vuESADD/_vuERSADD/_vuELENG/_vuERLENG all reduce fs.xyz to
+			// p = fs.x^2 + fs.y^2 + fs.z^2 (left-to-right, matching the
+			// interpreter's evaluation order), then diverge: ESADD stores it
+			// directly, ERSADD takes its reciprocal (skipped when zero), ELENG
+			// takes its square root (skipped when negative or NaN), ERLENG
+			// chains both. None of the four clamp their output, matching the
+			// interpreter (no vuDouble call on the result there), needs proper
+			// testing against every sign/zero/denormal/non-finite combination.
+			EmitEFUStall(a);
+			LoadVector(a, cache, q0, fs);
+			ClampInput(a, v0);
+			a.Dup(v2.V4S(), v0.V4S(), 0);
+			a.Dup(v3.V4S(), v0.V4S(), 1);
+			a.Dup(v4.V4S(), v0.V4S(), 2);
+			a.Fmul(s2, s2, s2);
+			a.Fmul(s3, s3, s3);
+			a.Fmul(s4, s4, s4);
+			a.Fadd(s5, s2, s3);
+			a.Fadd(s5, s5, s4);
+			if (op == Lower::Ersadd)
+			{
+				Label done;
+				a.Fcmp(s5, 0.0);
+				a.B(eq, &done);
+				a.Fmov(s6, 1.0f);
+				a.Fdiv(s5, s6, s5);
+				a.Bind(&done);
+			}
+			else if (op == Lower::Eleng || op == Lower::Erleng)
+			{
+				// "lt" is true for both a real negative sum and an unordered
+				// (NaN) one, so this correctly skips the square root -- leaving
+				// p as the original sum -- for exactly the cases where a plain
+				// "p >= 0" test would be false in C.
+				Label skip_sqrt;
+				a.Fcmp(s5, 0.0);
+				a.B(lt, &skip_sqrt);
+				a.Fsqrt(s5, s5);
+				if (op == Lower::Erleng)
+				{
+					Label done;
+					a.Fcmp(s5, 0.0);
+					a.B(eq, &done);
+					a.Fmov(s6, 1.0f);
+					a.Fdiv(s5, s6, s5);
+					a.Bind(&done);
+				}
+				a.Bind(&skip_sqrt);
+			}
+			a.Fmov(w0, s5);
+			u32 cycles = 11; // Esadd
+			if (op == Lower::Ersadd || op == Lower::Eleng)
+				cycles = 18;
+			else if (op == Lower::Erleng)
+				cycles = 24;
+			EmitEFUFinish(a, cycles);
+			return;
+		}
+		if (op == Lower::Esum)
+		{
+			// _vuESUM: p = fs.x + fs.y + fs.z + fs.w, left-to-right, no clamp.
+			EmitEFUStall(a);
+			LoadVector(a, cache, q0, fs);
+			ClampInput(a, v0);
+			a.Dup(v2.V4S(), v0.V4S(), 0);
+			a.Dup(v3.V4S(), v0.V4S(), 1);
+			a.Dup(v4.V4S(), v0.V4S(), 2);
+			a.Dup(v5.V4S(), v0.V4S(), 3);
+			a.Fadd(s2, s2, s3);
+			a.Fadd(s2, s2, s4);
+			a.Fadd(s2, s2, s5);
+			a.Fmov(w0, s2);
+			EmitEFUFinish(a, 12);
+			return;
+		}
+		if (op == Lower::Ercpr || op == Lower::Esqrt || op == Lower::Ersqrt)
+		{
+			// _vuERCPR/_vuESQRT/_vuERSQRT read a single Fs[fsf] lane directly,
+			// unlike the FDIV pipe's SQRT/RSQRT which take fabs() first: ERCPR
+			// takes its reciprocal (skipped when zero); ESQRT/ERSQRT take its
+			// square root, skipped entirely -- p keeps the original value --
+			// when negative or NaN; ERSQRT chains a reciprocal after. No output
+			// clamp, matching the interpreter, needs proper testing against
+			// every sign/zero/denormal/non-finite combination.
+			const u32 fsf = mask & 3;
+			EmitEFUStall(a);
+			LoadVector(a, cache, q0, fs);
+			a.Dup(v2.V4S(), v0.V4S(), fsf);
+			// The "skip" branch below can store this value completely
+			// unchanged, with no arithmetic instruction for hardware FZ to act
+			// on, so it needs the unconditional clamp (see ClampInputAlways).
+			ClampInputAlways(a, v2);
+			if (op == Lower::Ercpr)
+			{
+				// _vuERCPR divides "1.0" (a double literal, unlike ERSADD/
+				// ERLENG/ERSQRT's "1.0f") by p, so the division itself happens
+				// in double precision and only the final assignment back to
+				// float rounds -- a different result than a native single-
+				// precision division for some inputs. Widen, divide, narrow.
+				Label done;
+				a.Fcmp(s2, 0.0);
+				a.B(eq, &done);
+				a.Fcvt(d2, s2);
+				a.Fmov(d6, 1.0);
+				a.Fdiv(d2, d6, d2);
+				a.Fcvt(s2, d2);
+				a.Bind(&done);
+			}
+			else
+			{
+				Label skip_sqrt;
+				a.Fcmp(s2, 0.0);
+				a.B(lt, &skip_sqrt);
+				a.Fsqrt(s2, s2);
+				if (op == Lower::Ersqrt)
+				{
+					Label done;
+					a.Fcmp(s2, 0.0);
+					a.B(eq, &done);
+					a.Fmov(s6, 1.0f);
+					a.Fdiv(s2, s6, s2);
+					a.Bind(&done);
+				}
+				a.Bind(&skip_sqrt);
+			}
+			a.Fmov(w0, s2);
+			EmitEFUFinish(a, op == Lower::Ersqrt ? 18 : 12);
+			return;
+		}
+		if (op == Lower::Waitp)
+		{
+			// _vuWAITP's body is empty; its only effect is the pending-EFU
+			// stall every EFU-pipe op takes before doing anything else.
+			EmitEFUStall(a);
 			return;
 		}
 		if (op == Lower::Ilw || op == Lower::Ilwr)
@@ -1364,7 +1592,7 @@ namespace
 		// still depends on incoming timing. Every pair advances at least one cycle.
 		std::array<int, MaxInstructions> ages{};
 		ages.fill(-1);
-		u32 integer_ready = 0, fdiv_ready = 0;
+		u32 integer_ready = 0, fdiv_ready = 0, efu_ready = 0;
 		for (u32 i = 0; i < block.count; i++)
 		{
 			const auto& ins = block.instructions[i];
@@ -1400,7 +1628,11 @@ namespace
 			// on the generic path until the pipe has had its full latency.
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
 				fdiv_ready = i + ins.lregs.cycles + 1;
-			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= fdiv_ready &&
+			// Same as fdiv_ready, for the EFU pipe's single slot (ESADD..EEXP,
+			// retiring into P instead of Q).
+			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
+				efu_ready = i + ins.lregs.cycles + 1;
+			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= fdiv_ready && i >= efu_ready &&
 				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
@@ -1427,13 +1659,14 @@ namespace
 					}
 				}
 				// Deferred regions keep retired flags in host registers. Materialize
-				// them before an instruction observes architectural flag or Q state.
-				// Q retires from the FDIV pipe on the same generic per-pair path.
-				// An FDIV issue also stamps its own sCycle and stalls on the previous
-				// entry, so it needs the exact cycle rather than a batched one.
+				// them before an instruction observes architectural flag, Q or P
+				// state. Q and P retire from the FDIV/EFU pipes on the same
+				// generic per-pair path. An FDIV/EFU issue also stamps its own
+				// sCycle and stalls on the previous entry, so it needs the exact
+				// cycle rather than a batched one.
 				if (((ins.uregs.VIread | ins.lregs.VIread) &
-						((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG) | (1 << REG_Q))) ||
-					(ins.lregs.VIwrite & (1 << REG_Q)))
+						((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG) | (1 << REG_Q) | (1 << REG_P))) ||
+					(ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))))
 					plan.cycles = 0;
 				block.schedule[i] = plan;
 			}
@@ -1751,12 +1984,18 @@ namespace
 				// keeps it on the generic (non-deferred) path.
 				if (DecodeLower(ins.lower) == Lower::Waitq)
 					ins.lregs.VIwrite |= 1 << REG_Q;
+				// _vuRegsWAITP has the same gap as _vuRegsWAITQ above, for P
+				// instead of Q.
+				if (DecodeLower(ins.lower) == Lower::Waitp)
+					ins.lregs.VIwrite |= 1 << REG_P;
 			}
 			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
 			{
-				// FDIV (DIV/SQRT/RSQRT) reads are also FMAC-hazard checked by the
-				// interpreter's _vuTestLowerStalls, same as ordinary FMAC consumers.
-				if (regs->pipe != VUPIPE_FMAC && regs->pipe != VUPIPE_FDIV)
+				// FDIV (DIV/SQRT/RSQRT) and EFU (ESADD..WAITP) reads are also
+				// FMAC-hazard checked by the interpreter's _vuTestLowerStalls
+				// (_vuTestEFUStalls itself starts by calling _vuTestFMACStalls),
+				// same as ordinary FMAC consumers.
+				if (regs->pipe != VUPIPE_FMAC && regs->pipe != VUPIPE_FDIV && regs->pipe != VUPIPE_EFU)
 					continue;
 				if (regs->VFread0)
 					ins.readMasks[regs->VFread0] |= regs->VFr0xyzw;

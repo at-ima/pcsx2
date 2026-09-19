@@ -194,6 +194,29 @@ in the same pair (a common idiom pairing WAITQ with a Q-broadcast MULq/MADDq/etc
 observes the freshly retired value; native emission orders the same-pair FDIV
 stall ahead of the upper instruction to match.
 
+ESADD, ERSADD, ELENG, ERLENG, ESUM, ERCPR, ESQRT, ERSQRT and WAITP use a second,
+structurally identical single-slot pipe (EFU, retiring into P instead of Q).
+ESADD/ERSADD/ELENG/ERLENG reduce `fs.x^2+fs.y^2+fs.z^2` left to right before
+diverging into a direct store, a reciprocal, a square root, or both; ESUM sums
+all four lanes; ERCPR/ESQRT/ERSQRT read a single `Fs[fsf]` lane directly, unlike
+the FDIV pipe's SQRT/RSQRT, which take `fabs()` first. None of the eight clamp
+their output, matching the interpreter, and a `p >= 0` gate (ELENG/ERLENG/ESQRT/
+ERSQRT) uses the AArch64 `lt` condition specifically, since it is true for both
+a real negative operand and an unordered (NaN) one, correctly skipping the
+square root in either case. ERCPR's reciprocal divides a `double` literal in
+the interpreter (`1.0`), unlike every other reciprocal here (`1.0f`), so it
+widens, divides and narrows instead of dividing directly in single precision.
+WAITP mirrors WAITQ exactly, and needs the same manual `VIwrite(P)` tag as
+WAITQ's `VIwrite(Q)` for the same reason. Unlike Q, P has no upper-instruction
+broadcast source, so the same-pair emission-order fix WAITQ needed does not
+apply here. `ClampInput`'s hardware-FZ shortcut (skip the explicit denormal
+flush when arithmetic will do it anyway) does not hold for ERCPR/ESQRT/ERSQRT's
+"leave the operand unchanged" branch, since no further arithmetic touches that
+value there; `ClampInputAlways` covers that case explicitly. EATAN, EATANxy,
+EATANxz, ESIN and EEXP (all evaluate a polynomial approximation, several of
+them in `double` precision in the interpreter before narrowing to `float`) and
+MFP still fall back.
+
 IBLTZ, IBLEZ and IBGEZ reuse the existing integer-branch path, including the VI
 backup lookup and the combined FMAC/IALU waits, and differ only in the condition
 that skips the taken edge.

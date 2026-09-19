@@ -2357,6 +2357,149 @@ TEST_F(VU1RecompilerTest, WaitqRetiresQBeforePairedUpperBroadcastRead)
 	}
 }
 
+TEST_F(VU1RecompilerTest, EsaddErsaddElengErlengComputeSumOfSquares)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Zero, signed zero, denormals, normals, negatives and non-finite bit
+	// patterns, spread across x/y/z so the x^2+y^2+z^2 reduction sees mixed
+	// operands rather than three copies of the same value.
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	// ESADD/ERSADD: T3_00/01 idx 0x1c, code&0x7ff=0x73c/0x73d.
+	// ELENG/ERLENG: T3_10/11 idx 0x1c, code&0x7ff=0x73e/0x73f.
+	constexpr u32 opcodes[] = {0x73c, 0x73d, 0x73e, 0x73f};
+	constexpr u32 latencies[] = {11, 18, 18, 24};
+	for (u32 op = 0; op < 4; op++)
+		for (u32 i = 0; i < std::size(values); i++)
+		{
+			const u32 x = values[i], y = values[(i + 5) % std::size(values)], z = values[(i + 9) % std::size(values)];
+			SCOPED_TRACE(testing::Message() << op << "/" << x << "/" << y << "/" << z);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VF[1].UL[0] = x;
+			VU1.VF[1].UL[1] = y;
+			VU1.VF[1].UL[2] = z;
+			Put(0, 0x2ff, 0x80000000 | opcodes[op] | (1 << 11));
+			for (u32 pc = 8; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(1);
+			ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+			Compare(latencies[op] + 2);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
+TEST_F(VU1RecompilerTest, EsumComputesComponentSum)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	// ESUM: T3_10 idx 0x1d, code&0x7ff=0x77e.
+	for (u32 i = 0; i < std::size(values); i++)
+	{
+		const u32 x = values[i], y = values[(i + 3) % std::size(values)];
+		const u32 z = values[(i + 7) % std::size(values)], w = values[(i + 11) % std::size(values)];
+		SCOPED_TRACE(testing::Message() << x << "/" << y << "/" << z << "/" << w);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VF[1].UL[0] = x;
+		VU1.VF[1].UL[1] = y;
+		VU1.VF[1].UL[2] = z;
+		VU1.VF[1].UL[3] = w;
+		Put(0, 0x2ff, 0x8000077e | (1 << 11));
+		for (u32 pc = 8; pc < 64; pc += 8)
+			Put(pc, 0x800002ff, 0);
+		Compare(1);
+		ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+		Compare(14);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, ErcprEsqrtErsqrtComputeScalarLane)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {
+		0, 0x80000000, 0x00000001, 0x80000001, 0x007fffff, 0x807fffff,
+		0x3f800000, 0xbf800000, 0x40490fdb, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000};
+	// ERCPR/ESQRT/ERSQRT: T3_10/00/01 idx 0x1e, code&0x7ff=0x7be/0x7bc/0x7bd.
+	constexpr u32 opcodes[] = {0x7be, 0x7bc, 0x7bd};
+	constexpr u32 latencies[] = {12, 12, 18};
+	for (u32 op = 0; op < 3; op++)
+		for (u32 fs_bits : values)
+			for (u32 fsf : {0u, 1u, 2u, 3u})
+			{
+				SCOPED_TRACE(testing::Message() << op << "/" << fs_bits << "/" << fsf);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.VF[1].UL[fsf] = fs_bits;
+				Put(0, 0x2ff, 0x80000000 | opcodes[op] | (fsf << 21) | (1 << 11));
+				for (u32 pc = 8; pc < 64; pc += 8)
+					Put(pc, 0x800002ff, 0);
+				Compare(1);
+				ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+				Compare(latencies[op] + 2);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
+TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Mirrors WaitqStallsOnPendingFdivPipeAcrossBudgets, for the EFU pipe: ESADD
+	// then WAITP, sweeping cycle/budget combos. Excludes the same near-u64-wrap
+	// boundary as the FDIV version for the same reason (_vuTestEFUStalls's
+	// sCycle+Cycle addition vs VUPipeline::Retire's cycle-sCycle subtraction).
+	for (u64 cycle : {u64(100), u64(1) << 40})
+		for (u32 budget : {1u, 2u, 4u, 6u, 8u, 10u, 11u, 12u, 20u})
+		{
+			SCOPED_TRACE(testing::Message() << cycle << "/" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = cycle;
+			VU1.VF[1].F[0] = 3.0f;
+			VU1.VF[1].F[1] = 4.0f;
+			Put(0, 0x2ff, 0x8000073c | (1 << 11)); // ESADD VF1
+			Put(8, 0x2ff, 0x800007bf); // WAITP
+			for (u32 pc = 16; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
+TEST_F(VU1RecompilerTest, WaitpExcludedFromPrecomputedSchedule)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Mirrors WaitqExcludedFromPrecomputedSchedule: _vuRegsWAITP also declares
+	// no reads or writes, so it needs the same manual VIwrite(P) tag to stay
+	// off the precomputed schedule / out of deferred regions. Eight filler
+	// pairs push the ESADD/WAITP pair here to i=8/9, past the i>=7 threshold.
+	for (u32 budget : {8u, 9u, 10u, 11u, 14u, 15u, 16u, 20u, 30u})
+	{
+		SCOPED_TRACE(budget);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VF[1].F[0] = 3.0f;
+		VU1.VF[1].F[1] = 4.0f;
+		for (u32 i = 0; i < 8; i++)
+			Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x3f800000);
+		Put(64, 0x2ff, 0x8000073c | (1 << 11)); // ESADD VF1
+		Put(72, 0x2ff, 0x800007bf); // WAITP
+		for (u32 pc = 80; pc < 200; pc += 8)
+			Put(pc, 0x800002ff, 0);
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, IlwrMatchesIlwPipelineTimingWithoutImmediate)
 {
 	const VURegs initial = VU1, initial0 = VU0;

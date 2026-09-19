@@ -1692,3 +1692,103 @@ further keeps chipping at the actual bottleneck even when a single
 instruction's own share is too small to see. A 25-second unmeasured run
 exited cleanly on SIGTERM with no crash. No long-gameplay or x64 runtime
 validation was performed.
+
+
+## EFU, part 1: ESADD, ERSADD, ELENG, ERLENG, ESUM, ERCPR, ESQRT, ERSQRT, WAITP
+
+The EFU pipe is a second single-slot pipe alongside FDIV, structurally
+identical (`_vuTestEFUStalls`/`VUPipeline::Retire`'s EFU branch mirror
+`_vuTestFDIVStalls`/its FDIV branch) but retiring into P instead of Q. Split
+this into two sessions: this one covers the eight instructions that are
+plain arithmetic, deferring EATAN/EATANxy/EATANxz/ESIN/EEXP (all evaluate a
+polynomial approximation, several of them in `double` precision in the
+interpreter before narrowing to `float`) to a follow-up, since bit-matching
+those needs more care than reusing the machinery built here.
+
+Decoding these needed working out the bit layout independently: they're
+`LowerOP_T3_00..11` table entries in `VUops.cpp`, indexed by a combined
+`(table_index << 6) | table_selector` value that happens to already fit the
+existing `code & 0x7ff` switch DIV/SQRT/RSQRT/WAITQ use, just at higher
+constants (0x700-0x7ff) since these ops sit at indices 28-31 in each
+32-entry T3 table rather than DIV/SQRT/RSQRT/WAITQ's index 14.
+
+ESADD/ERSADD/ELENG/ERLENG reduce `fs.x^2+fs.y^2+fs.z^2` left to right (three
+separate `Dup`s to broadcast each lane, matched multiplies, then two
+sequential adds in the interpreter's own associativity) before diverging:
+ESADD stores it directly, ERSADD reciprocates (skipped when zero), ELENG
+takes the square root (skipped when negative or NaN), ERLENG chains both.
+ESUM sums all four lanes the same way. ERCPR/ESQRT/ERSQRT read a single
+`Fs[fsf]` lane directly — unlike the FDIV pipe's SQRT/RSQRT, these do **not**
+take `fabs()` first, so a negative operand skips the square root entirely
+rather than taking the root of its magnitude. None of the eight clamp their
+output at all (no `vuDouble` call on the interpreter's result), which is a
+new dimension of "match the host FPU's raw behavior" not needed by DIV/SQRT/
+RSQRT (whose results always come from `Fdiv`/`Fsqrt` outputs, which are
+already flushed by the hardware or the existing explicit clamp either way).
+
+Two correctness details, found by the differential tests rather than
+guessed up front:
+
+- The `p >= 0` gate before a square root (ELENG/ERLENG/ESQRT/ERSQRT) needs
+  the AArch64 `lt` condition specifically, branching to skip when `lt` is
+  true. `lt` is true for both a real negative operand *and* an unordered
+  (NaN) one, which is exactly the "leave the operand unchanged" case in C —
+  the mirror image of last session's `pl`/`mi` finding for a `< 0` test, but
+  landing on the *same* condition family for the opposite reason.
+- ERCPR divides `1.0` (a `double` literal) in the interpreter, while ERSADD/
+  ERLENG/ERSQRT's otherwise-identical reciprocals all divide `1.0f`. A
+  native single-precision `Fdiv` matched the other three immediately but
+  produced a different bit pattern than ERCPR's actual double-precision
+  division followed by narrowing, caught by `ErcprEsqrtErsqrtComputeScalarLane`
+  failing at the very first denormal input tried. Fixed by widening the
+  operand to double, dividing, and narrowing back, only for ERCPR.
+- `ErcprEsqrtErsqrtComputeScalarLane` failed a second, unrelated way even
+  after that: `ClampInput`'s hardware-FZ shortcut (skip the explicit
+  denormal-to-signed-zero flush when VU1FPCR enables it, since the
+  following arithmetic instruction will flush the input anyway) assumes
+  every clamped value is about to pass through more arithmetic. ERCPR/
+  ESQRT/ERSQRT's "leave the operand unchanged" branch breaks that
+  assumption — nothing touches the value between the clamp and the store,
+  so under hardware FZ a raw denormal operand reached `VU->p` unflushed
+  where the interpreter's `vuDouble()` always flushes it unconditionally.
+  Split `ClampInput` into an always-on `ClampInputAlways` plus a thin
+  FZ-aware wrapper, and used the always-on version for these three ops'
+  scalar read.
+
+WAITP mirrors WAITQ exactly, including needing the same manual
+`VIwrite(P)` tag (`_vuRegsWAITP` has the identical no-reads-no-writes gap
+as `_vuRegsWAITQ`) to stay off the precomputed schedule and out of deferred
+regions, plus the same `retire_queues` treatment inside `EmitEFUStall` so a
+forced cycle advance still drains queue entries it newly makes ready. One
+difference from WAITQ: P has no upper-instruction broadcast source (the
+upper broadcast operand is only ever I or Q), so the same-pair
+emission-order fix WAITQ needed — running the stall ahead of `EmitUpper`
+rather than after — does not apply to WAITP or any EFU-issuing op.
+
+`_vuTestEFUStalls` also decrements the pending entry's own `Cycle` field by
+one before testing readiness, releasing the stall "one cycle before P is
+updated" per the interpreter's own comment; `EmitEFUStall` mutates
+`efu.Cycle` the same way rather than only using a local copy, since every
+EFU-issuing op immediately overwrites it right after anyway (and WAITP
+leaves the entry disabled instead), matching the interpreter's own
+throwaway mutation exactly.
+
+216 of 217 tests pass (12 new); `SpecialFloatsAndChangedFloatingPointOptions`
+remains the one known, pre-existing, unrelated failure.
+
+Serial interleaved runs of the supplied state (frames 120-420):
+
+| Run | VPS | ms/frame |
+| --- | ---: | ---: |
+| old-a | 37.34 | 26.78 |
+| new-a | 36.67 | 27.27 |
+| new-b | 37.05 | 26.99 |
+| old-b | 36.66 | 27.28 |
+
+Two-run means are **37.00 -> 36.86 VPS**, flat within noise — consistent
+with WAITQ's session: these eight ops are presumably a small slice of this
+particular workload's VU1 fallback, so removing their interpreter cost
+doesn't move VPS by an amount distinguishable from run-to-run variance here.
+Visual confirmation only (no VPS measurement harness running) showed correct
+rendering in Saru! Get You! 2. No long-gameplay or x64 runtime validation
+was performed.
