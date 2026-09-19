@@ -159,6 +159,14 @@ or update. Upper/lower destination conflicts still suppress the whole lower
 operation, including its address update. FMAC issue and VI backup retirement
 use the existing shared pipeline machinery, including deferred regions.
 
+CLIP uses NEON signed integer comparisons and a weighted reduction for its six
+XYZ tests, preserving the interpreter's denormal-W threshold and 24-bit history.
+FCAND/FCEQ/FCOR read the retired architectural CLIP flag and write only VI1's low
+halfword. They do not create an arithmetic VI backup. Retirement of CLIP producers
+and reads of architectural flags use the generic path; deferred regions end before
+these observations so pending flag snapshots remain visible at the correct cycle.
+This retains the shared pipeline design rather than adding a separate flag timeline.
+
 ILW reads the low halfword of the final selected component, wraps VU1 data memory,
 and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic

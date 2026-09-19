@@ -110,6 +110,7 @@ namespace
 		Abs,
 		Itof,
 		Ftoi,
+		Clip,
 		Unsupported
 	};
 	struct Upper
@@ -163,6 +164,8 @@ namespace
 			return {Op::Abs};
 		if (sub == 7 && lane == 2)
 			return {Op::Mul, 4, true};
+		if (sub == 7 && lane == 3)
+			return {Op::Clip};
 		if (sub == 8 || sub == 9)
 		{
 			const bool ternary = lane & 1;
@@ -203,6 +206,9 @@ namespace
 		Mfir,
 		Mtir,
 		Ilw,
+		Fcand,
+		Fceq,
+		Fcor,
 		Ibeq,
 		Ibne,
 		Ibgtz,
@@ -220,6 +226,12 @@ namespace
 				return Lower::Sq;
 			case 4:
 				return Lower::Ilw;
+			case 0x10:
+				return Lower::Fceq;
+			case 0x12:
+				return Lower::Fcand;
+			case 0x13:
+				return Lower::Fcor;
 			case 0x28:
 				return Lower::Ibeq;
 			case 0x29:
@@ -457,6 +469,38 @@ namespace
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, fd = (code >> 6) & 31;
 		const u32 mask = (code >> 21) & 15;
 		LoadVector(a, cache, q0, fs);
+		if (op.op == Op::Clip)
+		{
+			// CLIP compares signed bit patterns, including non-finite inputs.
+			// A denormal W uses the largest denormal threshold; FP compares differ.
+			LoadVector(a, cache, q1, ft);
+			a.Umov(w0, v1.V4S(), 3);
+			a.And(w1, w0, 0x7fffffff);
+			a.Mov(w2, 0x007fffff);
+			a.Tst(w0, 0x7f800000);
+			a.Csel(w1, w1, w2, ne);
+			a.Dup(v1.V4S(), w1);
+			a.Movi(v2.V4S(), 0x80000000);
+			a.Eor(v2.V16B(), v0.V16B(), v2.V16B());
+			a.Cmgt(v0.V4S(), v0.V4S(), v1.V4S());
+			a.Cmgt(v2.V4S(), v2.V4S(), v1.V4S());
+			// Pack +X/-X/+Y/-Y/+Z/-Z into the next six history bits.
+			a.Mov(x0, 0x0000000400000001ull);
+			a.Fmov(d3, x0);
+			a.Mov(w0, 16);
+			a.Ins(v3.V4S(), 2, w0);
+			a.And(v0.V16B(), v0.V16B(), v3.V16B());
+			a.Shl(v3.V4S(), v3.V4S(), 1);
+			a.And(v2.V16B(), v2.V16B(), v3.V16B());
+			a.Orr(v0.V16B(), v0.V16B(), v2.V16B());
+			a.Addv(s0, v0.V4S());
+			a.Fmov(w0, s0);
+			a.Ldr(w1, Field(offsetof(VURegs, clipflag)));
+			a.Orr(w0, w0, Operand(w1, LSL, 6));
+			a.And(w0, w0, 0xffffff);
+			a.Str(w0, Field(offsetof(VURegs, clipflag)));
+			return;
+		}
 		if (op.op == Op::Abs || op.op == Op::Itof || op.op == Op::Ftoi)
 		{
 			if (!ft)
@@ -573,6 +617,26 @@ namespace
 		const Lower op = DecodeLower(code);
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, id = (code >> 6) & 15;
 		const u32 is = fs & 15, it = ft & 15, mask = (code >> 21) & 15;
+		if (op == Lower::Fcand || op == Lower::Fceq || op == Lower::Fcor)
+		{
+			// Read the retired flag instance, not the current CLIP accumulator.
+			a.Ldr(w0, Field(VI(REG_CLIP_FLAG)));
+			a.And(w0, w0, 0xffffff);
+			a.Mov(w1, code & 0xffffff);
+			if (op == Lower::Fcand)
+				a.Tst(w0, w1);
+			else if (op == Lower::Fceq)
+				a.Cmp(w0, w1);
+			else
+			{
+				a.Orr(w0, w0, w1);
+				a.Mov(w1, 0xffffff);
+				a.Cmp(w0, w1);
+			}
+			a.Cset(w0, op == Lower::Fcand ? ne : eq);
+			a.Strh(w0, Field(VI(1)));
+			return;
+		}
 		if (op == Lower::Ilw)
 		{
 			if (!it || !mask)
@@ -961,6 +1025,10 @@ namespace
 						plan.retired++;
 					}
 				}
+				// Deferred regions keep retired flags in host registers. Materialize
+				// them before a lower instruction observes architectural flag state.
+				if (ins.lregs.VIread & ((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG)))
+					plan.cycles = 0;
 				block.schedule[i] = plan;
 			}
 			for (u32 j = 0; j < i; j++)

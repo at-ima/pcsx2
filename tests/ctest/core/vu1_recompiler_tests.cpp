@@ -2021,4 +2021,106 @@ TEST_F(VU1RecompilerTest, EqualityBranchLoopsRetainTransfersAcrossBudgetsAndSour
 		}
 }
 
+TEST_F(VU1RecompilerTest, ClipPreservesBitComparisonsAndHistory)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {0, 0x80000000, 1, 0x807fffff, 0x007fffff, 0x00800000,
+		0x3f800000, 0xbf800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc12345, 0xffc12345};
+	for (u32 w : values)
+		for (u32 xyz : values)
+			for (u32 mask : {0u, 1u, 7u, 15u})
+			{
+				SCOPED_TRACE(testing::Message() << w << "/" << xyz << "/" << mask);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.clipflag = 0xfedcba98;
+				VU1.VI[REG_CLIP_FLAG].UL = 0x13579b;
+				VU1.VF[2].UL[0] = xyz;
+				VU1.VF[2].UL[1] = xyz ^ 0x80000000;
+				VU1.VF[2].UL[2] = w;
+				VU1.VF[3].UL[3] = w;
+				for (u32 pc = 0; pc < 80; pc += 8)
+					Put(pc, 0x800001ff | (mask << 21) | (3 << 16) | (2 << 11), 0);
+				CpuArm64VU1.Reserve();
+				Compare(1);
+				ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+				Compare(31);
+				if (HasFatalFailure())
+					return;
+			}
+}
+
+TEST_F(VU1RecompilerTest, ClipTestsObserveRetiredFlagsAcrossNativeRegions)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 op : {0x10u, 0x12u, 0x13u})
+		for (u32 immediate : {0u, 1u, 0x155555u, 0xaaaaaau, 0xffffffu})
+			for (u32 position : {0u, 1u, 3u, 4u, 8u, 17u, 31u})
+			{
+				for (u32 i = 0; i < 64; i++)
+				{
+					const u32 upper = (i % 5 == 0) ? (0x1ff | (3 << 16) | (2 << 11)) : 0x2ff;
+					const u32 lower = i == position ? (op << 25) | immediate : 0x8000033c;
+					Put(i * 8, upper, lower);
+				}
+				for (u32 budget : {1u, 3u, 4u, 8u, 19u, 35u, 80u})
+				{
+					SCOPED_TRACE(testing::Message() << op << "/" << immediate << "/" << position << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.clipflag = 0xabcdef;
+					VU1.VI[REG_CLIP_FLAG].UL = 0xff123456;
+					VU1.VI[1].UL = 0xabcd0123;
+					VU1.VIBackupCycles = 2;
+					VU1.VIRegNumber = 1;
+					VU1.VIOldValue = 42;
+					CpuArm64VU1.Reserve();
+					Compare(budget);
+					ASSERT_GT(CpuArm64VU1.GetCommittedCache(), 0u);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+}
+
+TEST_F(VU1RecompilerTest, ClipHandlesIncomingFlagsAliasesAndCycleWrap)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 fs : {0u, 2u, 3u})
+		for (u32 ft : {0u, 2u, 3u})
+			for (u64 cycle : {u64(100), ~u64(0) - 2})
+				for (u32 budget : {1u, 2u, 4u, 8u, 33u, 90u})
+				{
+					SCOPED_TRACE(testing::Message() << fs << "/" << ft << "/" << cycle << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = cycle;
+					VU1.fmaccount = 3;
+					VU1.fmacreadpos = 3;
+					VU1.fmacwritepos = 2;
+					for (u32 n = 0; n < 3; n++)
+					{
+						auto& pipe = VU1.fmac[(3 + n) & 3];
+						pipe.sCycle = cycle - (2 - n);
+						pipe.Cycle = 4;
+						pipe.regupper = 2;
+						pipe.xyzwupper = 15;
+						pipe.flagreg = 1 << REG_CLIP_FLAG;
+						pipe.clipflag = 0x123456 + n;
+					}
+					for (u32 i = 0; i < 64; i++)
+					{
+						if (i % 7 == 0)
+							Put(i * 8, 0x1ff | (ft << 16) | (fs << 11), 0x8000033c | (15 << 21) | (2 << 16) | (3 << 11));
+						else if (i % 7 == 4)
+							Put(i * 8, 0x2ff, (0x12 << 25) | 0x155555);
+						else
+							Put(i * 8, 0x800002ff, 0);
+					}
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+}
+
 #endif

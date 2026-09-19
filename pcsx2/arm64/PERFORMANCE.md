@@ -1268,3 +1268,75 @@ passed. The supplied outdoor state loaded SPU2/GS, ran for 20 seconds and exited
 with code 0. The existing optional patches.zip warning remains. No visual,
 long-gameplay or x64 runtime validation was performed. Logs:
 `scene-production-{build,ctest,state,state-console}.log`.
+
+
+## Outdoor-state CPU attribution and native CLIP
+
+A fresh five-second CPU-thread sample at `4fcd1d6d5` was partitioned by stack
+ancestry and the runtime EE/VU1 JIT address ranges. Self samples sum to the
+thread's 2,752 samples without negative or unassigned counts:
+
+| CPU-thread category | Samples | Share |
+| --- | ---: | ---: |
+| VU1 native code and pipeline | 1,023 | 37.2% |
+| VU1 interpreter fallback | 552 | 20.1% |
+| VU1 dispatcher/compiler | 205 | 7.4% |
+| VU1 GIF transfer | 12 | 0.4% |
+| IOP | 137 | 5.0% |
+| All remaining EE/VU0/VM work | 823 | 29.9% |
+
+VU1 therefore remains the largest subsystem at approximately **65%**. Temporary
+emitter cursor logging mapped the shared pipeline to VU1 cache offsets
+`0x000–0x714` (scan `0x234`, retirement `0x2a8`, backup `0x5a8`). This code contains
+532 self samples, **19.3% of the CPU thread**: 21 in entry stubs, 166 in hazard
+scanning, 268 in retirement/transfer handling and 77 in backup/finish handling.
+These are sampling estimates, not exact per-instruction timings. The sampling
+run is excluded from speed comparisons. Artifacts:
+`scene-sample-after-transfers.{log,sample.txt}`, its `-partition.json`, and
+`scene-map-pipeline-console.log`.
+
+The change extends the existing native trace with CLIP and FCAND/FCEQ/FCOR,
+reducing fallback breaks without introducing a second pipeline model. As in
+microVU, clipping uses integer comparisons; the ARM64 implementation specifically
+matches the interpreter's denormal-W threshold, non-finite bit patterns and
+24-bit history. NEON compares XYZ against both signs of W and reduces weighted
+bits. Lower flag tests observe the retired CLIP instance. Reads of architectural
+flags terminate deferred regions; CLIP retirement already excludes the ordinary
+scheduled-retirement path. Remaining pipeline handling is deliberately retained.
+
+Three differential tests cover signed zero, denormals, infinities/NaNs, ignored
+CLIP masks, flag-test immediates, upper VI preservation, backup state, pending
+CLIP producers, aliases including VF0, same-pair lower vector writes, cycle wrap,
+and partial budgets through ordinary and deferred regions. Comparisons include
+full registers, queues and VU1 memory. Native allocation checks reject silent
+fallback-only success for the new instructions.
+
+Serial unsampled runs of the supplied state (frames 120–420, identical settings
+and temporary metrics, no concurrent builds/tests) measured:
+
+| Run | VPS | CPU ms/frame | GS ms/frame |
+| --- | ---: | ---: | ---: |
+| old-a | 30.82 | 32.37 | 1.22 |
+| new-a | 33.41 | 29.89 | 1.22 |
+| old-b | 30.61 | 32.70 | 1.27 |
+| new-b | 33.57 | 29.74 | 1.20 |
+
+Two-run means are **30.72 → 33.49 VPS (+9.0%)**, with CPU time
+**32.54 → 29.81 ms/frame**. Artifacts: `scene-clip-{old,new}-{a,b}.log`.
+The previous session's baseline was faster than this session's; only these
+interleaved runs are used for the improvement calculation.
+
+A separate post-change sample contains 2,763 CPU samples: native VU1/pipeline
+1,064, fallback 463, VU1 dispatcher/compiler 252 and VU1 GIF transfer 12.
+VU1 remains approximately **65%**, with fallback's share approximately **17%**.
+This does not imply that native execution slowed down: the sampling shares use
+different total work rates and are not absolute timing comparisons. Unimplemented
+outer products and DIV, plus the shared pipeline and trace boundaries, remain
+candidates. Additional native coverage alone has not removed the management
+cost, and the state remains far below 60 VPS. Artifacts:
+`scene-sample-after-clip.{log,sample.txt}` and its `-partition.json`.
+
+Opening-movie regression check (frames 850–1100): **57.62 → 57.53 VPS (-0.2%)**,
+a single pair rather than a precise regression bound. Logs:
+`diagnostic-clip-{old,new}.log`. Temporary metrics and emitter-offset logging
+were removed before the production build. The installed app was not replaced.
