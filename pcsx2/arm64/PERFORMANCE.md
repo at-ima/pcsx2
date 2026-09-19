@@ -1467,3 +1467,60 @@ The state still runs far below 60 VPS. Remaining large items by measured
 frequency: OPMULA/OPMSUB (blocked, see above), RSQRT (~15.7M), WAITQ (~9.3M),
 IBLTZ/IBGEZ (~11.4M, now implemented alongside DIV in the previous commit).
 No visual, long-gameplay or x64 runtime validation was performed.
+
+## OPMULA/OPMSUB: native implementation and a known cross-block hazard gap
+
+Re-investigated the OPMULA/OPMSUB corruption from the previous session with a
+smaller, targeted reproduction instead of the full game trace. Two findings
+narrowed it considerably:
+
+- The corruption does not depend on OPMSUB's own emitted arithmetic at all:
+  a deliberately-empty body and a deliberately-wrong body (reusing the
+  existing MSUB emission path without the outer-product lane shuffle) produce
+  byte-identical corruption in the same unrelated registers. Disabling
+  deferred-region compilation entirely (`EmitDeferredRegion`) also does not
+  change it. This rules out `StoreMAC`/`StoreVector`, the deferred-region
+  flag-ring (`EmitFmacMetadata`), and the shared retirement code in
+  `VU1Pipeline.cpp` (which only ever writes STATUS/MAC/CLIP, never VF data).
+- Bisecting the `SpecialFloatsAndChangedFloatingPointOptions` failure by
+  budget shows the actual mechanism: OPMSUB's own destination register reads
+  back a transiently wrong value for several pairs after it retires (still
+  within its 4-cycle FMAC latency), then self-corrects once a later,
+  unrelated write reaches the same register. A pair in the *next* compiled
+  block, which reads that register with `dependency == -1` (cross-block,
+  resolved by the generic runtime hazard scan in `VU1Pipeline.cpp` rather
+  than the compile-time `ins.dependency` window), lands inside that
+  transient-wrong window, latches the bad value into its own destination,
+  and nothing rewrites it again before the budget ends. OPMSUB simply
+  happens to be the first opcode that reaches this exact topology (last
+  pair of a block, consumed again a few pairs into the next one); the gap
+  is in the cross-block hazard path, not in OPMULA/OPMSUB's own metadata.
+
+With that separated out, the actual arithmetic was implemented and checked
+against the scalar interpreter (`_vuOPMULA`/`_vuOPMSUB` in
+`pcsx2/VUops.cpp`) term by term: `Fd.x = ACC.x - Fs.y*Ft.z`, `Fd.y = ACC.y -
+Fs.z*Ft.x`, `Fd.z = ACC.z - Fs.x*Ft.y` (OPMULA writes the plain product to
+ACC instead). NEON has no single instruction for this permutation, so both
+Fs and Ft are rotated into place with three `Ins` lane copies each before an
+ordinary `Fmul`/`Fmls`. The destination mask is hardcoded to 0xE — real
+hardware never reads a mask field for these two opcodes, unlike every other
+FMAC instruction — so `StoreMAC` gained an explicit mask-override parameter
+rather than reading `(code >> 21) & 15`.
+
+206 of 207 tests pass. `SpecialFloatsAndChangedFloatingPointOptions` still
+fails on the cross-block hazard gap described above; it was not fixed this
+session; see the notes above for where to continue.
+
+Serial interleaved runs of the supplied state (frames 120-420):
+
+| Run | VPS | ms/frame |
+| --- | ---: | ---: |
+| old-a | 35.01 | 28.56 |
+| new-a | 36.71 | 27.24 |
+| old-b | 35.37 | 28.27 |
+| new-b | 36.55 | 27.36 |
+
+Two-run means are **35.19 -> 36.63 VPS (+4.1%)**, CPU time 28.42 -> 27.30
+ms/frame. A 25-second unmeasured run of the same state exited cleanly on
+SIGTERM with no crash. No visual, long-gameplay or x64 runtime validation
+was performed.

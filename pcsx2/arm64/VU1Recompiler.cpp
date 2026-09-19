@@ -111,6 +111,8 @@ namespace
 		Itof,
 		Ftoi,
 		Clip,
+		Opmula,
+		Opmsub,
 		Unsupported
 	};
 	struct Upper
@@ -135,7 +137,7 @@ namespace
 		{
 			constexpr Op ops[] = {Op::Mul, Op::Max, Op::Mul, Op::Min,
 				Op::Add, Op::Madd, Op::Add, Op::Madd, Op::Sub, Op::Msub, Op::Sub, Op::Msub,
-				Op::Add, Op::Madd, Op::Mul, Op::Max, Op::Sub, Op::Msub, Op::Unsupported, Op::Min};
+				Op::Add, Op::Madd, Op::Mul, Op::Max, Op::Sub, Op::Msub, Op::Opmsub, Op::Min};
 			const int bc = op >= 0x28 ? -1 : (op == 0x1d || op == 0x1f || (op & 2)) ? 4 :
 			                                                                          5;
 			if (op == 0x22 && CHECK_VUADDSUBHACK)
@@ -181,6 +183,8 @@ namespace
 			return {Op::Sub, -1, true};
 		if (sub == 11 && lane == 1)
 			return {Op::Msub, -1, true};
+		if (sub == 11 && lane == 2)
+			return {Op::Opmula, -1, true};
 		if (sub == 11 && lane == 3)
 			return {Op::None};
 		return {};
@@ -440,9 +444,11 @@ namespace
 		}
 	}
 
-	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code)
+	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
 	{
-		const u32 mask = (code >> 21) & 15;
+		// OPMULA/OPMSUB always write xyz regardless of the encoded bits at this
+		// position, which are not a destination mask for those two opcodes.
+		const u32 mask = mask_override >= 0 ? static_cast<u32>(mask_override) : (code >> 21) & 15;
 		const bool flush = EmuConfig.Cpu.VU1FPCR.GetFlushToZero();
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
 		a.Movi(v16.V4S(), 0x7f800000);
@@ -610,6 +616,34 @@ namespace
 			else
 				a.Bsl(v2.V16B(), v4.V16B(), v0.V16B());
 			StoreVector(a, cache, v2, fd, mask);
+			return;
+		}
+		if (op.op == Op::Opmula || op.op == Op::Opmsub)
+		{
+			// Outer product: rotate Fs to yzx and Ft to zxy before multiplying.
+			// The W lane of each shuffled vector is never read (mask is fixed
+			// to xyz), so it is left with whatever the copy produces.
+			a.Mov(v3.V16B(), v0.V16B());
+			a.Ins(v0.V4S(), 0, v3.V4S(), 1);
+			a.Ins(v0.V4S(), 1, v3.V4S(), 2);
+			a.Ins(v0.V4S(), 2, v3.V4S(), 0);
+			a.Mov(v3.V16B(), v1.V16B());
+			a.Ins(v1.V4S(), 0, v3.V4S(), 2);
+			a.Ins(v1.V4S(), 1, v3.V4S(), 0);
+			a.Ins(v1.V4S(), 2, v3.V4S(), 1);
+			ClampInput(a, v0);
+			ClampInput(a, v1);
+			if (op.op == Op::Opmula)
+				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
+			else
+			{
+				LoadVector(a, cache, q2, 32);
+				ClampInput(a, v2);
+				// Match the ARM64 interpreter's contracted multiply/subtract.
+				a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
+				a.Mov(v0.V16B(), v2.V16B());
+			}
+			StoreMAC(a, cache, op, code, 0xE);
 			return;
 		}
 		ClampInput(a, v0);
