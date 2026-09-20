@@ -462,10 +462,18 @@ namespace
 	// being stored; a handful of EFU ops (ERCPR/ESQRT/ERSQRT) can store this
 	// exact value completely unchanged, with no further instruction for
 	// hardware FZ to act on.
+	// v6/v7 hold the overflow clamp bounds (0x7f7fffff / 0xff7fffff), and v24
+	// holds the FP exponent mask (0x7f800000), all for the whole block, loaded
+	// once by EmitBlockConstants at block entry and after any call that may
+	// reach the real _vuXGKICKTransfer (which is free to clobber caller-saved
+	// v0-v7/v16-v31 under the AAPCS64 ABI, unlike our own hand-rolled
+	// VU1Pipeline.cpp stubs, which never touch vector registers at all).
+	// v8-v15 hold the VectorCache and v28-v31 are used by EmitDeferredRegion's
+	// per-slot MAC/status/clip flag cache, so v6/v7/v24 are deliberately
+	// outside both ranges.
 	void ClampInputAlways(MacroAssembler& a, VRegister reg)
 	{
-		a.Movi(v16.V4S(), 0x7f800000);
-		a.And(v17.V16B(), reg.V16B(), v16.V16B());
+		a.And(v17.V16B(), reg.V16B(), v24.V16B());
 		a.Movi(v18.V4S(), 0x80000000);
 		a.And(v18.V16B(), reg.V16B(), v18.V16B());
 		a.Cmeq(v19.V4S(), v17.V4S(), 0);
@@ -475,10 +483,8 @@ namespace
 		{
 			// Signed min clamps positive infinities/NaNs; unsigned min clamps
 			// their negative encodings. Finite values and signed zeros are intact.
-			a.Movi(v16.V4S(), 0x7f7fffff);
-			a.Movi(v17.V4S(), 0xff7fffff);
-			a.Smin(reg.V4S(), reg.V4S(), v16.V4S());
-			a.Umin(reg.V4S(), reg.V4S(), v17.V4S());
+			a.Smin(reg.V4S(), reg.V4S(), v6.V4S());
+			a.Umin(reg.V4S(), reg.V4S(), v7.V4S());
 		}
 	}
 
@@ -490,14 +496,26 @@ namespace
 		{
 			if (CHECK_VU_OVERFLOW(0))
 			{
-				a.Movi(v16.V4S(), 0x7f7fffff);
-				a.Movi(v17.V4S(), 0xff7fffff);
-				a.Smin(reg.V4S(), reg.V4S(), v16.V4S());
-				a.Umin(reg.V4S(), reg.V4S(), v17.V4S());
+				a.Smin(reg.V4S(), reg.V4S(), v6.V4S());
+				a.Umin(reg.V4S(), reg.V4S(), v7.V4S());
 			}
 			return;
 		}
 		ClampInputAlways(a, reg);
+	}
+
+	// Loads the shared per-block constants: the overflow-clamp bounds into
+	// v6/v7 when this block's options actually need them, and the FP
+	// exponent mask into v24 unconditionally (StoreMAC's MAC/status flag
+	// classification always needs it). Call once at block entry, and again
+	// after any Blr that might reach the real _vuXGKICKTransfer C++ function.
+	void EmitBlockConstants(MacroAssembler& a)
+	{
+		a.Movi(v24.V4S(), 0x7f800000);
+		if (!CHECK_VU_OVERFLOW(0) && !CHECK_VU_OVERFLOW(1))
+			return;
+		a.Movi(v6.V4S(), 0x7f7fffff);
+		a.Movi(v7.V4S(), 0xff7fffff);
 	}
 
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
@@ -507,8 +525,8 @@ namespace
 		const u32 mask = mask_override >= 0 ? static_cast<u32>(mask_override) : (code >> 21) & 15;
 		const bool flush = EmuConfig.Cpu.VU1FPCR.GetFlushToZero();
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
-		a.Movi(v16.V4S(), 0x7f800000);
-		a.And(v17.V16B(), v0.V16B(), v16.V16B());
+		// v24 holds the exponent mask for the whole block; see EmitBlockConstants.
+		a.And(v17.V16B(), v0.V16B(), v24.V16B());
 		a.Fcmeq(v18.V4S(), v0.V4S(), 0.0);
 		if (!flush)
 		{
@@ -516,7 +534,7 @@ namespace
 			a.Bic(v19.V16B(), v19.V16B(), v18.V16B()); // underflow
 			a.Orr(v21.V16B(), v18.V16B(), v19.V16B());
 		}
-		a.Cmeq(v20.V4S(), v17.V4S(), v16.V4S()); // overflow
+		a.Cmeq(v20.V4S(), v17.V4S(), v24.V4S()); // overflow
 		// Weight each enabled lane by its architectural MAC bit before the
 		// horizontal sum. The four bit groups do not overlap or carry.
 		const auto weight = [mask](u32 lane) -> u64 { return mask & (8 >> lane); };
@@ -559,10 +577,10 @@ namespace
 		}
 		if (CHECK_VU_OVERFLOW(1))
 		{
-			a.Movi(v22.V4S(), 0x7f7fffff);
-			a.Movi(v23.V4S(), 0xff7fffff);
-			a.Smin(v0.V4S(), v0.V4S(), v22.V4S());
-			a.Umin(v0.V4S(), v0.V4S(), v23.V4S());
+			// v6/v7 hold the clamp bounds for the whole block; see
+			// EmitBlockConstants.
+			a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
+			a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
 		}
 		const u32 fd = (code >> 6) & 31;
 		if (op.acc || fd)
@@ -790,6 +808,7 @@ namespace
 		// interpreter's own per-instruction dispatch order.
 		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.retire_queues));
 		a.Blr(x16);
+		EmitBlockConstants(a);
 		a.Bind(&not_pending);
 	}
 
@@ -836,6 +855,7 @@ namespace
 		a.Str(wzr, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
 		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.retire_queues));
 		a.Blr(x16);
+		EmitBlockConstants(a);
 		a.Bind(&not_pending);
 	}
 
@@ -1510,9 +1530,11 @@ namespace
 			return;
 		// The supported lower instructions either use FMAC or have zero IALU latency.
 		// Emit the same queue entry as _vuClearFMAC + _vuAddUpper/LowerStalls.
-		a.Ldr(w0, Field(offsetof(VURegs, fmacwritepos)));
+		// w12 keeps the original fmacwritepos around so the increment below
+		// doesn't need to reload what x0's address computation already consumed.
+		a.Ldr(w12, Field(offsetof(VURegs, fmacwritepos)));
 		a.Mov(w1, sizeof(fmacPipe));
-		a.Madd(x0, x0, x1, x19);
+		a.Madd(x0, x12, x1, x19);
 		a.Add(x0, x0, offsetof(VURegs, fmac));
 		EmitFmacMetadata(a, ins);
 		a.Str(x26, MemOperand(x0, offsetof(fmacPipe, sCycle)));
@@ -1525,8 +1547,7 @@ namespace
 		a.Ldr(w9, Field(offsetof(VURegs, fmaccount)));
 		a.Add(w9, w9, 1);
 		a.Str(w9, Field(offsetof(VURegs, fmaccount)));
-		a.Ldr(w9, Field(offsetof(VURegs, fmacwritepos)));
-		a.Add(w9, w9, 1);
+		a.Add(w9, w12, 1);
 		a.And(w9, w9, 3);
 		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
 	}
@@ -1540,6 +1561,7 @@ namespace
 		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.flush_kick));
 		a.Blr(x16);
 		a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+		EmitBlockConstants(a);
 		a.Bind(&fresh);
 		// Read VI after flushing, matching the reference lower-op ordering.
 		a.Ldrh(w0, Field(VI((code >> 11) & 15)));
@@ -2098,6 +2120,7 @@ namespace
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Ldr(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+			EmitBlockConstants(a);
 			// Share the most frequent helper address in x22; keep preparation code
 			// outside the emitted instruction stream to avoid instruction-cache growth.
 			const auto& prepare = s_pipeline.prepare;
@@ -2197,6 +2220,7 @@ namespace
 					a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.finish_packet));
 					a.Blr(x16);
 					a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+					EmitBlockConstants(a);
 					// Scheduling was disabled while the packet was pending. Recheck
 					// after the callback; generic preparation rebuilds known timing.
 					if (scheduled)

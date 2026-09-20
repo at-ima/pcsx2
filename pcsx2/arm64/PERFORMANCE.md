@@ -1792,3 +1792,124 @@ doesn't move VPS by an amount distinguishable from run-to-run variance here.
 Visual confirmation only (no VPS measurement harness running) showed correct
 rendering in Saru! Get You! 2. No long-gameplay or x64 runtime validation
 was performed.
+
+## Third, tiny fix: EmitFinish's redundant fmacwritepos reload
+
+`EmitFinish` loaded `fmacwritepos` to compute the queue-slot address, then
+threw that value away and reloaded it from memory a few instructions later
+just to increment and store it back. Kept the original load in `w12`
+(confirmed unused as persistent state anywhere else in this file — only as
+function-local scratch in other, non-overlapping call sites) instead of
+reloading. Saves one `Ldr` per FMAC-pipe pair; too small to measure against
+this session's run-to-run noise, kept because it's free and correct
+(216/217 tests, ~25s stable run of Saru! Get You! 2).
+
+## Wall-clock profiling and the FMAC overflow-clamp hoist
+
+Following the EFU session, a proper wall-clock investigation (rather than
+counting instructions or interpreter fallback calls) was run against the
+same Saru! Get You! 2 state, using temporary, non-committed instrumentation
+(reverted before every commit in this section, per the established
+convention): macOS `sample` for coarse EE-thread stack sampling, then
+direct `std::chrono` wrapping of `Arm64VU1Recompiler::Execute`'s three call
+sites (`Compile`, `block->function`, interpreter `Step`) and of
+`_vuXGKICKTransfer`.
+
+Findings, in order:
+
+- The GS thread is ~96% idle; the EE thread's dominant cost (~41% of
+  samples) is VIF1-unpack/VU1-execution-adjacent code, not EE R5900/VU0
+  macro interpretation (~2%) as originally speculated. This ruled out the
+  EE FPU interpreter as a target and motivated looking at VU1 native
+  execution specifically.
+- A finer breakdown of `Execute`'s three call sites (300 frames, ~40.4M
+  native calls) found: `Compile` 0.3%, `block->function` (native execution)
+  44.4%, interpreter `Step` 1.9%, with `_vuXGKICKTransfer` accounting for
+  only 0.6% (a subset of the native/step time, not additional to it). This
+  ruled out JIT compilation, interpreter fallback, and GIF/XGKICK transfer
+  as the bottleneck; the native execution body itself is the target.
+- Bucketing native calls by VU1 cycles actually executed per call revealed
+  a bimodal distribution, not the single "average ~20 cycles/call" the
+  unbucketed mean suggested: 65.7% of calls execute 5 or fewer cycles
+  (~24ns each, ~15% of total time — largely fixed per-dispatch overhead),
+  while 3.5% of calls execute more than 160 cycles and consume 52% of all
+  native execution time, at ~1553ns/call. The long tail's per-cycle cost
+  (~8-10ns/cycle) is still 2-3x a real VU1 cycle's ~3.4ns, so it is a
+  codegen-quality problem, not something MTVU (which only relocates work to
+  another core) would fix.
+- Disassembling one such block (`armDisassembleAndDumpCode`, gated behind
+  `AsmHelpers.cpp`'s existing `INCLUDE_DISASSEMBLER` macro, temporarily
+  re-enabled) found the long blocks pathologically dense: as much as ~650
+  bytes (~160 instructions) of generated code per source pair. A large
+  share of that was every `ClampInput`/`ClampInputAlways` call and the
+  `StoreMAC` output clamp independently re-materializing the same two
+  overflow-clamp bound vectors (`0x7f7fffff` / `0xff7fffff`) via
+  `Movi`+`Smin`+`Umin` from scratch, up to three times per FMAC-class
+  instruction (once per operand).
+
+The fix hoists those two constants into fixed vector registers (`v6`/`v7`),
+loaded once by a new `EmitOverflowClampConstants` at block entry (guarded
+by `CHECK_VU_OVERFLOW(0) || CHECK_VU_OVERFLOW(1)`, so blocks that don't
+need clamping pay nothing) instead of re-materializing them at every call
+site. `ClampInputAlways`, `ClampInput`, and the `StoreMAC` output clamp now
+just `Smin`/`Umin` against `v6`/`v7` directly.
+
+Register choice needed care: `v8`-`v15` hold the `VectorCache`, and
+`EmitDeferredRegion` already uses `v28`-`v31` as a live per-slot
+MAC/status/clip flag cache for the whole deferred region (confirmed by
+reading that function, which also calls `EmitPair` — so `ClampInput` runs
+concurrently with that cache being live). `v30`/`v31` were the first choice
+and would have silently corrupted that flag cache; `v6`/`v7` are unused
+anywhere else in the file. `v6`/`v7` also need reloading after any call
+that can reach the real `_vuXGKICKTransfer` C++ function — our own
+hand-rolled `VU1Pipeline.cpp` stubs never touch vector registers, but
+`_vuXGKICKTransfer` is a normal compiled function and is free to clobber
+any caller-saved vector register (`v0`-`v7`, `v16`-`v31`) under AAPCS64.
+`EmitOverflowClampConstants` is called again after the `retire_queues`
+Blr in `EmitFDIVStall`/`EmitEFUStall`, after `flush_kick` in `EmitKick`,
+and after `finish_packet` in the main block loop — all rare/slow paths, so
+the extra reload is not on the hot path.
+
+216 of 217 tests pass (same pre-existing unrelated failure). Interleaved
+runs of the same state and frame window (120-420):
+
+| Run | VPS | ms/frame |
+| --- | ---: | ---: |
+| old-a | 24.96 | 40.06 |
+| new-a | 27.27 | 36.66 |
+| new-b | 26.63 | 37.55 |
+| old-b | 23.79 | 42.03 |
+
+Two-run means are **24.38 -> 26.95 VPS, about +10.6%**, a real and
+measurable win from hoisting two constants alone — consistent with the
+disassembly showing clamp-constant materialization as a substantial
+fraction of the ~650-byte/pair long blocks. The remaining gap to real
+hardware (even a 5GHz host core against PS2's ~300MHz VU1 clock should have
+large headroom) is presumably the rest of the per-pair structural cost:
+one `prepare[]` stub call per pair breaking pipelining, and per-pair
+MAC/status/clip flag traffic through the `fmac[]` queue in memory rather
+than registers. Both remain open for a future session; this change did not
+touch either. No long-gameplay or x64 runtime validation was performed.
+
+## Second hoist: StoreMAC's exponent mask
+
+The same disassembly also showed `StoreMAC` (the MAC/status/clip flag
+classifier run after every ADD/SUB/MUL/MADD/MSUB/OPMULA/OPMSUB) rebuilding
+the FP exponent mask (`0x7f800000`) from scratch into `v16` on every call,
+just to `And` it against the result once. `EmitOverflowClampConstants` was
+renamed to `EmitBlockConstants` and extended to also load this mask into
+`v24` unconditionally (StoreMAC's flag classification needs it regardless
+of the overflow-check options, unlike the clamp bounds), and `StoreMAC` and
+`ClampInputAlways`'s matching `0x7f800000` materialization were switched to
+read `v24` directly. `v16` is now completely unused in this file.
+
+This is a much smaller win than the clamp hoist — one `Movi`+`And` collapses
+to one `And` per `StoreMAC` call, versus removing three full `Movi` pairs
+per FMAC-class instruction — and it measured as such: two more interleaved
+runs (frames 120-420, same state) gave 27.24 and 25.73 VPS, mean 26.49,
+statistically indistinguishable from the clamp-hoist-only 26.95 VPS mean
+given the run-to-run spread already observed in this session (~1.2 VPS
+between old-a/old-b). Kept anyway since it's free, safe (216/217 tests,
+same pre-existing failure; stable ~26s run of Saru! Get You! 2), and
+further reduces code size in the same hot path. No long-gameplay or x64
+runtime validation was performed.
