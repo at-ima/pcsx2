@@ -12,7 +12,7 @@ namespace Arm64VU1
 	{
 		MacroAssembler a(code, capacity);
 		PipelineCode result;
-		Label scan, retire, backup, done;
+		Label scan, retire, retire_mid, wrap_zero_w2, backup, done;
 		auto field = [](size_t offset) { return MemOperand(x19, offset); };
 		auto vi = [&](u32 reg) { return field(offsetof(VURegs, VI) + sizeof(REG_VI) * reg); };
 
@@ -27,8 +27,11 @@ namespace Arm64VU1
 				result.prepare[entry] = code + a.GetCursorOffset();
 			if (entry == 6)
 				a.Ldr(w2, MemOperand(x0, offsetof(Instruction, lregs) + offsetof(_VURegsNum, VIread)));
-			else
-				a.Mov(w2, 0);
+			else if (dependency == -1)
+				a.Mov(w2, 0); // Entry 1 always falls through the scan path's real w2 check below.
+			// Entries 0 and 2-5 leave w2 unset here: their common path jumps straight to
+			// retire_mid, which never reads w2, and their rare wrap fallback (wrap_zero_w2)
+			// sets w2=0 itself right before rejoining the scan/retire path that does.
 			a.Ldr(x9, field(offsetof(VURegs, cycle)));
 			a.Mov(w15, w9); // Interpreter truncates cyclesBeforeOp to u32.
 			a.Add(x9, x9, 1);
@@ -48,7 +51,7 @@ namespace Arm64VU1
 				{
 					// Retain the reference scan at the cycle-wrap boundary.
 					a.Cmn(x9, 5);
-					a.B(hs, &scan);
+					a.B(hs, &wrap_zero_w2);
 					if (dependency)
 					{
 						a.Ldr(w10, field(offsetof(VURegs, fmacwritepos)));
@@ -67,9 +70,15 @@ namespace Arm64VU1
 						a.Csel(x9, x9, x11, hs);
 					}
 				}
-				a.B(&retire);
+				a.B(&retire_mid);
 			}
 		}
+
+		// Entries 0 and 2-5's rare cycle-wrap fallback rejoins the scan/full-retire path,
+		// which reads w2 for the integer-branch wait (see emit_retire_queues); those entries
+		// never set w2 on their common path, so it must be zeroed here before falling into scan.
+		a.Bind(&wrap_zero_w2);
+		a.Mov(w2, 0);
 
 		// Inspect incoming FMAC entries, merging the upper/lower lane hazards.
 		a.Bind(&scan);
@@ -116,7 +125,10 @@ namespace Arm64VU1
 		// those must run at most once per pair, so a caller invoking this a
 		// second time for the same pair (see PipelineCode::retire_queues)
 		// must not fall into them again.
-		auto emit_retire_queues = [&]() {
+		// `mid`, when non-null, is bound right after the integer-branch wait block below,
+		// for callers that already know w2==0 and want to skip straight past that dead
+		// check (see retire_mid) instead of paying for the Cbz that always falls through.
+		auto emit_retire_queues = [&](Label* mid = nullptr) {
 			{
 				// Branches wait for matching integer loads after upper FMAC stalls.
 				Label loop, next, end;
@@ -146,6 +158,8 @@ namespace Arm64VU1
 				a.B(ne, &loop);
 				a.Bind(&end);
 			}
+			if (mid)
+				a.Bind(mid);
 			a.Str(x9, field(offsetof(VURegs, cycle)));
 			{
 				Label loop, end, no_clip, normal_flags, store_flags;
@@ -333,7 +347,7 @@ namespace Arm64VU1
 		// Mirror VUPipeline::Retire, including flag writeback order. Architectural
 		// queue contents remain intact for prefix exits and interpreter fallback.
 		a.Bind(&retire);
-		emit_retire_queues();
+		emit_retire_queues(&retire_mid);
 		emit_xgkick(backup);
 		a.Bind(&backup);
 		a.Ldrb(w10, field(offsetof(VURegs, VIBackupCycles)));

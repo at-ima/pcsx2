@@ -1913,3 +1913,100 @@ between old-a/old-b). Kept anyway since it's free, safe (216/217 tests,
 same pre-existing failure; stable ~26s run of Saru! Get You! 2), and
 further reduces code size in the same hot path. No long-gameplay or x64
 runtime validation was performed.
+
+## Skip the dead integer-branch wait check for non-branch entries
+
+A follow-up investigation targeted the remaining per-pair `prepare[]`/
+`branch_prepare` call/retirement overhead noted at the end of the previous
+section: every pair issues one `Blr` into a shared stub, which falls or
+branches into a single `retire` label running `emit_retire_queues()` —
+four back-to-back drain checks (FMAC ring, FDIV pipe, EFU pipe, IALU ring),
+each cheaply short-circuited by its own `Ldr`+`Cbz`, but still paid on every
+pair. This code is shared across every VU1 instruction in every game and
+already caused one real rendering-corruption bug (WAITQ, see above), so the
+approach taken here was deliberately the most conservative option: pure
+dead-code elimination on a path provably always taken the same way, not a
+restructuring of when or how any check runs.
+
+Of the seven entry stubs (six FMAC dependency variants plus the
+integer-branch entry), the first block of `emit_retire_queues` — the
+integer-branch wait — is gated on register `w2`, which the branch entry
+loads from `VIread` but which every one of the other six stubs sets to a
+hardcoded `0` purely to feed that gate. Five of those six (all but the
+entry that always falls into the incoming-FMAC-queue `scan` loop) reach
+`retire` on their common path via a single unconditional branch with no
+other use for `w2` in between, so the `Cbz(w2, &end)` they always take is
+provably dead work on that path: the `Mov(w2, 0)` and the `Cbz` itself.
+
+The fix adds a `retire_mid` label bound right after the integer-branch wait
+block inside `emit_retire_queues` (behind a new optional `Label* mid`
+parameter, so the pre-existing standalone `retire_queues` entry point used
+by `EmitFDIVStall`/`EmitEFUStall` is unaffected) and redirects the four
+entries with a static FMAC producer distance (0, 2, and their two same-cycle-
+wrap-checked neighbors) plus the no-dependency entry to branch straight to
+it, skipping the dead check entirely. The two entries that reach `scan` —
+the general incoming-queue-inspection entry and the branch entry — are
+untouched and still join full `retire`. The rare cycle-wrap fallback taken
+by the four dependency-checked entries (`Cmn`/`B(hs, ...)`) still needs a
+real `w2=0` before falling into `scan`, since that shared path ends at full
+`retire` and reads it; a new `wrap_zero_w2` label sets it there, once, right
+before `scan`, so it costs nothing on any entry's common path.
+
+Net effect: the no-dependency entry drops both the `Mov(w2, 0)` and the
+`Cbz`; the four dependency-checked entries keep the `Mov` (needed for their
+rare wrap fallback) but drop the `Cbz` on their common path. This does not
+change emitted behavior on any path — it removes instructions whose outcome
+was already fixed at compile time — so no new differential test was added;
+217 tests ran (216 passing, the same pre-existing `SpecialFloatsAndChanged
+FloatingPointOptions` failure).
+
+Wall-clock measurement used the same Saru! Get You! 2 (Japan) fastboot/
+frames-850-1100 protocol as the FMAC-hoist session above, with a temporary
+`PCSX2_ARM_PROFILE`-gated `@DIAG@` log line in `PerformanceMetrics::Update`
+(reverted before committing, per the established convention) reporting
+per-interval VPS, internal FPS, and CPU/GS/GPU thread ms/frame. On this
+machine the scene was not CPU-bound at 850-1100 — VPS pinned at the 60 FPS
+limiter on both builds — so CPU-thread ms/frame (not vsync-capped) was
+compared instead. Serial new/old/old/new runs:
+
+| Run | CPU thread ms/frame |
+| --- | ---: |
+| new-a | 16.71 |
+| old-a | 16.66 |
+| old-b | 16.68 |
+| new-b | 16.69 |
+
+Means are old 16.67 -> new 16.70 ms/frame, i.e. flat within run-to-run
+noise and if anything marginally worse, not a measured win. This is
+consistent with the change's small size: it removes at most two
+instructions from a stub that itself is `Blr`'d (not inlined) and dwarfed
+by the surrounding pipeline/arithmetic work. Kept anyway, like the
+SIMD-save-reduction change above, for its provably unchanged behavior and
+reduced code size on the hot path, not as a throughput claim.
+
+A production smoke test loaded the existing SCPS-15025 save state on the
+rebuilt app, ran 19 logged seconds, and shut down cleanly (exit code 0,
+"Add 19 seconds play time to SCPS-15025", no error/abort/exception lines).
+This is a smoke check, not frame-by-frame visual comparison; no screenshot
+or long-gameplay comparison against the pre-change build was performed for
+this specific change, unlike WAITQ, given the change is provably behavior-
+preserving on every path rather than a runtime-semantics change.
+
+Remaining per-pair overhead is untouched here: the `Blr` itself, the two
+entries that still traverse `scan`, and the four retirement drain checks'
+own bodies whenever a queue is non-empty. A combined "anything pending"
+flag across all four pipes was considered and rejected for this session:
+`fmaccount`/`fdiv.enable`/`efu.enable`/`ialucount` are written directly by
+the shared interpreter/x86-compatible structures in many places outside
+this file, so maintaining an incremental combined flag would mean touching
+code paths shared with the interpreter and x64 backend — a much larger
+blast radius than this change's scope justified. Batching multiple pairs'
+retirement was also not attempted, for the same reason WAITQ's own fix was
+delicate: the interpreter's per-instruction dispatch order (`_vuTestLower
+Stalls` before `_vuTestPipes`, before the next instruction's own stall
+logic) is a precise contract that per-pair retirement already mirrors one
+call at a time; batching would need to reprove that ordering across
+multiple pairs at once, which is out of scope for a wall-clock-only
+follow-up. Both remain candidates for a future session with dedicated
+differential-test coverage designed around them first.
+

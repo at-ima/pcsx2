@@ -150,6 +150,11 @@ each scheduled producer distance, and integer-branch VI dependencies. `VU1Pipeli
 and one shared ARM64 retirement body per code-cache generation. It mirrors the
 reference retirement order in `VUPipeline.h`; generated blocks do not each contain
 a copy of the retirement routine. Native retirement omits interpreter trace logs.
+Five of the seven entry stubs always carry a zero integer-branch-wait register
+and join the shared body past that check's dead `Cbz`; the two paths that can
+still reach it with a real (or a rare wrap-fallback) value join earlier. See
+"Skip the dead integer-branch wait check for non-branch entries" in
+`PERFORMANCE.md`.
 
 LQI/SQI and LQD/SQD execute vector transfers and VI address updates natively.
 They wrap data-memory addresses at 16 KiB and VI updates at 16 bits, preserving
