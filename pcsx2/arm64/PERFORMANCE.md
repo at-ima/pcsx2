@@ -2010,3 +2010,141 @@ multiple pairs at once, which is out of scope for a wall-clock-only
 follow-up. Both remain candidates for a future session with dedicated
 differential-test coverage designed around them first.
 
+## COP2 (VU0 macro-mode) no longer ends the native EE block
+
+Follow-up investigation into "why does this run at ~40fps on hardware with
+~20x the PS2's clock" (the user's framing). The honest answer turned out to
+be broader than any single hot function: cost is spread across VU1's
+generated blocks/shared pipeline (see the sections above), EE dispatch, and
+IOP, and this section covers only one concrete, fixable piece of it.
+
+**Profiling methodology correction.** An initial `sample`(1) capture during
+real gameplay (loaded from a save state, not `-fastboot`, to skip the boot/
+FMV time this session's earlier profiling runs spent most of their budget
+on) was read as "sort by top of stack, same collapsed" — a leaf-time table
+merged across every thread in the process. That table showed large samples
+in `vu0Exec`, `_vuTestPipes`, `VU_MAC*_UPDATE`, `COP2_SPECIAL`, and EE
+interpreter fallback functions (`intExecuteBlock`, `doBranch`,
+`R5900::GetCurrentInstruction`), which read as "VU0 interpretation and EE
+interpreter fallback dominate." The user correctly pushed back that a
+process sitting at ~100% CPU across many threads can still be mostly idle
+per-thread waiting on semaphores, and that merged table's top entries were
+in fact kernel wait primitives (`__workq_kernreturn`, `mach_msg2_trap`,
+`__psynch_cvwait`) from *other* threads (GS, audio, worker pool), which
+dilute and can misorder a same-collapsed leaf ranking. Re-reading the same
+capture's per-thread call graph for just `Thread ...: CPU Thread` (the
+actual EE emulation thread) gave a truer picture and is the methodology
+used from here on: always isolate the CPU-bound thread's own subtree
+before ranking self-time, not the whole-process merged table.
+
+**The actual finding.** `pcsx2/arm64/EECodeGenerator.cpp`'s `Supports()`
+had no case for COP2 (VU0 macro-mode: `MFC2`/`CFC2`/`MTC2`/`CTC2` and the
+`VADD`/`VMUL`/`VCALLMS`/... family dispatched through `COP2_SPECIAL`) at
+all. `EERecompiler.cpp`'s `Compile()` stops accumulating a native block at
+the first unsupported instruction, so any EE code that mixes ordinary
+integer/branch work with COP2 — which is exactly how VU0 macro-mode is
+used, interleaved with the surrounding scalar code that sets up its
+operands — dropped out of native compilation entirely at that point, and
+the interpreter took over not just for the COP2 instruction but for
+everything after it until the interpreter's own PC happened to land back
+on a cached native block. `VMManager.cpp` already carries an explicit `//
+TODO(Stenzek): Remove me once EE/VU/IOP recs are added` for VU0/IOP always
+being interpreted on ARM64; this change does not touch that (VU0
+micro-mode programs, dispatched via `CpuVU0->Execute()`, still run fully
+interpreted either way), but it does stop COP2 macro-mode instructions
+from additionally taking the surrounding EE integer/branch code down with
+them.
+
+**The fix, deliberately not a reimplementation.** Given the WAITQ
+precedent and this file's own TODOs ("Fix the flags Proper as they aren't
+handled now", "Add Interlock in QMFC2,QMTC2,CFC2,CTC2" — see
+`pcsx2/VU0.cpp`), reimplementing COP2 macro-mode semantics in ARM64 codegen
+was rejected as out of scope for this change: VU0's pipeline/sync/flag
+behavior here is exactly the kind of delicate, easy-to-get-subtly-wrong
+territory WAITQ warned about, and every COP2 handler
+(`QMFC2`/`CFC2`/`QMTC2`/`CTC2`/`COP2_SPECIAL`) already operates on the
+`cpuRegs`/`VU0` globals with no arguments. `EmitCOP2` in
+`EECodeGenerator.cpp` instead sets `cpuRegs.pc`/`cpuRegs.code` (the same
+`EmitPosition` helper `EmitMemory`/`EmitBranch` already use) and calls the
+exact same interpreter handler via `Blr`, then lets native compilation
+continue with the next instruction instead of ending the block. Zero VU0
+semantics were reimplemented; the only new logic is opcode routing
+(`rs` selects `QMFC2`/`CFC2`/`QMTC2`/`CTC2`, or `COP2_SPECIAL` for
+`rs & 16`) and register bookkeeping around the call. BC2 (`rs == 8`) is
+deliberately left unsupported since it is a branch this codegen does not
+model; it keeps ending the block exactly as before.
+
+**A real bug caught by the differential tests.** This was the first `Blr`
+this file ever emitted (`EmitMemory`/`EmitBranch` never call out). Every
+generated block relies on `lr` still holding its *caller's* return address
+for its own trailing `Ret()` — true as long as the block is a leaf as far
+as the caller is concerned. `Blr` overwrites `lr` with the address right
+after itself, and the very first version of this change didn't save/
+restore it, so the block's own final `Ret()` returned into the middle of
+itself instead of back to `Arm64EE::TryExecute`, producing a tight
+infinite loop between the post-call register-restore code and the block's
+own epilogue — 100% CPU with no forward progress, caught immediately by
+`COP2RegisterTransfersMatchInterpreter` hanging instead of passing.
+Confirmed via `lldb` attach + single-stepping the live JIT code (not
+guesswork). Fixed by saving/restoring `lr` around the `Blr`
+(`Stp(x15, lr, MemOperand(sp, -16, PreIndex))` / matching `Ldp`), the same
+idiom `VU1Pipeline.cpp`'s XGKICK stub calls already use for the same
+reason. `x0` (the `cpuRegisters*` base every field access in this file
+assumes stays live for the whole function) and `x14` (the cached vtlb map
+base, when the block needs it) are also caller-saved and are reloaded
+after the call, since an ordinary AAPCS64 C++ function is free to clobber
+both.
+
+**Tests.** `tests/ctest/core/ee_recompiler_tests.cpp` gained
+`COP2RegisterTransfersMatchInterpreter` (QMFC2/CFC2/QMTC2/CTC2 against the
+reference interpreter, both bit-0 "wait" settings, comparing full `cpuRegs`
+*and* `VU0` state), `COP2MacroArithmeticMatchesInterpreter` (a `COP2_SPECIAL`
+op, `VADD`), `COP2SurroundingIntegerCodeStaysNative` (integer code before
+and after a COP2 instruction in the same block, count=3, to exercise the
+"block keeps compiling past it" behavior specifically), and
+`COP2BranchRemainsInterpreted` (BC2 still rejects and leaves state
+untouched). Full suite: 220/221 (the one failure,
+`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions`, reproduces
+identically with this change stashed out — pre-existing and unrelated).
+
+**Wall-clock measurement.** Interleaved old/new A/B using the SCPS-15025
+save state directly (`-statefile`, skipping `-fastboot`'s boot/FMV time
+entirely — the state loads and starts producing frames in under a second),
+`PCSX2_ARM_PROFILE`-gated `@DIAG@` logging as before (reverted from
+`PerformanceMetrics.cpp` before committing), 35s per run with the first
+~2s discarded as post-load settling, 3 interleaved pairs:
+
+| Pair | old ee_ms | new ee_ms | old vps | new vps |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 22.918 | 22.908 | 43.513 | 43.589 |
+| 2 | 23.983 | 23.579 | 41.649 | 42.362 |
+| 3 | 24.442 | 23.637 | 40.856 | 42.255 |
+
+`new` beat `old` on both ee_ms and vps in all three pairs (mean ee_ms
+23.78 -> 23.37, about 1.7%; mean vps 42.01 -> 42.74, about 1.7%) — small
+but consistent, not noise-dominated like the retire_mid change above. This
+is the expected size of win: COP2_SPECIAL/QMFC2/etc. calls are still full
+interpreter calls (same cost as before) and VU0 micro-mode remains fully
+interpreted regardless; what this change removes is only the tax of the
+*surrounding* EE integer/branch code additionally falling out of native
+compilation every time COP2 appears.
+
+Production smoke test: SCPS-15025 save state, 19.5 logged seconds, clean
+exit (code 0, "Add 19 seconds play time to SCPS-15025", no error/abort/
+exception/assert lines besides the pre-existing benign macOS
+duplicate-Qt-framework `objc[]` warnings this dev environment always
+prints).
+
+**What's still open.** VU0 micro-mode program execution
+(`_vuTestPipes`/`VU_MAC*_UPDATE`/`vu0Exec` and friends) is unaffected by
+this change and, per this session's corrected per-thread profiling, is a
+larger share of the CPU Thread's own time than COP2 dispatch ever was —
+it's simply a separate subsystem (no ARM64 native VU0 recompiler exists;
+`VMManager.cpp`'s `CpuVU0 = &CpuIntVU0;` is unconditional on this
+platform) that this change deliberately did not attempt, given its scope
+is comparable to the entire existing `VU1Recompiler.cpp`/`VU1Pipeline.cpp`
+body of work. IOP is in the same unconditionally-interpreted position.
+Both remain the largest identified opportunities and the natural next
+target, but each is a multi-session undertaking on its own, not a
+follow-up to this change.
+

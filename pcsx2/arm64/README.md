@@ -63,6 +63,18 @@ registers. These non-saturating operations preserve host floating-point status
 and are eligible in native delay slots. Saturating arithmetic, other packed
 operations and floating-point arithmetic remain interpreted.
 
+COP2 (VU0 macro-mode: `QMFC2`/`CFC2`/`QMTC2`/`CTC2` and the `COP2_SPECIAL`
+arithmetic family) no longer ends the native block. `EmitCOP2` sets
+`pc`/`code` and calls the exact interpreter handler via `Blr`, so VU0's own
+pipeline/flag/sync semantics are never reimplemented here; only the
+surrounding integer/branch code stops falling out of native compilation
+alongside it. `lr` must be saved/restored around this call (the block's own
+trailing `Ret()` otherwise returns into itself — see "COP2 (VU0 macro-mode)
+no longer ends the native EE block" in `PERFORMANCE.md`), as must `x0` and
+`x14`, since the handler is an ordinary AAPCS64 function free to clobber
+every caller-saved register. BC2 (rs == 8) is not modeled and still ends the
+block. VU0 micro-mode programs and IOP remain fully interpreted regardless.
+
 Supported integer branches and jumps terminate the block. Their delay slot must
 be a supported, nontrapping integer instruction in the same page and block.
 Taken branches return after executing that slot, with the sequential PC still

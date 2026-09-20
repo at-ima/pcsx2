@@ -3,6 +3,7 @@
 
 #include "Common.h"
 #include "arm64/EECodeGenerator.h"
+#include "R5900OpcodeTables.h"
 #include "vtlb.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
 
@@ -445,6 +446,48 @@ namespace
 		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, code)));
 	}
 
+	// Only the plain register-transfer ops (QMFC2/CFC2/QMTC2/CTC2, selected by
+	// rs) and the "CO" macro-mode arithmetic ops (rs bit 4 set, dispatched by
+	// COP2_SPECIAL exactly as the interpreter's own top-level table does) are
+	// recognized. BC2 (rs == 8) still ends the native block and falls back to
+	// the interpreter, since it is a branch this codegen does not model.
+	bool SupportsCOP2(u32 code)
+	{
+		const u32 rs = (code >> 21) & 31;
+		return rs == 1 || rs == 2 || rs == 5 || rs == 6 || (rs & 16) != 0;
+	}
+
+	// COP2 macro-mode ops are left as plain interpreter calls rather than
+	// reimplemented in native code: their VU0 pipeline/flag/sync semantics
+	// (see the TODOs atop VU0.cpp) are delicate, and every one of them already
+	// operates on cpuRegs/VU0 globals with no arguments, so calling the exact
+	// same, already-validated handler costs one Blr while still letting the
+	// surrounding integer/branch code stay natively compiled instead of the
+	// whole block dropping to the interpreter at the first COP2 instruction.
+	void EmitCOP2(MacroAssembler& a, u32 code, u32 pc)
+	{
+		const u32 rs = (code >> 21) & 31;
+		EmitPosition(a, pc + 4, code);
+		void (*handler)() = (rs & 16) ? &COP2_SPECIAL : rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2;
+		// A generated block is a leaf function as far as its caller is concerned:
+		// its own trailing Ret() relies on lr still holding the return address
+		// TryExecute's call left there. Blr overwrites lr with this call site, so
+		// it must be saved/restored around the call, matching VU1Pipeline.cpp's
+		// stub calls (x15 just keeps sp's mandatory 16-byte alignment here; this
+		// codegen never keeps anything live in it across instructions).
+		a.Stp(x15, lr, MemOperand(sp, -16, PreIndex));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(handler));
+		a.Blr(x16);
+		a.Ldp(x15, lr, MemOperand(sp, 16, PostIndex));
+		// COP2 handlers are ordinary C++ functions under the AAPCS64 ABI and are
+		// free to clobber every caller-saved register; x0 (the cpuRegisters*
+		// base every subsequent field access assumes stays live for the whole
+		// compiled function) and x14 (the vtlb map base, cached once per block
+		// when the block needs it at all) must be restored afterward.
+		a.Mov(x0, reinterpret_cast<uintptr_t>(&cpuRegs));
+		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
+	}
+
 	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding)
 	{
 		using namespace Arm64EE::CodeGenerator;
@@ -629,7 +672,8 @@ namespace
 
 bool Arm64EE::CodeGenerator::Supports(u32 code)
 {
-	return SupportsInteger(code) || MemorySize(code) != 0 || IsBranch(code);
+	return SupportsInteger(code) || MemorySize(code) != 0 || IsBranch(code) ||
+	       ((code >> 26) == 18 && SupportsCOP2(code));
 }
 
 bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 code)
@@ -652,6 +696,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		}
 		if (MemorySize(words[i]))
 			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
+		else if ((words[i] >> 26) == 18)
+			EmitCOP2(a, words[i], pc + i * 4);
 		else
 			Emit(a, words[i]);
 	}

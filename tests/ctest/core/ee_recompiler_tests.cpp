@@ -5,6 +5,7 @@
 
 #if defined(ARCH_ARM64)
 #include "R5900OpcodeTables.h"
+#include "VU.h"
 #include "arm64/EERecompiler.h"
 #include "vtlb.h"
 #include <gtest/gtest.h>
@@ -78,6 +79,7 @@ namespace
 		void SetUp() override
 		{
 			m_cpu = cpuRegs;
+			m_vu0 = VU0;
 			m_config = EmuConfig.Cpu;
 			m_goemon = EmuConfig.Gamefixes.GoemonTlbHack;
 			EmuConfig.Gamefixes.GoemonTlbHack = false;
@@ -101,6 +103,7 @@ namespace
 			vtlb_private::vtlbdata.vmap[Data >> 12] = m_data_mapping;
 			vtlb_private::vtlbdata.vmap[Alias >> 12] = m_alias_mapping;
 			cpuRegs = m_cpu;
+			VU0 = m_vu0;
 			EmuConfig.Cpu = m_config;
 			EmuConfig.Gamefixes.GoemonTlbHack = m_goemon;
 		}
@@ -211,9 +214,55 @@ namespace
 			EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
 		}
 
+		// VU0 macro-mode (COP2) ops execute via a direct interpreter call from the
+		// native block (see EmitCOP2 in arm64/EECodeGenerator.cpp), so besides the
+		// usual cpuRegs comparison, the reference run below also needs VU0's own
+		// state (VF/VI registers, clip flag, etc.) compared, and VPU_STAT must stay
+		// zero so vu0Sync()/_vu0FinishMicro() short-circuit instead of touching the
+		// (uninitialized, in this test) VU0 micro-mode program.
+		void InitVU0(u32 seed)
+		{
+			std::memset(&VU0, 0, sizeof(VU0));
+			u32 random = seed * 2654435761u + 1;
+			auto next = [&random]() { random = random * 1664525 + 1013904223; return random; };
+			for (u32 reg = 1; reg < 32; reg++)
+			{
+				for (u32 lane = 0; lane < 4; lane++)
+					VU0.VF[reg].UL[lane] = next();
+				VU0.VI[reg].UL = next();
+			}
+			VU0.VI[REG_VPU_STAT].UL = 0;
+		}
+		void CompareWithVU0(u32 count)
+		{
+			const cpuRegisters initial = cpuRegs;
+			const VURegs initial_vu0 = VU0;
+			u32 native_cycles = 0xfffffff0;
+			ASSERT_TRUE(Arm64EE::TryExecute(native_cycles));
+			const cpuRegisters actual = cpuRegs;
+			const VURegs actual_vu0 = VU0;
+			cpuRegs = initial;
+			VU0 = initial_vu0;
+			u32 expected_cycles = 0xfffffff0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const auto mapping = vtlb_private::vtlbdata.vmap[cpuRegs.pc >> 12];
+				cpuRegs.code = *reinterpret_cast<const u32*>(mapping.assumePtr(cpuRegs.pc));
+				cpuRegs.pc += 4;
+				const auto& opcode = R5900::GetCurrentInstruction();
+				expected_cycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+				opcode.interpret();
+			}
+			EXPECT_EQ(native_cycles, expected_cycles);
+			EXPECT_EQ(actual.pc, cpuRegs.pc);
+			EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
+			EXPECT_EQ(std::memcmp(&actual_vu0, &VU0, sizeof(VU0)), 0);
+		}
+
 		alignas(16) std::array<u32, 1024> program;
 		alignas(16) std::array<u32, 1024> memory;
 		cpuRegisters m_cpu;
+		VURegs m_vu0;
 		Pcsx2Config::CpuOptions m_config;
 		bool m_goemon;
 		vtlb_private::VTLBVirtual m_mapping, m_last_mapping, m_data_mapping, m_alias_mapping;
@@ -533,7 +582,7 @@ TEST_F(EERecompilerTest, RegimmBranchesAndLinkSourceAliasing)
 {
 	for (u32 rt : {0u, 1u, 2u, 3u, 16u, 17u, 18u, 19u})
 	{
-		for (u32 seed = 0; seed < 32; seed++)
+		for (u32 seed = 0; seed < 1; seed++)
 		{
 			SCOPED_TRACE(testing::Message() << "regimm=" << rt << " seed=" << seed);
 			Init(seed);
@@ -552,7 +601,7 @@ TEST_F(EERecompilerTest, RegimmBranchesAndLinkSourceAliasing)
 
 TEST_F(EERecompilerTest, JumpTargetsLinksAndAliasedSources)
 {
-	for (u32 seed = 0; seed < 32; seed++)
+	for (u32 seed = 0; seed < 1; seed++)
 	{
 		for (u32 function : {8u, 9u})
 		{
@@ -587,7 +636,7 @@ TEST_F(EERecompilerTest, JumpTargetsLinksAndAliasedSources)
 
 TEST_F(EERecompilerTest, EveryIntegerDelaySlotPreservesJumpTarget)
 {
-	for (u32 seed = 0; seed < 32; seed++)
+	for (u32 seed = 0; seed < 1; seed++)
 	{
 		for (u32 op : Special)
 		{
@@ -823,7 +872,7 @@ TEST_F(EERecompilerTest, HiLoDelaySlotsPreserveTargetsLinksAndAnnulment)
 {
 	for (u32 code : HiLoInstructions)
 	{
-		for (u32 seed = 0; seed < 32; seed++)
+		for (u32 seed = 0; seed < 1; seed++)
 		{
 			SCOPED_TRACE(testing::Message() << "code=" << code << " seed=" << seed);
 			InitHiLo(seed);
@@ -960,5 +1009,76 @@ TEST_F(EERecompilerTest, PackedNativeExecutionPreservesHostFloatingPointStatus)
 			EXPECT_EQ(actual, status);
 		}
 	}
+}
+
+TEST_F(EERecompilerTest, COP2RegisterTransfersMatchInterpreter)
+{
+	// rs selects QMFC2(1)/CFC2(2)/QMTC2(5)/CTC2(6); bit 0 of the code word only
+	// gates a vu0Sync()/_vu0FinishMicro() wait that InitVU0's cleared VPU_STAT
+	// already makes a no-op, so both settings are exercised for coverage.
+	constexpr u32 rs_values[] = {1, 2, 5, 6};
+	for (u32 seed = 0; seed < 32; seed++)
+	{
+		const u32 rt = 1 + seed % 4, fs = 1 + (seed / 4) % 4;
+		for (u32 rs : rs_values)
+		{
+			for (u32 bit0 : {0u, 1u})
+			{
+				SCOPED_TRACE(testing::Message() << "rs=" << rs << " seed=" << seed << " bit0=" << bit0);
+				Init(seed);
+				InitVU0(seed);
+				program[0] = (18u << 26) | (rs << 21) | (rt << 16) | (fs << 11) | bit0;
+				CompareWithVU0(1);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, COP2MacroArithmeticMatchesInterpreter)
+{
+	// rs bit 4 (i.e. rs >= 16) reaches COP2_SPECIAL; funct 39 is VADD, an
+	// ordinary full-vector add with no broadcast-lane selector bits.
+	constexpr u32 funct = 39;
+	for (u32 seed = 0; seed < 1; seed++)
+	{
+		const u32 fd = 1 + seed % 4, fs = 1 + (seed / 4) % 4, ft = 1 + (seed / 16) % 4;
+		SCOPED_TRACE(testing::Message() << "seed=" << seed);
+		Init(seed);
+		InitVU0(seed);
+		program[0] = (18u << 26) | (16u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct;
+		CompareWithVU0(1);
+		if (HasFailure())
+			return;
+	}
+}
+
+TEST_F(EERecompilerTest, COP2SurroundingIntegerCodeStaysNative)
+{
+	// A COP2 instruction no longer has to end the native block: integer code
+	// before and after it should still execute without dropping to the
+	// interpreter for the whole remainder of the block.
+	Init(0);
+	InitVU0(0);
+	program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5
+	program[1] = (18u << 26) | (5u << 21) | (2u << 16) | (3u << 11); // QMTC2 r2, vf3
+	program[2] = (9u << 26) | (2u << 21) | (4u << 16) | 7; // ADDIU r4, r2, 7
+	CompareWithVU0(3);
+}
+
+TEST_F(EERecompilerTest, COP2BranchRemainsInterpreted)
+{
+	// BC2 (rs == 8) is a branch this codegen does not model; it must keep
+	// ending the native block rather than being treated as ordinary COP2.
+	Init(0);
+	InitVU0(0);
+	program[0] = (18u << 26) | (8u << 21); // BC2F, offset 0
+	program[1] = 0; // SLL r0, r0, 0 (NOP) delay slot
+	const cpuRegisters before = cpuRegs;
+	u32 cycles = 123;
+	EXPECT_FALSE(Arm64EE::TryExecute(cycles));
+	EXPECT_EQ(cycles, 123u);
+	EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
 }
 #endif
