@@ -1056,6 +1056,8 @@ set(pcsx2arm64Sources
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
+	arm64/VU0Recompiler.cpp
+	arm64/VU0Pipeline.cpp
 	arm64/VU1Recompiler.cpp
 	arm64/VU1Pipeline.cpp
 	arm64/EERecompiler.cpp
@@ -1064,6 +1066,8 @@ set(pcsx2arm64Sources
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
+	arm64/VU0Recompiler.h
+	arm64/VU0Pipeline.h
 	arm64/VU1Recompiler.h
 	arm64/VU1Pipeline.h
 	arm64/EERecompiler.h
