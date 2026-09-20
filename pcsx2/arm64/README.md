@@ -275,10 +275,16 @@ through its private ABI. Actual XGKICK transfers publish the cache, call the
 original C++ transfer routine, then reload it; this also handles AAPCS64's
 caller-clobbered upper vector halves. Credit-only XGKICK ticks stay native.
 
-This does not enable MTVU or adopt microVU's separate execution and synchronization
-protocol. ARM64's current fallback still updates EE/VIF state and interrupts
-synchronously. Moving it to the MTVU worker requires an explicit completion and
-interrupt handoff, not just enabling the thread setting.
+MTVU (`THREAD_VU1`) is enabled, without adopting microVU's timing model
+(`REC_VU1` stays off). As this section previously anticipated, the thread setting
+alone was not enough: an explicit completion and interrupt handoff was required.
+Unlike microVU, this backend delegates control flow to the shared VU1 interpreter,
+which had no MTVU handling because that combination is unreachable on x64. On the
+MTVU thread it therefore touched EE-owned state (VPU_STAT, FBRST, `vif1Regs`,
+`cpuRegs.cycle`, INTC). Those sites now use the `VUFLAG_MTVURUNNING` VU1-local run
+flag and report E/T bits through `mtvuInterrupts`, matching `mVUEBit`/`mVUTBit`.
+See "MTVU (THREAD_VU1) on the ARM64 backend" in PERFORMANCE.md. Only one game has
+been exercised so far; this needs proper testing across games.
 
 Arithmetic input clamping uses signed/unsigned NEON min operations to clamp both
 signs of infinity/NaN. When VU1's FPCR flushes denormals, arithmetic supplies the

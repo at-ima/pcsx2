@@ -1846,11 +1846,16 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 		VU1.xgkickendpacket = size != 0;
 		VU1.xgkickcyclecount = 0;
 		VU1.xgkickenable = false;
-		VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
-		if (vif1Regs.stat.VGW)
+		// VPU_STAT's VGW bit and the VIF1 stall release are EE-thread state; under
+		// MTVU the EE never observed the GIF as busy for this packet to begin with.
+		if (!THREAD_VU1)
 		{
-			vif1Regs.stat.VGW = false;
-			CPU_INT(DMAC_VIF1, 8);
+			VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
+			if (vif1Regs.stat.VGW)
+			{
+				vif1Regs.stat.VGW = false;
+				CPU_INT(DMAC_VIF1, 8);
+			}
 		}
 		_vuTestPipes(&VU1);
 		return;
@@ -1908,8 +1913,7 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 		//{
 			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize * 0x10, true);
 		//}
-
-		if ((VU0.VI[REG_VPU_STAT].UL & 0x100) && flush)
+		if ((THREAD_VU1 ? (VU1.flags & VUFLAG_MTVURUNNING) != 0 : (VU0.VI[REG_VPU_STAT].UL & 0x100) != 0) && flush)
 			VU1.cycle += transfersize * 2;
 
 		VU1.xgkickcyclecount -= transfersize * 2;
@@ -1924,12 +1928,15 @@ void _vuXGKICKTransfer(s32 cycles, bool flush)
 		{
 			VUM_LOG("XGKICK transfer finished");
 			VU1.xgkickenable = false;
-			VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
-			// Check if VIF is waiting for the GIF to not be busy
-			if (vif1Regs.stat.VGW)
+			if (!THREAD_VU1)
 			{
-				vif1Regs.stat.VGW = false;
-				CPU_INT(DMAC_VIF1, 8);
+				VU0.VI[REG_VPU_STAT].UL &= ~(1 << 12);
+				// Check if VIF is waiting for the GIF to not be busy
+				if (vif1Regs.stat.VGW)
+				{
+					vif1Regs.stat.VGW = false;
+					CPU_INT(DMAC_VIF1, 8);
+				}
 			}
 		}
 	}
@@ -1962,7 +1969,8 @@ static __ri void _vuXGKICK(VURegs* VU)
 	// XGKick command counts as one cycle for the transfer.
 	// Can be tested with Resident Evil: Outbreak, Kingdom Hearts, CART Fury.
 	VU->xgkickcyclecount = 1;
-	VU0.VI[REG_VPU_STAT].UL |= (1 << 12);
+	if (!(VU == &VU1 && THREAD_VU1))
+		VU0.VI[REG_VPU_STAT].UL |= (1 << 12);
 	VUM_LOG("XGKICK addr %x", addr);
 }
 

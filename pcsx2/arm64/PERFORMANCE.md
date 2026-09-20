@@ -2148,3 +2148,72 @@ Both remain the largest identified opportunities and the natural next
 target, but each is a multi-session undertaking on its own, not a
 follow-up to this change.
 
+## MTVU (THREAD_VU1) on the ARM64 backend
+
+`THREAD_VU1` is now enabled on ARM64. It is independent of `REC_VU1`
+(which selects microVU's timing model and stays off here): it only moves
+VU1 microprogram execution onto the MTVU thread, which the polymorphic
+`BaseVUmicroCPU` interface already supports.
+
+**Why the first two attempts broke rendering.** Flipping the macro alone
+looked correct in every batch check but destroyed rendering in live play
+(attempt 1: screen mostly black with only additive/glow elements; attempt
+2, after a wrong "fix" that set the VPU_STAT busy bit from the VU1 thread:
+the picture froze on the first frame and never updated).
+
+The reason is structural. microVU is a self-contained VU1 provider and
+carries MTVU-awareness in ~25 `THREAD_VU1` sites of its own. The ARM64
+provider is instead a *hybrid*: it JITs instruction pairs but delegates
+control flow — branches, E/D/T bits, unsupported ops — to the shared VU1
+interpreter. That interpreter has no MTVU handling at all, because on x64
+the combination is unreachable: `THREAD_VU1` implies `REC_VU1`, which
+implies `CpuVU1 == &CpuMicroVU1`, so the interpreter never runs under
+MTVU there. ARM64 is the first configuration to enter it.
+
+Running on the MTVU thread, that shared code read and wrote state the EE
+thread owns: `VU0.VI[REG_VPU_STAT]`, `VU0.VI[REG_FBRST]`, `vif1Regs`,
+`cpuRegs.cycle`, and `CPU_INT`/`hwIntcIrq`. Attempt 2's frozen frame was a
+direct consequence — setting the VPU_STAT busy bit from the VU1 thread
+kept the EE thread from ever observing it clear, so `Vif1_Dma.cpp` stalled
+VIF1 permanently and no new data reached the GS.
+
+**What was changed.** The MTVU-thread paths now follow what microVU does:
+
+- `VUFLAG_MTVURUNNING` (`VU.h`), a VU1-local run flag set by the MTVU
+  dispatcher, replaces the EE-owned VPU_STAT busy bit as the run gate in
+  `Arm64VU1Recompiler::Execute()` and in `_vuXGKICKTransfer`.
+- The interpreter's E-bit posts `InterruptFlagVUEBit` and the T-bit posts
+  `InterruptFlagVUTBit` instead of writing VPU_STAT / raising INTC, and
+  D/T-bit tests read the `vu1Thread.vuFBRST` ring-buffer snapshot.
+- VGW maintenance, the VIF1 stall release, `nextBlockCycles` and the
+  JIT-emitted VPU_STAT write are skipped under MTVU; `nextBlockCycles` in
+  particular pairs `VU1.cycle` with the EE clock, and MTVU resets
+  `VU1.cycle` to 0 per run.
+- `THREAD_VU1` joins the recompiler options hash so blocks are
+  invalidated when the mode changes.
+
+x64 behaviour is unchanged: every new branch is unreachable there.
+
+**Measured** (SCPS-15025 save state, 40 s batch, Saru! Get You! 2):
+
+| | MTVU off | MTVU on |
+|---|---|---|
+| ee_ms | 23.36 | 10.42 |
+| vps | 42.71 | 59.94 |
+
+A 120 s soak held 59.8 vps with no errors. Live interactive play was
+confirmed correct by hand — the mandatory gate here, since batch runs
+passed during both earlier broken attempts.
+
+**A batch check that actually discriminates.** Temporary instrumentation
+counted XGKICK packets and frames. GS packets *per frame* came out at
+1920.0 in both modes, i.e. identical GS work per frame; during the broken
+attempts VU1 had executed zero cycles. Per-frame GS packet rate is a far
+better automated signal here than fps or absence of crashes, both of which
+looked healthy while rendering was destroyed.
+
+**Still open.** Only one game has been exercised. The whole-packet XGKICK
+path and the shared incremental path (left MTVU-unaware on purpose by
+upstream, per the PATH3-masking comment in `_vuXGKICKTransfer`) both need
+proper testing across games, as does T-bit behaviour, which this title
+does not appear to exercise.

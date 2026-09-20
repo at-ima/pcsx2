@@ -77,6 +77,10 @@ struct REG_VI
 //#define VUFLAG_BREAKONMFLAG		0x00000001
 #define VUFLAG_MFLAGSET 0x00000002
 #define VUFLAG_INTCINTERRUPT 0x00000004
+// Set by the MTVU thread around a VU1 microprogram run. Under MTVU the EE thread
+// owns VU0.VI[REG_VPU_STAT], so a VU1 provider that runs on the MTVU thread cannot
+// use its 0x100 "busy" bit as a run gate. This VU1-local flag replaces it.
+#define VUFLAG_MTVURUNNING 0x00000008
 struct fdivPipe
 {
 	int enable;

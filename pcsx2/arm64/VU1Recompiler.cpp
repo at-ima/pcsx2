@@ -84,7 +84,8 @@ namespace
 	{
 		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (CHECK_VU_OVERFLOW(1) ? 2 : 0) | (CHECK_VUADDSUBHACK ? 4 : 0) |
 		       (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero() ? 8 : 0) |
-		       (CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? 16 : 0);
+		       (CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? 16 : 0) |
+		       (THREAD_VU1 ? 32 : 0);
 	}
 
 	void InvalidateAll()
@@ -1576,10 +1577,14 @@ namespace
 		StoreWord(a, 0, offsetof(VURegs, xgkickendpacket));
 		StoreWord(a, 1, offsetof(VURegs, xgkickcyclecount));
 		a.Str(x26, Field(offsetof(VURegs, xgkicklastcycle)));
-		a.Mov(x0, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
-		a.Ldr(w9, MemOperand(x0));
-		a.Orr(w9, w9, 1 << 12);
-		a.Str(w9, MemOperand(x0));
+		// VPU_STAT's VGW bit is EE-thread state; the MTVU thread must not write it.
+		if (!THREAD_VU1)
+		{
+			a.Mov(x0, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+			a.Ldr(w9, MemOperand(x0));
+			a.Orr(w9, w9, 1 << 12);
+			a.Str(w9, MemOperand(x0));
+		}
 	}
 
 	void EmitIntegerIssue(MacroAssembler& a, const Instruction& ins)
@@ -2384,11 +2389,16 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 	if (s_options != Options())
 		InvalidateAll();
 	const FPControlRegisterBackup fpcr(EmuConfig.Cpu.VU1FPCR);
+	// Under MTVU this runs on the VU1 thread, where VU0.VI[REG_VPU_STAT] belongs to
+	// the EE thread. Reading its busy bit here raced with the EE clearing it, and
+	// writing it corrupted the EE's VIF1 stall handling. Use the VU1-local flag the
+	// MTVU dispatcher sets instead; the interpreter clears it at the E-bit.
+	const bool mtvu = THREAD_VU1;
 	VU1.VI[REG_TPC].UL <<= 3;
 	const u64 start = VU1.cycle;
 	while (VU1.cycle - start < cycles)
 	{
-		if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
+		if (!(mtvu ? (VU1.flags & VUFLAG_MTVURUNNING) : (VU0.VI[REG_VPU_STAT].UL & 0x100)))
 		{
 			if (VU1.branch == 1)
 			{
@@ -2421,5 +2431,9 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			Step();
 	}
 	VU1.VI[REG_TPC].UL >>= 3;
-	VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;
+	// nextBlockCycles pairs VU1.cycle with the EE clock for the synchronous path.
+	// Under MTVU neither operand is valid here: MTVU resets VU1.cycle to 0 per run,
+	// and cpuRegs.cycle is owned by the EE thread.
+	if (!mtvu)
+		VU1.nextBlockCycles = (VU1.cycle - cpuRegs.cycle) + 1;
 }

@@ -150,7 +150,13 @@ void VU_Thread::ExecuteRingBuffer()
 					if (addr != -1)
 						VU1.VI[REG_TPC].UL = addr & 0x7FF;
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
+					// VU1-local "running" state for providers that need a run gate.
+					// microVU tracks this implicitly in its generated code; the ARM64
+					// provider drives an explicit loop and reads this instead of the
+					// EE-owned VU0.VI[REG_VPU_STAT] busy bit. Cleared at the E-bit.
+					VU1.flags |= VUFLAG_MTVURUNNING;
 					CpuVU1->Execute(vu1RunCycles);
+					VU1.flags &= ~VUFLAG_MTVURUNNING;
 					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
 					semaXGkick.Post(); // Tell MTGS a path1 packet is complete
 					vuCycles[vuCycleIdx].store(VU1.cycle, std::memory_order_release);
