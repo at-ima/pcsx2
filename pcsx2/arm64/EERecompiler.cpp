@@ -56,7 +56,7 @@ namespace
 
 	// Allocation and compilation are cold. Keep their register/stack requirements
 	// out of the dispatcher that runs for every cached block.
-	__noinline Block& Compile(u32 pc, const u32* source)
+	__noinline Block& Compile(u32 pc, const u32* source, vtlb_ProtectionMode page_type, bool tracked)
 	{
 		Block& block = s_blocks[pc];
 		block = {};
@@ -84,6 +84,16 @@ namespace
 			std::copy_n(source, block.word_count, block.words.data());
 			return block;
 		}
+		// None and Write both mean "not currently known to self-modify": write-protect
+		// the page so TryExecute can trust the cache without a memcmp on every entry.
+		// Manual pages already faulted at least once; leave them alone; re-protecting
+		// on every recompile would just re-fault immediately (see the vtlb.cpp comment
+		// on ProtMode_Manual). NotRequired (non-RAM, e.g. BIOS ROM) needs no protection:
+		// mmap_MarkCountedRamPage() has no bounds check against non-RAM pointers.
+		// Never mark when untracked: pc's physical mapping doesn't correspond to
+		// source, so mmap_MarkCountedRamPage() would protect an unrelated page.
+		if (tracked && (page_type == ProtMode_None || page_type == ProtMode_Write))
+			mmap_MarkCountedRamPage(pc);
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
 			pc, source, std::span(block.words.data(), block.word_count));
@@ -142,9 +152,25 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		block = it != s_blocks.end() ? &it->second : nullptr;
 		lookup = {pc, 0, block, nullptr};
 	}
-	// Recheck the virtual mapping and all source words on every entry. This also
-	// covers self-modifying code, DMA, TLB changes and state loads without Clear().
-	if (!block || block->source != source || std::memcmp(source, block->words.data(), block->word_count * 4) != 0)
+	// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
+	// separate *physical* (pmap) mapping, not the vmap lookup that produced
+	// source above; they normally agree for real PS2 RAM, but nothing
+	// guarantees it (e.g. a vmap override onto host memory pmap knows nothing
+	// about -- exactly what the recompiler unit tests do to inject synthetic
+	// code buffers). Only trust write-protection tracking when the two
+	// mappings actually resolve to the same byte, so a mismatch just falls
+	// back to the always-safe per-entry memcmp below instead of silently
+	// tracking -- or protecting -- the wrong page.
+	const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
+	const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
+	// Write-protected (unchanged since compile) and non-RAM pages need no
+	// per-entry recheck; ClearProvider() drops any block a protection fault
+	// invalidates. None (never protected, or untracked) and Manual (faulted
+	// at least once, vtlb.cpp's permanent brute-force fallback) still need
+	// it every entry.
+	const bool trust_cache = page_type == ProtMode_Write || page_type == ProtMode_NotRequired;
+	if (!block || block->source != source ||
+		(!trust_cache && std::memcmp(source, block->words.data(), block->word_count * 4) != 0))
 	{
 		// Validated cache hits need no opcode decoding. Avoid allocating entries
 		// for unsupported entry instructions on the interpreter fallback path.
@@ -153,7 +179,7 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 			lookup = {pc, source[0], nullptr, source};
 			return {};
 		}
-		block = &Compile(pc, source);
+		block = &Compile(pc, source, page_type, tracked);
 		lookup = {pc, 0, block, nullptr};
 	}
 	if (!block->function)
@@ -188,7 +214,15 @@ namespace
 	}
 	void ClearProvider(u32, u32)
 	{
-		// Blocks validate source bytes and the virtual mapping at every entry.
+		// Called for a write to a write-protected page (via vtlb.cpp's page fault
+		// handler, now that Compile() calls mmap_MarkCountedRamPage) or a TLB
+		// remap. Both are rare next to block execution, so unconditionally
+		// dropping every cached block is simpler -- and safer -- than working out
+		// which ones the given range actually overlaps. s_write is left alone;
+		// its space is reclaimed the same way an ordinary memcmp-miss recompile
+		// already leaks it, on the next Reset().
+		s_lookup.fill({});
+		decltype(s_blocks){}.swap(s_blocks);
 	}
 } // namespace
 
