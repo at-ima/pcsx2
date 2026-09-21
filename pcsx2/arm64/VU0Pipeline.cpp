@@ -115,9 +115,13 @@ namespace Arm64VU0
 			a.B(ne, &loop);
 		}
 
-		// Drains FMAC/IALU entries ready at cycle x9, then retires VIBackupCycles.
-		// No FDIV/EFU/XGKICK handling: VU0Recompiler.cpp does not yet compile any
-		// pair that touches those (see its Compile()).
+		// Drains FMAC/FDIV/EFU/IALU entries ready at cycle x9, then retires
+		// VIBackupCycles, in VUPipeline::Retire()'s order. FDIV/EFU must be drained
+		// even though VU0Recompiler.cpp never compiles a DIV/SQRT/RSQRT/EFU op
+		// itself: it does compile the ops that *read* their results (Q via an
+		// op.broadcast == 5 upper, P via MFP), so leaving those pipes un-retired
+		// made a compiled block read a stale Q/P once the block advanced the cycle
+		// past the pipe's latency. No XGKICK handling: VU0 has no GIF path at all.
 		a.Bind(&retire);
 		a.Bind(&retire_mid);
 		a.Str(x9, field(offsetof(VURegs, cycle)));
@@ -164,6 +168,42 @@ namespace Arm64VU0
 			a.Str(w11, field(offsetof(VURegs, fmacreadpos)));
 			a.Str(w10, field(offsetof(VURegs, fmaccount)));
 			a.Cbnz(w10, &loop);
+			a.Bind(&end);
+		}
+		{
+			Label end;
+			constexpr size_t offset = offsetof(VURegs, fdiv);
+			a.Ldr(w10, field(offset + offsetof(fdivPipe, enable)));
+			a.Cbz(w10, &end);
+			a.Ldr(x10, field(offset + offsetof(fdivPipe, sCycle)));
+			a.Ldr(w11, field(offset + offsetof(fdivPipe, Cycle)));
+			a.Sub(x10, x9, x10);
+			a.Cmp(x10, x11);
+			a.B(lo, &end);
+			a.Str(wzr, field(offset + offsetof(fdivPipe, enable)));
+			a.Ldr(w10, field(offset + offsetof(fdivPipe, reg)));
+			a.Str(w10, vi(REG_Q));
+			a.Ldr(w10, vi(REG_STATUS_FLAG));
+			a.And(w10, w10, 0xfcf);
+			a.Ldr(w11, field(offset + offsetof(fdivPipe, statusflag)));
+			a.And(w11, w11, 0xc30);
+			a.Orr(w10, w10, w11);
+			a.Str(w10, vi(REG_STATUS_FLAG));
+			a.Bind(&end);
+		}
+		{
+			Label end;
+			constexpr size_t offset = offsetof(VURegs, efu);
+			a.Ldr(w10, field(offset + offsetof(efuPipe, enable)));
+			a.Cbz(w10, &end);
+			a.Ldr(x10, field(offset + offsetof(efuPipe, sCycle)));
+			a.Ldr(w11, field(offset + offsetof(efuPipe, Cycle)));
+			a.Sub(x10, x9, x10);
+			a.Cmp(x10, x11);
+			a.B(lo, &end);
+			a.Str(wzr, field(offset + offsetof(efuPipe, enable)));
+			a.Ldr(w10, field(offset + offsetof(efuPipe, reg)));
+			a.Str(w10, vi(REG_P));
 			a.Bind(&end);
 		}
 		{
