@@ -141,6 +141,80 @@ namespace
 		return MemOperand(x0, offsetof(cpuRegisters, GPR) + reg * sizeof(GPR_reg));
 	}
 
+	// fpuRegs is not a member of cpuRegisters: it is cpuRegs' sibling inside
+	// cpuRegistersPack (R5900.h). x0 always holds &cpuRegs == &_cpuRegistersPack,
+	// so fpuRegs is reachable at a fixed extra offset from x0 rather than
+	// through offsetof(cpuRegisters, ...) the way GPR() works.
+	MemOperand FPR(u32 reg)
+	{
+		return MemOperand(x0, offsetof(cpuRegistersPack, fpuRegs) + offsetof(fpuRegisters, fpr) + reg * sizeof(FPRreg));
+	}
+
+	MemOperand FCR31()
+	{
+		return MemOperand(x0, offsetof(cpuRegistersPack, fpuRegs) + offsetof(fpuRegisters, fprc) + 31 * sizeof(u32));
+	}
+
+	constexpr u32 FPUflagC = 0x00800000;
+	constexpr u32 FPUflagO = 0x00008000, FPUflagSO = 0x00000010;
+	constexpr u32 FPUflagU = 0x00004000, FPUflagSU = 0x00000008;
+
+	// Mirrors the interpreter's fpuDouble() (FPU.cpp): every FPU operand is
+	// sanitized before use so PS2's non-IEEE FPU semantics (denormals flush to
+	// signed zero, Inf/NaN bit patterns saturate to +/-Fmax) hold even though
+	// the host FP unit is strictly IEEE-754. reg is clamped in place; w11/w12
+	// are scratch.
+	void EmitFpuClampOperand(MacroAssembler& a, const Register& reg)
+	{
+		Label flush, saturate, done;
+		a.And(w11, reg, 0x7fffffff); // magnitude
+		a.And(w12, reg, 0x80000000); // sign
+		a.Cmp(w11, 0x00800000);
+		a.B(lo, &flush); // magnitude < 0x00800000 -> exponent == 0 (denormal or zero)
+		a.Cmp(w11, 0x7f800000);
+		a.B(hs, &saturate); // magnitude >= 0x7f800000 -> exponent == 0xff (Inf; NaN can't
+		                     // reach here since every operand was clamped before arithmetic)
+		a.B(&done);
+		a.Bind(&flush);
+		a.Mov(reg, w12);
+		a.B(&done);
+		a.Bind(&saturate);
+		a.Orr(reg, w12, 0x7f7fffff);
+		a.Bind(&done);
+	}
+
+	// Mirrors the interpreter's checkOverflow()+checkUnderflow() (FPU.cpp) for
+	// ADD_S/SUB_S/MUL_S: a result of exactly +/-Inf saturates to +/-Fmax and
+	// sets O/SO; otherwise a true denormal flushes to signed zero and sets
+	// U/SU, and either way O is cleared (checkOverflow's not-taken branch
+	// always clears it for these ops, since they pass FPUflagO in cFlagsToSet).
+	// w9 holds the raw result bits in/out; w11/w12 are scratch.
+	void EmitFpuOutputFlags(MacroAssembler& a)
+	{
+		Label overflow, not_denormal, done;
+		a.Ldr(w12, FCR31());
+		a.And(w11, w9, 0x7fffffff);
+		a.Cmp(w11, 0x7f800000);
+		a.B(eq, &overflow);
+		a.Bic(w12, w12, FPUflagO);
+		a.Cmp(w11, 1);
+		a.B(lo, &not_denormal); // magnitude == 0: exact zero, not a denormal
+		a.Cmp(w11, 0x00800000);
+		a.B(hs, &not_denormal); // magnitude in the normal range
+		a.And(w9, w9, 0x80000000);
+		a.Orr(w12, w12, FPUflagU | FPUflagSU);
+		a.B(&done);
+		a.Bind(&not_denormal);
+		a.Bic(w12, w12, FPUflagU);
+		a.B(&done);
+		a.Bind(&overflow);
+		a.And(w9, w9, 0x80000000);
+		a.Orr(w9, w9, 0x7f7fffff);
+		a.Orr(w12, w12, FPUflagO | FPUflagSO);
+		a.Bind(&done);
+		a.Str(w12, FCR31());
+	}
+
 	void EmitPacked(MacroAssembler& a, u32 code, PackedInstruction instruction)
 	{
 		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31;
@@ -446,6 +520,40 @@ namespace
 		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, code)));
 	}
 
+	// Phase 1 coverage: register transfer (MFC1/CFC1/MTC1/CTC1), CVT_S,
+	// ADD_S/SUB_S/MUL_S/ABS_S/MOV_S/NEG_S, CVT_W, and the C.cond.S compare
+	// family. DIV_S/SQRT_S/RSQRT_S and the ACC-based MADD/MSUB/MULA/etc.
+	// family are deliberately left unsupported for now (see PERFORMANCE
+	// notes/plan) -- they fall back to the interpreter like any other
+	// unsupported instruction. needs proper testing across games.
+	bool SupportsCOP1(u32 code)
+	{
+		const u32 rs = (code >> 21) & 31;
+		if (rs == 0 || rs == 2 || rs == 4 || rs == 6) // MFC1/CFC1/MTC1/CTC1
+			return true;
+		if (rs == 20) // W format: only CVT_S.W exists
+			return (code & 0x3f) == 32;
+		if (rs == 16) // S format
+		{
+			switch (code & 0x3f)
+			{
+				case 0: // ADD_S
+				case 1: // SUB_S
+				case 2: // MUL_S
+				case 5: // ABS_S
+				case 6: // MOV_S
+				case 7: // NEG_S
+				case 36: // CVT_W
+				case 48: // C_F
+				case 50: // C_EQ
+				case 52: // C_LT
+				case 54: // C_LE
+					return true;
+			}
+		}
+		return false;
+	}
+
 	// Only the plain register-transfer ops (QMFC2/CFC2/QMTC2/CTC2, selected by
 	// rs) and the "CO" macro-mode arithmetic ops (rs bit 4 set, dispatched by
 	// COP2_SPECIAL exactly as the interpreter's own top-level table does) are
@@ -488,12 +596,162 @@ namespace
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
 	}
 
+	// Natively compiles the COP1 (FPU) instructions accepted by SupportsCOP1().
+	// Semantics are matched instruction-for-instruction against pcsx2/FPU.cpp;
+	// see EmitFpuClampOperand/EmitFpuOutputFlags for the non-IEEE clamping this
+	// mirrors. needs proper testing across games, especially the O/U flag
+	// bookkeeping (FCR31), since nothing else in this codegen depends on it.
+	// No EmitPosition() call is needed here (unlike EmitCOP2): every case below
+	// decodes register fields from the already-known `code` value directly
+	// rather than through cpuRegs.code/pc the way the interpreter's own COP1
+	// handlers do, and none of these instructions can fault.
+	void EmitCOP1(MacroAssembler& a, u32 code)
+	{
+		const u32 rs = (code >> 21) & 31;
+		const u32 ft = (code >> 16) & 31; // GPR index for transfers, else FPR ft
+		const u32 fs = (code >> 11) & 31;
+		const u32 fd = (code >> 6) & 31;
+		if (rs == 0) // MFC1
+		{
+			if (ft)
+			{
+				a.Ldrsw(x9, FPR(fs));
+				a.Str(x9, GPR(ft));
+			}
+			return;
+		}
+		if (rs == 2) // CFC1
+		{
+			if (!ft)
+				return;
+			if (fs == 31)
+				a.Ldrsw(x9, FCR31());
+			else
+				a.Mov(x9, fs == 0 ? 0x2E00 : 0);
+			a.Str(x9, GPR(ft));
+			return;
+		}
+		if (rs == 4) // MTC1
+		{
+			a.Ldr(w9, GPR(ft));
+			a.Str(w9, FPR(fs));
+			return;
+		}
+		if (rs == 6) // CTC1
+		{
+			if (fs == 31)
+			{
+				a.Ldr(w9, GPR(ft));
+				a.Str(w9, FCR31());
+			}
+			return;
+		}
+		if (rs == 20) // CVT_S.W: FdValf = (float)FsValSl
+		{
+			a.Ldr(w9, FPR(fs));
+			a.Scvtf(s0, w9);
+			a.Str(s0, FPR(fd));
+			return;
+		}
+		// rs == 16: S format.
+		const u32 function = code & 0x3f;
+		if (function == 48 || function == 50 || function == 52 || function == 54) // C.F/C.EQ/C.LT/C.LE
+		{
+			a.Ldr(w12, FCR31());
+			if (function == 48) // C_F: unconditionally clears C
+			{
+				a.Bic(w12, w12, FPUflagC);
+				a.Str(w12, FCR31());
+				return;
+			}
+			a.Ldr(w9, FPR(fs));
+			a.Ldr(w10, FPR(ft));
+			EmitFpuClampOperand(a, w9);
+			EmitFpuClampOperand(a, w10);
+			a.Fmov(s0, w9);
+			a.Fmov(s1, w10);
+			a.Fcmp(s0, s1);
+			// Operands are pre-clamped and can never be NaN, so the ordinary
+			// (non-unordered-aware) condition mnemonics already match the
+			// interpreter's plain C++ ==/</<= comparisons exactly.
+			const Condition cond = function == 50 ? eq : function == 52 ? lt : le;
+			a.Ldr(w12, FCR31()); // reload: EmitFpuClampOperand above clobbered w12 as scratch
+			Label set_c, done_c;
+			a.B(cond, &set_c);
+			a.Bic(w12, w12, FPUflagC);
+			a.B(&done_c);
+			a.Bind(&set_c);
+			a.Orr(w12, w12, FPUflagC);
+			a.Bind(&done_c);
+			a.Str(w12, FCR31());
+			return;
+		}
+		a.Ldr(w9, FPR(fs));
+		switch (function)
+		{
+			case 5: // ABS_S
+				a.And(w9, w9, 0x7fffffff);
+				a.Str(w9, FPR(fd));
+				a.Ldr(w12, FCR31());
+				a.Bic(w12, w12, FPUflagO | FPUflagU);
+				a.Str(w12, FCR31());
+				return;
+			case 6: // MOV_S
+				a.Str(w9, FPR(fd));
+				return;
+			case 7: // NEG_S
+				a.Eor(w9, w9, 0x80000000);
+				a.Str(w9, FPR(fd));
+				a.Ldr(w12, FCR31());
+				a.Bic(w12, w12, FPUflagO | FPUflagU);
+				a.Str(w12, FCR31());
+				return;
+			case 36: // CVT_W
+			{
+				a.And(w10, w9, 0x7f800000); // exponent field of the original value
+				a.And(w13, w9, 0x80000000); // sign of the original value
+				Label sat, done_cvt;
+				a.Cmp(w10, 0x4E800000);
+				a.B(hi, &sat);
+				a.Fmov(s0, w9);
+				a.Fcvtzs(w9, s0); // round toward zero, matching the interpreter's (s32) cast
+				a.B(&done_cvt);
+				a.Bind(&sat);
+				a.Mov(w9, 0x7fffffff);
+				a.Mov(w11, 0x80000000);
+				a.Cmp(w13, 0);
+				a.Csel(w9, w9, w11, eq); // sign == 0 -> 0x7fffffff, else -> 0x80000000
+				a.Bind(&done_cvt);
+				a.Str(w9, FPR(fd));
+				return;
+			}
+			default: // ADD_S(0)/SUB_S(1)/MUL_S(2)
+			{
+				a.Ldr(w10, FPR(ft));
+				EmitFpuClampOperand(a, w9);
+				EmitFpuClampOperand(a, w10);
+				a.Fmov(s0, w9);
+				a.Fmov(s1, w10);
+				if (function == 0)
+					a.Fadd(s0, s0, s1);
+				else if (function == 1)
+					a.Fsub(s0, s0, s1);
+				else
+					a.Fmul(s0, s0, s1);
+				a.Fmov(w9, s0);
+				EmitFpuOutputFlags(a);
+				a.Str(w9, FPR(fd));
+				return;
+			}
+		}
+	}
+
 	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
 		const bool conditional = op != 0 && op != 2 && op != 3;
-		const bool likely = (op >= 20 && op <= 23) || (op == 1 && (rt & 2));
+		const bool likely = (op >= 20 && op <= 23) || (op == 1 && (rt & 2)) || (op == 17 && (rt & 2));
 		const u32 link = op == 3 || (op == 1 && (rt & 16)) ? 31 : op == 0 && (code & 63) == 9 ? (code >> 11) & 31 :
 		                                                                                        0;
 		// Capture register targets before either the link or delay slot overwrites
@@ -512,21 +770,30 @@ namespace
 		Label untaken;
 		if (conditional)
 		{
-			// REGIMM links are unconditional and precede the rs comparison in the
-			// reference interpreter, including the rs == ra alias.
-			a.Ldr(x9, GPR(rs));
 			Condition taken;
-			if (op == 4 || op == 5 || op == 20 || op == 21)
+			if (op == 17) // BC1F/BC1T/BC1FL/BC1TL: branch on FCR31's C bit, not a GPR.
 			{
-				a.Ldr(x10, GPR(rt));
-				a.Cmp(x9, x10);
-				taken = (op == 4 || op == 20) ? eq : ne;
+				a.Ldr(w9, FCR31());
+				a.Tst(w9, FPUflagC);
+				taken = (rt & 1) ? ne : eq;
 			}
 			else
 			{
-				a.Cmp(x9, 0);
-				taken = op == 1 ? ((rt & 1) ? ge : lt) : (op == 6 || op == 22) ? le :
-				                                                                 gt;
+				// REGIMM links are unconditional and precede the rs comparison in
+				// the reference interpreter, including the rs == ra alias.
+				a.Ldr(x9, GPR(rs));
+				if (op == 4 || op == 5 || op == 20 || op == 21)
+				{
+					a.Ldr(x10, GPR(rt));
+					a.Cmp(x9, x10);
+					taken = (op == 4 || op == 20) ? eq : ne;
+				}
+				else
+				{
+					a.Cmp(x9, 0);
+					taken = op == 1 ? ((rt & 1) ? ge : lt) : (op == 6 || op == 22) ? le :
+					                                                                 gt;
+				}
 			}
 			a.B(InvertCondition(taken), &untaken);
 		}
@@ -560,7 +827,9 @@ namespace
 			case 35:
 			case 39:
 			case 43:
-				return 4; // LW, LWU, SW
+			case 49:
+			case 57:
+				return 4; // LW, LWU, SW, LWC1, SWC1
 			case 33:
 			case 37:
 			case 41:
@@ -579,7 +848,8 @@ namespace
 	{
 		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
 		const u32 size = MemorySize(code);
-		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63;
+		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63 || op == 57;
+		const bool fpu = op == 49 || op == 57; // LWC1/SWC1 target fpuRegs.fpr, not a GPR
 		a.Ldr(w9, GPR(rs));
 		a.Add(w9, w9, static_cast<int16_t>(code));
 		if (size == 16)
@@ -611,6 +881,11 @@ namespace
 			{
 				a.Ldr(q0, GPR(rt));
 				a.Str(q0, MemOperand(x12));
+			}
+			else if (fpu)
+			{
+				a.Ldr(w10, FPR(rt));
+				a.Str(w10, MemOperand(x12));
 			}
 			else
 			{
@@ -653,13 +928,19 @@ namespace
 					a.Ldrh(w10, MemOperand(x12));
 					break;
 				case 39:
+				case 49:
 					a.Ldr(w10, MemOperand(x12));
 					break;
 				case 55:
 					a.Ldr(x10, MemOperand(x12));
 					break;
 			}
-			if (rt)
+			if (fpu)
+			{
+				// Unlike GPR r0, fpr[0] is a real writable register.
+				a.Str(w10, FPR(rt));
+			}
+			else if (rt)
 			{
 				if (size == 16)
 					a.Str(q0, GPR(rt));
@@ -673,7 +954,7 @@ namespace
 bool Arm64EE::CodeGenerator::Supports(u32 code)
 {
 	return SupportsInteger(code) || MemorySize(code) != 0 || IsBranch(code) ||
-	       ((code >> 26) == 18 && SupportsCOP2(code));
+	       ((code >> 26) == 18 && SupportsCOP2(code)) || ((code >> 26) == 17 && SupportsCOP1(code));
 }
 
 bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 code)
@@ -698,6 +979,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
 		else if ((words[i] >> 26) == 18)
 			EmitCOP2(a, words[i], pc + i * 4);
+		else if ((words[i] >> 26) == 17)
+			EmitCOP1(a, words[i]);
 		else
 			Emit(a, words[i]);
 	}

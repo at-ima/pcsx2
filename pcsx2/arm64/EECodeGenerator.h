@@ -32,6 +32,10 @@ namespace Arm64EE::CodeGenerator
 					return false;
 			}
 		}
+		// COP1's BC1F/BC1T/BC1FL/BC1TL live under rs == 8; the other COP1 rs
+		// values (register transfer, S/W-format arithmetic) are not branches.
+		if (op == 17)
+			return ((code >> 21) & 31) == 8;
 		return (op >= 2 && op <= 7) || (op >= 20 && op <= 23);
 	}
 	bool SupportsDelaySlot(u32 code);

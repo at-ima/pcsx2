@@ -80,6 +80,7 @@ namespace
 		{
 			m_cpu = cpuRegs;
 			m_vu0 = VU0;
+			m_fpu = fpuRegs;
 			m_config = EmuConfig.Cpu;
 			m_goemon = EmuConfig.Gamefixes.GoemonTlbHack;
 			EmuConfig.Gamefixes.GoemonTlbHack = false;
@@ -104,6 +105,7 @@ namespace
 			vtlb_private::vtlbdata.vmap[Alias >> 12] = m_alias_mapping;
 			cpuRegs = m_cpu;
 			VU0 = m_vu0;
+			fpuRegs = m_fpu;
 			EmuConfig.Cpu = m_config;
 			EmuConfig.Gamefixes.GoemonTlbHack = m_goemon;
 		}
@@ -259,10 +261,64 @@ namespace
 			EXPECT_EQ(std::memcmp(&actual_vu0, &VU0, sizeof(VU0)), 0);
 		}
 
+		// COP1 (FPU) native codegen (see EmitCOP1 in arm64/EECodeGenerator.cpp)
+		// writes fpuRegs directly, which is not part of cpuRegisters, so it needs
+		// its own init/compare pair alongside the usual cpuRegs comparison.
+		void InitFPU(u32 seed)
+		{
+			std::memset(&fpuRegs, 0, sizeof(fpuRegs));
+			// A mix of ordinary values and the PS2 FPU's non-IEEE edge cases:
+			// +/-0, +/-1, +/-Fmax, +/-Inf, NaN, smallest/largest +/-denormals.
+			constexpr u32 edge[] = {
+				0x00000000, 0x80000000,
+				0x3f800000, 0xbf800000,
+				0x7f7fffff, 0xff7fffff,
+				0x7f800000, 0xff800000,
+				0x7fc00000, 0xffc00000,
+				0x00000001, 0x80000001,
+				0x007fffff, 0x807fffff,
+				0x3f000000, 0x40490fdb,
+			};
+			u32 random = seed * 2654435761u + 1;
+			auto next = [&random]() { random = random * 1664525 + 1013904223; return random; };
+			for (u32 reg = 0; reg < 32; reg++)
+				fpuRegs.fpr[reg].UL = seed < 64 ? edge[(seed + reg) % std::size(edge)] : next();
+		}
+		void CompareWithFPU(u32 count)
+		{
+			const cpuRegisters initial = cpuRegs;
+			const fpuRegisters initial_fpu = fpuRegs;
+			const auto initial_memory = memory;
+			u32 native_cycles = 0xfffffff0;
+			ASSERT_TRUE(Arm64EE::TryExecute(native_cycles));
+			const cpuRegisters actual = cpuRegs;
+			const fpuRegisters actual_fpu = fpuRegs;
+			const auto actual_memory = memory;
+			cpuRegs = initial;
+			fpuRegs = initial_fpu;
+			memory = initial_memory;
+			u32 expected_cycles = 0xfffffff0;
+			for (u32 i = 0; i < count; i++)
+			{
+				const auto mapping = vtlb_private::vtlbdata.vmap[cpuRegs.pc >> 12];
+				cpuRegs.code = *reinterpret_cast<const u32*>(mapping.assumePtr(cpuRegs.pc));
+				cpuRegs.pc += 4;
+				const auto& opcode = R5900::GetCurrentInstruction();
+				expected_cycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+				opcode.interpret();
+			}
+			EXPECT_EQ(native_cycles, expected_cycles);
+			EXPECT_EQ(actual.pc, cpuRegs.pc);
+			EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
+			EXPECT_EQ(std::memcmp(&actual_fpu, &fpuRegs, sizeof(fpuRegs)), 0);
+			EXPECT_EQ(actual_memory, memory);
+		}
+
 		alignas(16) std::array<u32, 1024> program;
 		alignas(16) std::array<u32, 1024> memory;
 		cpuRegisters m_cpu;
 		VURegs m_vu0;
+		fpuRegisters m_fpu;
 		Pcsx2Config::CpuOptions m_config;
 		bool m_goemon;
 		vtlb_private::VTLBVirtual m_mapping, m_last_mapping, m_data_mapping, m_alias_mapping;
@@ -1080,5 +1136,186 @@ TEST_F(EERecompilerTest, COP2BranchRemainsInterpreted)
 	EXPECT_FALSE(Arm64EE::TryExecute(cycles));
 	EXPECT_EQ(cycles, 123u);
 	EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
+}
+
+TEST_F(EERecompilerTest, COP1RegisterTransfersMatchInterpreter)
+{
+	// rs selects MFC1(0)/CFC1(2)/MTC1(4)/CTC1(6). CFC1/CTC1 only special-case
+	// fs==31 (FCR31) and, for CFC1 only, fs==0 (FCR0); everything else reads
+	// as zero and non-31 CTC1 writes are dropped, so fs is swept across all
+	// three cases (0, 31, and an arbitrary other register).
+	constexpr u32 rs_values[] = {0, 2, 4, 6};
+	constexpr u32 fs_values[] = {0, 5, 31};
+	for (u32 seed = 0; seed < 16; seed++)
+	{
+		const u32 rt = 1 + seed % 4;
+		for (u32 rs : rs_values)
+		{
+			for (u32 fs : fs_values)
+			{
+				SCOPED_TRACE(testing::Message() << "rs=" << rs << " fs=" << fs << " seed=" << seed);
+				Init(seed);
+				InitFPU(seed);
+				fpuRegs.fprc[31] = 0x0083c078 ^ seed; // arbitrary FCR31 content for CFC1 coverage
+				program[0] = (17u << 26) | (rs << 21) | (rt << 16) | (fs << 11);
+				CompareWithFPU(1);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, COP1ArithmeticMatchesInterpreter)
+{
+	// function selects ADD_S(0)/SUB_S(1)/MUL_S(2)/ABS_S(5)/MOV_S(6)/NEG_S(7).
+	// Operands sweep InitFPU's edge-case table (zeros, Inf, NaN, denormals,
+	// Fmax) so the non-IEEE clamping in EmitFpuClampOperand/EmitFpuOutputFlags
+	// gets exercised, not just ordinary finite values.
+	constexpr u32 functions[] = {0, 1, 2, 5, 6, 7};
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		const u32 fd = 1 + seed % 4, fs = 1 + (seed / 4) % 4, ft = 1 + (seed / 16) % 4;
+		for (u32 function : functions)
+		{
+			SCOPED_TRACE(testing::Message() << "function=" << function << " seed=" << seed);
+			Init(seed);
+			InitFPU(seed);
+			program[0] = (17u << 26) | (16u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | function;
+			CompareWithFPU(1);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, COP1CompareAndBranchMatchInterpreter)
+{
+	// function selects C_F(48)/C_EQ(50)/C_LT(52)/C_LE(54); the FCR31 C bit it
+	// writes is then consumed by a BC1[F/T][L] in the following instruction.
+	constexpr u32 functions[] = {48, 50, 52, 54};
+	for (u32 seed = 0; seed < 16; seed++)
+	{
+		const u32 fs = 1 + seed % 4, ft = 1 + (seed / 4) % 4;
+		for (u32 function : functions)
+		{
+			SCOPED_TRACE(testing::Message() << "function=" << function << " seed=" << seed);
+			Init(seed);
+			InitFPU(seed);
+			program[0] = (17u << 26) | (16u << 21) | (ft << 16) | (fs << 11) | function;
+			CompareWithFPU(1);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, COP1BranchFollowsCompareResult)
+{
+	// BC1F/BC1T/BC1FL/BC1TL (rt selects which) branching off a preceding
+	// C_LT.S, covering both the taken and untaken/annulled paths.
+	for (u32 seed = 0; seed < 8; seed++)
+	{
+		const u32 fs = 1 + seed % 4, ft = 1 + (seed / 4) % 4;
+		for (u32 rt = 0; rt < 4; rt++)
+		{
+			SCOPED_TRACE(testing::Message() << "rt=" << rt << " seed=" << seed);
+			Init(seed);
+			InitFPU(seed);
+			program[0] = (17u << 26) | (16u << 21) | (ft << 16) | (fs << 11) | 52; // C_LT.S
+			program[1] = (17u << 26) | (8u << 21) | (rt << 16) | 2; // BC1[F/T][L], offset +2
+			program[2] = 0; // SLL r0, r0, 0 (NOP) delay slot
+
+			// Predict C_LT.S's outcome by interpreting it against a scratch copy,
+			// without disturbing the state CompareBranch below needs pristine.
+			cpuRegisters cpu_copy = cpuRegs;
+			fpuRegisters fpu_copy = fpuRegs;
+			cpu_copy.code = program[0];
+			const auto& opcode = R5900::GetInstruction(program[0]);
+			std::swap(cpuRegs, cpu_copy);
+			std::swap(fpuRegs, fpu_copy);
+			opcode.interpret();
+			const bool c = (fpuRegs.fprc[31] & 0x00800000) != 0;
+			std::swap(cpuRegs, cpu_copy);
+			std::swap(fpuRegs, fpu_copy);
+
+			const bool taken = c == ((rt & 1) != 0);
+			const bool likely = (rt & 2) != 0;
+			CompareBranch(1, taken, likely, likely, Base + 16); // branch at Base+4, target = +4+offset*4
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, COP1ConvertMatchesInterpreter)
+{
+	// CVT_S.W (rs==20) converts an integer bit pattern to float; CVT_W.S
+	// (rs==16, function 36) converts back with PS2's saturate-instead-of-trap
+	// behavior for out-of-range magnitudes, so InitFPU's edge cases (which
+	// include values well past the +/-2^30 cutoff) matter here too.
+	for (u32 seed = 0; seed < 16; seed++)
+	{
+		const u32 fd = 1 + seed % 4, fs = 1 + (seed / 4) % 4;
+		SCOPED_TRACE(testing::Message() << "CVT_S seed=" << seed);
+		Init(seed);
+		InitFPU(seed);
+		program[0] = (17u << 26) | (20u << 21) | (fs << 11) | (fd << 6) | 32;
+		CompareWithFPU(1);
+		if (HasFailure())
+			return;
+		SCOPED_TRACE(testing::Message() << "CVT_W seed=" << seed);
+		Init(seed);
+		InitFPU(seed);
+		program[0] = (17u << 26) | (16u << 21) | (fs << 11) | (fd << 6) | 36;
+		CompareWithFPU(1);
+		if (HasFailure())
+			return;
+	}
+}
+
+TEST_F(EERecompilerTest, COP1MemoryTransfersMatchInterpreter)
+{
+	Init(0);
+	InitFPU(0);
+	cpuRegs.GPR.r[1].UD[0] = Data;
+	program[0] = (49u << 26) | (1u << 21) | (3u << 16) | 4; // LWC1 f3, 4(r1)
+	CompareWithFPU(1);
+	if (HasFailure())
+		return;
+	Init(0);
+	InitFPU(0);
+	cpuRegs.GPR.r[1].UD[0] = Data;
+	program[0] = (57u << 26) | (1u << 21) | (3u << 16) | 8; // SWC1 f3, 8(r1)
+	CompareWithFPU(1);
+}
+
+TEST_F(EERecompilerTest, COP1SurroundingIntegerCodeStaysNative)
+{
+	// Like COP2SurroundingIntegerCodeStaysNative: a COP1 instruction should
+	// not force the rest of the block back to the interpreter.
+	Init(0);
+	InitFPU(0);
+	program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5
+	program[1] = (17u << 26) | (16u << 21) | (2u << 16) | (1u << 11) | (3u << 6) | 0; // ADD.S f3, f1, f2
+	program[2] = (9u << 26) | (2u << 21) | (4u << 16) | 7; // ADDIU r4, r2, 7
+	CompareWithFPU(3);
+}
+
+TEST_F(EERecompilerTest, COP1UnsupportedRemainsInterpreted)
+{
+	// DIV_S (function 3) is not in SupportsCOP1's Phase-1 whitelist; it must
+	// keep falling back to the interpreter rather than being mis-decoded by
+	// EmitCOP1's arithmetic default case.
+	Init(0);
+	InitFPU(0);
+	program[0] = (17u << 26) | (16u << 21) | (2u << 16) | (1u << 11) | (3u << 6) | 3; // DIV.S f3, f1, f2
+	const cpuRegisters before = cpuRegs;
+	const fpuRegisters before_fpu = fpuRegs;
+	u32 cycles = 123;
+	EXPECT_FALSE(Arm64EE::TryExecute(cycles));
+	EXPECT_EQ(cycles, 123u);
+	EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
+	EXPECT_EQ(std::memcmp(&before_fpu, &fpuRegs, sizeof(fpuRegs)), 0);
 }
 #endif
