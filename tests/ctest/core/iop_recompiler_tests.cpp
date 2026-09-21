@@ -211,6 +211,30 @@ TEST_F(IopRecompilerTest, LoadsAndStoresThroughLutFastPath)
 	}
 }
 
+TEST_F(IopRecompilerTest, IsolateCacheSuppressesStoresButNotLoads)
+{
+	// Status bit 16 (IsC, isolate-cache) makes iopMemWrite{8,16,32}() (IopMem.cpp)
+	// skip the actual RAM write -- a boot/kernel cache-flush idiom. Native SB/SH/SW
+	// must match that, or boot-time isolate-cache writes silently corrupt live
+	// BIOS/kernel state instead of being no-ops.
+	for (u32 op : {40u, 41u, 43u}) // SB, SH, SW
+	{
+		for (bool isolate : {false, true})
+		{
+			SCOPED_TRACE(testing::Message() << "opcode=" << op << " isolate=" << isolate);
+			Init(0);
+			psxRegs.CP0.n.Status = isolate ? 0x10000 : 0;
+			const u32 address = Data;
+			psxRegs.GPR.r[1] = address - 8;
+			psxRegs.GPR.r[2] = 0x89abcdef;
+			program[0] = (op << 26) | (1 << 21) | (2 << 16) | 8;
+			Compare(1);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(IopRecompilerTest, ConditionalBranchTakenAndUntakenPreserveDelaySlot)
 {
 	for (bool taken : {false, true})

@@ -437,6 +437,17 @@ namespace
 
 		if (store)
 		{
+			// iopMemWrite{8,16,32}() (IopMem.cpp) gate the actual RAM write behind
+			// !(Status & 0x10000) -- bit 16 is IsC (isolate-cache): boot/kernel code
+			// uses isolate-cache stores as a cache-flush idiom that must not touch
+			// real RAM. Skipping this check overwrites live BIOS/kernel state with
+			// those dummy values, which is silent (no crash) but leaves execution
+			// permanently wrong from that point on -- reproduced live as a normal
+			// (non-savestate) boot that never gets past a black screen, since
+			// savestate resume starts after boot's isolate-cache writes are done.
+			Label skip_store;
+			a.Ldr(w14, CP0(12)); // Status
+			a.Tbnz(w14, 16, &skip_store);
 			a.Ldr(w10, GPR(rt));
 			if (size == 4)
 				a.Str(w10, MemOperand(x12));
@@ -449,6 +460,7 @@ namespace
 			a.Sub(x15, x12, x15);
 			a.Cmp(x15, source_bytes);
 			a.B(lo, after);
+			a.Bind(&skip_store);
 		}
 		else
 		{
