@@ -35,10 +35,30 @@ namespace
 	};
 	// unordered_map preserves element addresses across rehash. Reset/Shutdown
 	// clear this non-owning cache before destroying the backing blocks.
-	std::array<LookupEntry, 1024> s_lookup{};
+	// Sized well past any game's live working set of unique block PCs so this
+	// direct-mapped cache absorbs almost every lookup: s_blocks.find() falls
+	// back to libc++'s prime-bucketed unordered_map, which costs a hardware
+	// integer division per probe -- measured as ~15% of total EE-thread time
+	// in a busy scene with a 1024-entry cache (fixed-size code sample, needs
+	// proper testing against a wider range of games/scenes).
+	std::array<LookupEntry, 65536> s_lookup{};
 	u8* s_write = nullptr;
 	u8* s_write_limit = nullptr;
 	bool s_goemon_tlb_hack = false;
+	// 1-entry "most recently dispatched" cache, checked before s_lookup. A
+	// branch that loops back to its own containing block's entry pc (a very
+	// common delay/poll-loop shape) makes intExecuteWithBackend call
+	// TryExecute() again immediately for the same pc, back-to-back, with
+	// nothing else running in between -- so this hits every single iteration
+	// of such a loop, skipping s_lookup's indexing and s_blocks.find()'s
+	// division-costing hashmap fallback entirely (measured live: that
+	// fallback can otherwise cost ~15% of total EE-thread time in a busy
+	// scene with such a loop running millions of times/sec). This only
+	// changes which path *finds* the block to run -- TryExecute() still runs
+	// exactly one block per call, same as always, so callers that invoke it
+	// directly (e.g. differential tests) see no change in behavior.
+	u32 s_last_dispatch_pc = 0;
+	const Block* s_last_dispatch_block = nullptr;
 
 
 	u32 GetSupportedInstructionCount(const u32* source, u32 remaining)
@@ -109,6 +129,8 @@ __noinline void Arm64EE::Reset()
 {
 	s_lookup.fill({});
 	s_blocks.clear();
+	s_last_dispatch_pc = 0;
+	s_last_dispatch_block = nullptr;
 	s_write = SysMemory::GetEERec();
 	// The reserved buffer is stable until Shutdown; keep its compilation margin
 	// out of the per-block memory-manager call path.
@@ -120,6 +142,8 @@ void Arm64EE::Shutdown()
 {
 	s_lookup.fill({});
 	decltype(s_blocks){}.swap(s_blocks);
+	s_last_dispatch_pc = 0;
+	s_last_dispatch_block = nullptr;
 	s_write = nullptr;
 	s_write_limit = nullptr;
 }
@@ -138,10 +162,14 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 	const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
 	if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_write > s_write_limit)
 		Reset();
+	// Checked before s_lookup: see the comment on its declaration. Reset() /
+	// ClearProvider() invalidate it alongside s_lookup and s_blocks.
+	const Block* block = s_last_dispatch_pc == pc ? s_last_dispatch_block : nullptr;
 	// Mix page and instruction bits to avoid concentrating same-offset blocks
 	// in one slot. The full PC tag keeps virtual aliases distinct.
 	LookupEntry& lookup = s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)];
-	const Block* block = lookup.pc == pc ? lookup.block : nullptr;
+	if (!block)
+		block = lookup.pc == pc ? lookup.block : nullptr;
 	if (!block)
 	{
 		// Only opcode-level rejection is cached here. Branch/delay rejection
@@ -184,6 +212,8 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 	}
 	if (!block->function)
 		return {};
+	s_last_dispatch_pc = pc;
+	s_last_dispatch_block = block;
 	const u64 result = block->function(&cpuRegs);
 	const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
 	block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
@@ -223,6 +253,8 @@ namespace
 		// already leaks it, on the next Reset().
 		s_lookup.fill({});
 		decltype(s_blocks){}.swap(s_blocks);
+		s_last_dispatch_pc = 0;
+		s_last_dispatch_block = nullptr;
 	}
 } // namespace
 
