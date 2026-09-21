@@ -288,11 +288,51 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		return {};
 	s_last_dispatch_pc = pc;
 	s_last_dispatch_block = block;
-	const u64 result = block->function(&cpuRegs);
-	const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
-	block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
-	return {static_cast<EEBlockExit>((result >> CodeGenerator::ExitShift) & CodeGenerator::ExitMask),
-		static_cast<u32>(result >> 32)};
+	// A branch that lands back on this exact block's own entry pc (a common
+	// delay/poll-loop shape -- see the s_last_dispatch_pc comment above) is
+	// provably still `block`: no lookup can find anything else. Looping here
+	// instead of returning skips a full intExecuteWithBackend round trip
+	// (switch dispatch, intFinishBranch, event-deadline check) on every single
+	// iteration of such a loop, not just the block lookup that 3f5ca209f
+	// already made free. This trusts the cached `block` pointer across
+	// iterations exactly as much as s_last_dispatch_pc already does across
+	// separate TryExecute() calls -- see its comment -- just for longer;
+	// kMaxSelfLoopIterations bounds how long that trust window stays open.
+	// needs proper testing across a wider range of games.
+	constexpr u32 kMaxSelfLoopIterations = 4096;
+	for (u32 iterations = 0;; iterations++)
+	{
+		const u64 result = block->function(&cpuRegs);
+		const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
+		block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+		const auto exit = static_cast<EEBlockExit>((result >> CodeGenerator::ExitShift) & CodeGenerator::ExitMask);
+		const u32 target = static_cast<u32>(result >> 32);
+		if (exit != EEBlockExit::TakenBranch || target != pc || iterations >= kMaxSelfLoopIterations)
+			return {exit, target};
+		// Replicates intFinishBranch()'s effect on this (non-interpreter-
+		// execution) path -- its WaitLoop speedhack branch is gated on
+		// Cpu->usesInterpreterExecution, which is false here, so nothing else
+		// from intFinishBranch applies. branch2 (Interpreter.cpp) is written
+		// but never read there, so it needs no equivalent here.
+		cpuRegs.branch = 1;
+		cpuRegs.pc = target;
+		cpuRegs.branch = 0;
+		intUpdateCPUCycles();
+		if (EEBranchEventDue(/*backend_active=*/true, /*exit_requested=*/false, cpuRegs.cycle, cpuRegs.nextEventCycle))
+		{
+			// pc/cycles are already committed above, unlike the normal return
+			// path below -- returning TakenBranch here would make
+			// intExecuteWithBackend redo intFinishBranch/intUpdateCPUCycles a
+			// second time and double-count cycles (intUpdateCPUCycles() always
+			// adds at least 1 cycle, even for a near-zero residual). Run the
+			// event test ourselves instead and report a plain Continue so the
+			// caller's switch does nothing further.
+			intEventTest(); // may fastjmp out of this function entirely; does not return in that case
+			return {EEBlockExit::Continue, 0};
+		}
+		// Same block, no event due yet: loop back without a full TryExecute()
+		// re-entry.
+	}
 }
 
 size_t Arm64EE::GetCommittedCache()

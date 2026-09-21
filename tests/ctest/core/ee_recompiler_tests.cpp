@@ -634,6 +634,104 @@ TEST_F(EERecompilerTest, ConditionalBranchesPreserveDelayAndEventBoundaries)
 	}
 }
 
+// A BNE back to its own containing block's entry pc (ADDIU counter decrement;
+// BNE; delay-slot ADDIU) is fast-pathed inside TryExecute() itself -- see the
+// loop comment above TryExecute() in EERecompiler.cpp. Drive it the same way
+// intExecuteWithBackend does (repeatedly call TryExecute(), manually applying
+// intFinishBranch's cpuRegs.branch/pc commit on a TakenBranch exit) and check
+// the loop still lands on the exact final state/cycle count a fully manual,
+// one-MIPS-instruction-at-a-time replay predicts -- this is what would catch a
+// double-counted cycle or a stale/skipped pc commit from the new internal loop.
+// needs proper testing across a wider range of games.
+TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
+{
+	for (u32 initial_t0 : {1u, 2u, 5u, 5000u}) // 5000 exercises kMaxSelfLoopIterations (4096)
+	{
+		SCOPED_TRACE(testing::Message() << "initial_t0=" << initial_t0);
+		Init(0);
+		program[0] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // ADDIU $t0(r1), $t0, -1
+		program[1] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfffeu; // BNE $t0, $zero, Base (back to word 0)
+		program[2] = (9u << 26) | (2 << 21) | (2 << 16) | 1u;      // delay slot: ADDIU $t1(r2), $t1, 1
+		cpuRegs.GPR.r[1].UD[0] = initial_t0;
+		// Keep the event deadline far away so the internal loop never takes its
+		// intEventTest() exit: that path calls into counters/IOP/VMManager state
+		// this narrow unit test harness doesn't set up. The event-due exit itself
+		// is exercised only by inspection/live testing for now -- needs proper
+		// testing with a harness that can run intEventTest() safely. Note
+		// EEBranchEventDue() treats the gap as a wrapping s64 difference (see
+		// EEBranchPollingTest above), so ~u64(0) reads as "already due", not
+		// "far away" -- a merely large value is what actually stays not-due.
+		cpuRegs.nextEventCycle = u64(1) << 40;
+		const cpuRegisters initial = cpuRegs;
+		const u32 scale = 2 - ((cpuRegs.CP0.n.Config >> 18) & 1);
+		const u32 addiu_cycles = R5900::GetInstruction(program[0]).cycles;
+		const u32 bne_cycles = R5900::GetInstruction(program[1]).cycles;
+		const u32 delay_cycles = R5900::GetInstruction(program[2]).cycles;
+
+		// Manual, one-instruction-at-a-time ground truth: every decrement but the
+		// last is taken (loops back to Base); the one that brings $t0 to 0 is not.
+		cpuRegs = initial;
+		u32 expected_cycles = 0;
+		for (u32 t0 = initial_t0;;)
+		{
+			cpuRegs.code = program[0];
+			R5900::GetCurrentInstruction().interpret(); // ADDIU $t0, $t0, -1
+			expected_cycles += addiu_cycles * scale;
+			t0--;
+			expected_cycles += bne_cycles * scale;
+			if (t0 != 0)
+			{
+				cpuRegs.code = program[2];
+				R5900::GetCurrentInstruction().interpret(); // delay slot
+				expected_cycles += delay_cycles * scale;
+			}
+			else
+			{
+				// Untaken: native's EmitPosition() (EECodeGenerator.cpp) leaves cpuRegs
+				// at the delay slot's address/code, without executing it -- whoever runs
+				// next (this test's own driver, or the real dispatcher) does that.
+				cpuRegs.pc = Base + 8;
+				cpuRegs.code = program[1];
+				break;
+			}
+		}
+		const cpuRegisters expected = cpuRegs;
+
+		// Native, driven exactly like intExecuteWithBackend drives TryExecute().
+		cpuRegs = initial;
+		u32 native_cycles = 0;
+		EEBlockResult result;
+		u32 outer_calls = 0;
+		do
+		{
+			result = Arm64EE::TryExecute(native_cycles);
+			ASSERT_TRUE(result);
+			if (result.exit == EEBlockExit::TakenBranch)
+			{
+				cpuRegs.branch = 1;
+				cpuRegs.pc = result.target;
+				cpuRegs.branch = 0;
+			}
+			ASSERT_LT(++outer_calls, 10u);
+		} while (result.exit == EEBlockExit::TakenBranch && result.target == Base);
+
+		EXPECT_EQ(native_cycles, expected_cycles);
+		// cpuRegs.cycle itself isn't compared: intUpdateCPUCycles() (Interpreter.cpp)
+		// updates it from its own file-static cpuBlockCycles, not from the
+		// block_cycles reference TryExecute() was actually called with here -- only
+		// correct when the caller aliases the two, which only intExecuteWithBackend's
+		// real registration (intExecuteWithBackend(&Arm64EE::TryExecute), Interpreter.h)
+		// guarantees. native_cycles above (this call's own block_cycles accumulator)
+		// is the accounting this test can actually verify.
+		cpuRegisters actual_no_cycle = cpuRegs;
+		cpuRegisters expected_no_cycle = expected;
+		actual_no_cycle.cycle = expected_no_cycle.cycle = 0;
+		EXPECT_EQ(std::memcmp(&actual_no_cycle, &expected_no_cycle, sizeof(cpuRegisters)), 0);
+		if (HasFailure())
+			return;
+	}
+}
+
 TEST_F(EERecompilerTest, RegimmBranchesAndLinkSourceAliasing)
 {
 	for (u32 rt : {0u, 1u, 2u, 3u, 16u, 17u, 18u, 19u})
