@@ -1062,6 +1062,8 @@ set(pcsx2arm64Sources
 	arm64/VU1Pipeline.cpp
 	arm64/EERecompiler.cpp
 	arm64/EECodeGenerator.cpp
+	arm64/IopRecompiler.cpp
+	arm64/IopCodeGenerator.cpp
 	)
 
 set(pcsx2arm64Headers
@@ -1072,6 +1074,8 @@ set(pcsx2arm64Headers
 	arm64/VU1Pipeline.h
 	arm64/EERecompiler.h
 	arm64/EECodeGenerator.h
+	arm64/IopRecompiler.h
+	arm64/IopCodeGenerator.h
 )
 
 # These ones benefit a lot from LTO

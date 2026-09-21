@@ -5,6 +5,7 @@ add_pcsx2_test(core_test
 	vu_neon_tests.cpp
 	vu1_recompiler_tests.cpp
 	ee_recompiler_tests.cpp
+	iop_recompiler_tests.cpp
 	iop_fetch_tests.cpp
 	iop_dispatch_tests.cpp
 	iop_branch_tests.cpp

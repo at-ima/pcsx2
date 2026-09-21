@@ -5,6 +5,7 @@
 #include "BuildVersion.h"
 #if defined(ARCH_ARM64)
 #include "arm64/EERecompiler.h"
+#include "arm64/IopRecompiler.h"
 #include "arm64/VU0Recompiler.h"
 #include "arm64/VU1Recompiler.h"
 #endif
@@ -2687,6 +2688,7 @@ void VMManager::InitializeCPUProviders()
 	CpuMicroVU1.Reserve();
 #else
 	arm64Cpu.Reserve();
+	arm64IopCpu.Reserve();
 	CpuArm64VU0.Reserve();
 	CpuArm64VU1.Reserve();
 	// The ARM64 VU1 provider does not support MTVU, but
@@ -2714,6 +2716,7 @@ void VMManager::ShutdownCPUProviders()
 	recCpu.Shutdown();
 #else
 	arm64Cpu.Shutdown();
+	arm64IopCpu.Shutdown();
 	CpuArm64VU0.Shutdown();
 	CpuArm64VU1.Shutdown();
 	// See the comment in the InitializeCPUProviders for an explaination why we
@@ -2742,12 +2745,14 @@ void VMManager::UpdateCPUImplementations()
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
 #else
 	Cpu = EmuConfig.Cpu.Recompiler.EnableEE ? &arm64Cpu : &intCpu;
-	psxCpu = &psxInt;
+	psxCpu = CHECK_IOPREC ? &arm64IopCpu : &psxInt;
 
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
-	Console.WriteLn("CPU execution: EE: %s; IOP interpreter; VU0: %s; VU1: %s; MTVU unavailable",
-		Cpu == &arm64Cpu ? "ARM64 block recompiler (partial)" : "interpreter", CpuVU0->GetLongName(), CpuVU1->GetLongName());
+	Console.WriteLn("CPU execution: EE: %s; IOP: %s; VU0: %s; VU1: %s; MTVU unavailable",
+		Cpu == &arm64Cpu ? "ARM64 block recompiler (partial)" : "interpreter",
+		psxCpu == &arm64IopCpu ? "ARM64 block recompiler (partial)" : "interpreter",
+		CpuVU0->GetLongName(), CpuVU1->GetLongName());
 #endif
 }
 
