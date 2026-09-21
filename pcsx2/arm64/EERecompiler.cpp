@@ -10,7 +10,7 @@
 
 #include <algorithm>
 #include <array>
-#include <unordered_map>
+#include <deque>
 
 namespace
 {
@@ -25,7 +25,70 @@ namespace
 		const u32* source = nullptr;
 		Function function = nullptr;
 	};
-	std::unordered_map<u32, Block> s_blocks;
+	// std::deque never invalidates references to existing elements when more
+	// are appended (unlike std::vector), so pointers handed out into this
+	// stay valid for as long as the deque itself lives -- exactly the
+	// property s_lookup/s_last_dispatch_block below rely on.
+	std::deque<Block> s_block_storage;
+	// Backing index for s_block_storage, keyed by pc: fixed-size, power-of-two,
+	// linear-probed open addressing. libc++'s std::unordered_map (used here
+	// until this commit) picks a prime bucket count, which needs a hardware
+	// integer division per probe to index -- measured live as ~15-22% of
+	// total EE-thread time in a busy scene. A power-of-two table needs only a
+	// mask. Entries are never individually removed (only Reset()/
+	// ClearProvider() ever clear everything at once), so an empty slot
+	// unambiguously means "not present" -- no tombstones needed.
+	struct BlockTableSlot
+	{
+		u32 pc = 0;
+		bool occupied = false;
+		Block* block = nullptr;
+	};
+	constexpr u32 BlockTableSize = 1u << 19; // 524288: generous vs. any realistic live block-pc count
+	std::array<BlockTableSlot, BlockTableSize> s_block_table{};
+	u32 s_block_table_count = 0;
+	u32 HashBlockPc(u32 pc) { return ((pc >> 2) * 0x9E3779B1u) >> (32 - 19); } // Fibonacci hashing, top 19 bits
+	// Existing entry for pc, or nullptr. Linear-probes from the hashed slot;
+	// bounded by BlockTableSize, though a real miss resolves in O(1) average
+	// since ClearBlockTable() keeps the load factor low (see its call site).
+	Block* FindBlock(u32 pc)
+	{
+		for (u32 index = HashBlockPc(pc);; index = (index + 1) & (BlockTableSize - 1))
+		{
+			const BlockTableSlot& slot = s_block_table[index];
+			if (!slot.occupied)
+				return nullptr;
+			if (slot.pc == pc)
+				return slot.block;
+		}
+	}
+	// Always allocates a fresh Block (even when pc already has one -- e.g. a
+	// self-modifying-code recompile): callers immediately overwrite every
+	// cached pointer to the old one, so nothing needs it to stay reachable,
+	// and reusing the old slot in place would only complicate this for no
+	// benefit. The orphaned old Block just lingers in s_block_storage until
+	// the next wholesale clear, exactly like s_write's own cache-exhaustion
+	// philosophy already documented at its declaration below.
+	Block& InsertBlock(u32 pc)
+	{
+		for (u32 index = HashBlockPc(pc);; index = (index + 1) & (BlockTableSize - 1))
+		{
+			BlockTableSlot& slot = s_block_table[index];
+			if (!slot.occupied || slot.pc == pc)
+			{
+				s_block_table_count += !slot.occupied;
+				s_block_storage.emplace_back();
+				slot = {pc, true, &s_block_storage.back()};
+				return *slot.block;
+			}
+		}
+	}
+	void ClearBlockTable()
+	{
+		s_block_table.fill({});
+		s_block_table_count = 0;
+		std::deque<Block>{}.swap(s_block_storage);
+	}
 	struct LookupEntry
 	{
 		u32 pc = 0;
@@ -33,14 +96,9 @@ namespace
 		const Block* block = nullptr;
 		const u32* rejected_source = nullptr;
 	};
-	// unordered_map preserves element addresses across rehash. Reset/Shutdown
-	// clear this non-owning cache before destroying the backing blocks.
 	// Sized well past any game's live working set of unique block PCs so this
-	// direct-mapped cache absorbs almost every lookup: s_blocks.find() falls
-	// back to libc++'s prime-bucketed unordered_map, which costs a hardware
-	// integer division per probe -- measured as ~15% of total EE-thread time
-	// in a busy scene with a 1024-entry cache (fixed-size code sample, needs
-	// proper testing against a wider range of games/scenes).
+	// direct-mapped cache absorbs almost every lookup before it would ever
+	// need to fall back to FindBlock() above.
 	std::array<LookupEntry, 65536> s_lookup{};
 	u8* s_write = nullptr;
 	u8* s_write_limit = nullptr;
@@ -50,8 +108,8 @@ namespace
 	// common delay/poll-loop shape) makes intExecuteWithBackend call
 	// TryExecute() again immediately for the same pc, back-to-back, with
 	// nothing else running in between -- so this hits every single iteration
-	// of such a loop, skipping s_lookup's indexing and s_blocks.find()'s
-	// division-costing hashmap fallback entirely (measured live: that
+	// of such a loop, skipping s_lookup's indexing and (formerly) the
+	// division-costing unordered_map fallback entirely (measured live: that
 	// fallback can otherwise cost ~15% of total EE-thread time in a busy
 	// scene with such a loop running millions of times/sec). This only
 	// changes which path *finds* the block to run -- TryExecute() still runs
@@ -78,8 +136,12 @@ namespace
 	// out of the dispatcher that runs for every cached block.
 	__noinline Block& Compile(u32 pc, const u32* source, vtlb_ProtectionMode page_type, bool tracked)
 	{
-		Block& block = s_blocks[pc];
-		block = {};
+		// Keep the table's load factor low so a genuine miss (an unseen pc)
+		// still resolves in ~O(1): matches s_write's own "just wipe everything
+		// and start over" cache-exhaustion philosophy rather than growing.
+		if (s_block_table_count * 4 >= BlockTableSize * 3)
+			Arm64EE::Reset();
+		Block& block = InsertBlock(pc);
 		block.source = source;
 		const u32 limit = std::min(MaxInstructions, (4096 - (pc & 4095)) / 4);
 		while (block.word_count < limit)
@@ -128,7 +190,7 @@ namespace
 __noinline void Arm64EE::Reset()
 {
 	s_lookup.fill({});
-	s_blocks.clear();
+	ClearBlockTable();
 	s_last_dispatch_pc = 0;
 	s_last_dispatch_block = nullptr;
 	s_write = SysMemory::GetEERec();
@@ -141,7 +203,7 @@ __noinline void Arm64EE::Reset()
 void Arm64EE::Shutdown()
 {
 	s_lookup.fill({});
-	decltype(s_blocks){}.swap(s_blocks);
+	ClearBlockTable();
 	s_last_dispatch_pc = 0;
 	s_last_dispatch_block = nullptr;
 	s_write = nullptr;
@@ -163,7 +225,7 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 	if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_write > s_write_limit)
 		Reset();
 	// Checked before s_lookup: see the comment on its declaration. Reset() /
-	// ClearProvider() invalidate it alongside s_lookup and s_blocks.
+	// ClearProvider() invalidate it alongside s_lookup and the block table.
 	const Block* block = s_last_dispatch_pc == pc ? s_last_dispatch_block : nullptr;
 	// Mix page and instruction bits to avoid concentrating same-offset blocks
 	// in one slot. The full PC tag keeps virtual aliases distinct.
@@ -176,8 +238,7 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		// still uses a Block and validates both instruction words below.
 		if (lookup.pc == pc && lookup.rejected_source == source && lookup.rejected_word == source[0])
 			return {};
-		const auto it = s_blocks.find(pc);
-		block = it != s_blocks.end() ? &it->second : nullptr;
+		block = FindBlock(pc);
 		lookup = {pc, 0, block, nullptr};
 	}
 	// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
@@ -252,7 +313,7 @@ namespace
 		// its space is reclaimed the same way an ordinary memcmp-miss recompile
 		// already leaks it, on the next Reset().
 		s_lookup.fill({});
-		decltype(s_blocks){}.swap(s_blocks);
+		ClearBlockTable();
 		s_last_dispatch_pc = 0;
 		s_last_dispatch_block = nullptr;
 	}
