@@ -1218,6 +1218,15 @@ void Arm64VU0Recompiler::Execute(u32 cycles)
 		InvalidateAll();
 	const FPControlRegisterBackup fpcr(EmuConfig.Cpu.VU0FPCR);
 	VU0.VI[REG_TPC].UL <<= 3;
+	// An M-bit pair (see the file comment above) sets this to end that pair's
+	// Execute() call early; the interpreter (VU0microInterp.cpp) and the old
+	// x86 recompiler (x86/microVU.cpp) both clear it again here so the next
+	// call resumes stepping. This call was missing it, so once any VU0
+	// microprogram hit an M-bit the flag stayed set forever and every later
+	// Execute() call returned immediately without advancing VU0.cycle --
+	// livelocking the EE thread, which keeps calling Execute() expecting
+	// progress. Needs proper testing across more M-bit-using microprograms.
+	VU0.flags &= ~VUFLAG_MFLAGSET;
 	const u64 start = VU0.cycle;
 	while (VU0.cycle - start < cycles)
 	{
