@@ -4,6 +4,7 @@
 #include "Common.h"
 
 #if defined(ARCH_ARM64)
+#include "MTVU.h"
 #include "arm64/VU1Recompiler.h"
 #include "arm64/VU1Pipeline.h"
 #include "Gif_Unit.h"
@@ -2149,6 +2150,165 @@ TEST_F(VU1RecompilerTest, IntegerBranchesLtzGezLezMatchInterpreter)
 				if (HasFatalFailure())
 					return;
 			}
+}
+
+TEST_F(VU1RecompilerTest, JrJumpsToRuntimeRegisterTarget)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 target_pc : {4u, 50u})
+	{
+		for (u32 budget : {1u, 2u, 3u, 8u})
+		{
+			for (bool backed_up : {false, true})
+			{
+				SCOPED_TRACE(testing::Message() << "target=" << target_pc << " budget=" << budget << " backed_up=" << backed_up);
+				VU0 = initial0;
+				VU1 = initial;
+				Put(0, 0x2ff, 0x48000000 | (5 << 11)); // JR vi5
+				Put(8, 0x800002ff, 0x40000000); // Delay slot: I = 2.0
+				Put(target_pc * 8, 0x800002ff, 0x40400000);
+				Put(target_pc * 8 + 8, 0x800002ff, 0x40800000);
+				VU1.VI[5].UL = target_pc;
+				if (backed_up)
+				{
+					VU1.VIRegNumber = 5;
+					VU1.VIOldValue = static_cast<u16>(target_pc + 1);
+					VU1.VIBackupCycles = 2;
+				}
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, JalrJumpsAndOptionallyLinksReturnAddress)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 it : {0u, 6u})
+	{
+		for (u32 budget : {1u, 2u, 3u, 8u})
+		{
+			SCOPED_TRACE(testing::Message() << "it=" << it << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			Put(0, 0x2ff, 0x4a000000 | (it << 16) | (5 << 11)); // JALR vi_it, vi5
+			Put(8, 0x800002ff, 0x40000000); // Delay slot: I = 2.0
+			Put(320, 0x800002ff, 0x40400000);
+			Put(328, 0x800002ff, 0x40800000);
+			VU1.VI[5].UL = 40;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, BalJumpsToStaticTargetAndOptionallyLinks)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 it : {0u, 7u})
+	{
+		for (u32 budget : {1u, 2u, 3u, 8u})
+		{
+			SCOPED_TRACE(testing::Message() << "it=" << it << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			Put(0, 0x2ff, 0x42000000 | (it << 16) | 39); // BAL vi_it, +39 -> target pc = 0+8+39*8=320
+			Put(8, 0x800002ff, 0x40000000); // Delay slot: I = 2.0
+			Put(320, 0x800002ff, 0x40400000);
+			Put(328, 0x800002ff, 0x40800000);
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, RegisterBranchNestedInDelaySlotUsesInterpreterFallback)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 budget : {1u, 2u, 3u, 4u, 8u, 32u})
+	{
+		SCOPED_TRACE(budget);
+		VU0 = initial0;
+		VU1 = initial;
+		Put(0, 0x2ff, 0x40000002); // B +2 -> target pc 24.
+		Put(8, 0x2ff, 0x48000000 | (5 << 11)); // JR in the delay slot: not natively resolved.
+		Put(16, 0x800002ff, 0x40000000);
+		Put(24, 0x800002ff, 0x40400000);
+		Put(32, 0x800002ff, 0x40800000);
+		VU1.VI[5].UL = 4; // If taken, JR's own target would be pc 32.
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, RegisterBranchDelaySlotEndingDeferredRegionPublishesRuntimeTarget)
+{
+	// A JR/JALR/BAL delay slot that lands as the last instruction of a deferred
+	// FMAC region must not have its runtime-resolved TPC clobbered by the
+	// region's own generic (compile-time-constant) exit bookkeeping.
+	const VURegs initial = VU1, initial0 = VU0;
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28;
+	for (bool use_bal : {false, true})
+	{
+		for (u32 it : {0u, 6u})
+		{
+			for (u32 budget : {64u, 128u, 256u})
+			{
+				SCOPED_TRACE(testing::Message() << "use_bal=" << use_bal << " it=" << it << " budget=" << budget);
+				VU0 = initial0;
+				VU1 = initial;
+				for (u32 i = 0; i < 16; i++)
+					Put(i * 8, 0x80000000 | add, 0x3f800000);
+				if (use_bal)
+					Put(16 * 8, 0x2ff, 0x42000000 | (it << 16) | 39); // BAL -> target pc 320.
+				else
+					Put(16 * 8, 0x2ff, 0x4a000000 | (it << 16) | (5 << 11)); // JALR vi_it, vi5.
+				Put(17 * 8, 0x800002ff, 0x40000000); // Delay slot: I = 2.0.
+				Put(320, 0x800002ff, 0x40400000);
+				Put(328, 0x800002ff, 0x40800000);
+				VU1.VI[5].UL = 40; // JALR target pc = 40*8 = 320, matching BAL's static target.
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, XtopXitopReadVifRegistersMatchingInterpreterSource)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	const auto saved_vif1 = vif1Regs;
+	const auto saved_thread_vif = vu1Thread.vifRegs;
+	vif1Regs.top = 0x1234;
+	vif1Regs.itop = 0x5678;
+	vu1Thread.vifRegs.top = 0x9abc;
+	vu1Thread.vifRegs.itop = 0xdef0;
+	for (bool xitop : {false, true})
+	{
+		for (u32 it : {0u, 5u})
+		{
+			SCOPED_TRACE(testing::Message() << "xitop=" << xitop << " it=" << it);
+			VU0 = initial0;
+			VU1 = initial;
+			Put(0, 0x2ff, 0x80000000 | (it << 16) | (xitop ? 0x6bd : 0x6bc));
+			Put(8, 0x800002ff, 0x3f800000);
+			Compare(1);
+			if (HasFatalFailure())
+			{
+				vif1Regs = saved_vif1;
+				vu1Thread.vifRegs = saved_thread_vif;
+				return;
+			}
+		}
+	}
+	vif1Regs = saved_vif1;
+	vu1Thread.vifRegs = saved_thread_vif;
 }
 
 TEST_F(VU1RecompilerTest, DivComputesQuotientAndDivideByZeroFlags)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "MTVU.h"
 #include "arm64/VU1Recompiler.h"
 #include "arm64/VU1Pipeline.h"
 #include "common/HostSys.h"
@@ -246,6 +247,11 @@ namespace
 		Iblez,
 		Xgkick,
 		Branch,
+		Bal,
+		Jr,
+		Jalr,
+		Xtop,
+		Xitop,
 		Unsupported
 	};
 	Lower DecodeLower(u32 code)
@@ -302,6 +308,12 @@ namespace
 				return Lower::Isubiu;
 			case 0x20:
 				return Lower::Branch;
+			case 0x21:
+				return Lower::Bal;
+			case 0x24:
+				return Lower::Jr;
+			case 0x25:
+				return Lower::Jalr;
 			case 0x40:
 				switch (code & 0x3f)
 				{
@@ -364,6 +376,10 @@ namespace
 						return Lower::Ilwr;
 					case 0x6fc:
 						return CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? Lower::Xgkick : Lower::Unsupported;
+					case 0x6bc:
+						return Lower::Xtop;
+					case 0x6bd:
+						return Lower::Xitop;
 				}
 				break;
 		}
@@ -375,6 +391,14 @@ namespace
 	{
 		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz ||
 		       op == Lower::Ibltz || op == Lower::Ibgez || op == Lower::Iblez;
+	}
+
+	// JR/JALR/BAL: always-taken branches with no compile-time-constant continuation
+	// (JR/JALR's target is a register; BAL's is static but handled the same way for
+	// one code path). EmitControlFlow, not EmitLower, generates these.
+	bool IsRegisterBranch(Lower op)
+	{
+		return op == Lower::Jr || op == Lower::Jalr || op == Lower::Bal;
 	}
 
 	void StoreWord(MacroAssembler& a, u32 value, size_t offset)
@@ -1258,6 +1282,21 @@ namespace
 			a.Strh(w0, Field(VI(it))); // Neither instruction creates an arithmetic VI backup.
 			return;
 		}
+		if (op == Lower::Xtop || op == Lower::Xitop)
+		{
+			if (!it)
+				return;
+			// THREAD_VU1 (MTVU) redirects the VIF1 registers this pipe reads to the
+			// snapshot the VU1 thread owns; baked in at compile time like the
+			// Xgkick/CHECK_XGKICKHACK decode gate above, since the setting can't
+			// change while this block is executing.
+			VIFregisters& vifRegs = THREAD_VU1 ? vu1Thread.vifRegs : vif1Regs;
+			const u32* const src = op == Lower::Xtop ? &vifRegs.top : &vifRegs.itop;
+			a.Mov(x0, reinterpret_cast<uintptr_t>(src));
+			a.Ldr(w0, MemOperand(x0));
+			a.Strh(w0, Field(VI(it)));
+			return;
+		}
 		if (op == Lower::Isw)
 		{
 			// Unlike ILW's single selected lane, ISW writes each masked lane
@@ -1432,7 +1471,7 @@ namespace
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
 			if (DecodeLower(ins.lower) != Lower::Branch && !IsIntegerBranch(DecodeLower(ins.lower)) &&
-				DecodeLower(ins.lower) != Lower::Xgkick)
+				DecodeLower(ins.lower) != Lower::Xgkick && !IsRegisterBranch(DecodeLower(ins.lower)))
 				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
@@ -1497,10 +1536,57 @@ namespace
 			StoreWord(a, 1, offsetof(VURegs, branch));
 			a.Bind(&done);
 		}
+		else if (!(ins.upper & 0x80000000) && IsRegisterBranch(DecodeLower(ins.lower)))
+		{
+			const Lower op = DecodeLower(ins.lower);
+			const u32 it_reg = (ins.lower >> 16) & 15;
+			if (op == Lower::Bal)
+			{
+				const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+				StoreWord(a, (ins.pc + 8 + displacement) & VU1_PROGMASK, offsetof(VURegs, branchpc));
+			}
+			else
+			{
+				// JR/JALR: runtime target from VI[Is].US[0] * 8. Unlike the integer
+				// branches above, _vuJR/_vuJALR read the live register directly with
+				// no VI-backup bypass, so this doesn't apply one either.
+				const u32 is_reg = (ins.lower >> 11) & 15;
+				a.Ldrh(w0, Field(VI(is_reg)));
+				a.Lsl(w0, w0, 3);
+				a.And(w0, w0, VU1_PROGMASK);
+				a.Str(w0, Field(offsetof(VURegs, branchpc)));
+			}
+			if (op != Lower::Jr && it_reg)
+			{
+				// Compile() never lets a JR/JALR/BAL land in a pending delay slot
+				// (it bails out of the trace instead), so VU->branch==1 can't be true
+				// here. _vuJALR/_vuBAL then link to (TPC+8)/8, but TPC has already
+				// been advanced past this instruction by the time they read it, so
+				// the return address is two pairs ahead: this instruction's own
+				// address + 16, not + 8.
+				a.Mov(w0, (ins.pc + 16) / 8);
+				a.Strh(w0, Field(VI(it_reg)));
+			}
+			StoreWord(a, 1, offsetof(VURegs, branch));
+		}
 		else if (block.delay[index])
 		{
+			const auto& prev = block.instructions[index - 1];
+			const bool register_target = !(prev.upper & 0x80000000) && IsRegisterBranch(DecodeLower(prev.lower));
 			StoreWord(a, 0, offsetof(VURegs, branch));
-			StoreWord(a, block.next_pc[index], VI(REG_TPC));
+			if (register_target)
+			{
+				// The preceding JR/JALR/BAL already resolved branchpc itself (at
+				// runtime for JR/JALR, statically for BAL); Compile() never gives this
+				// delay slot a compile-time next_pc to fall back on, so copy it instead
+				// of storing a literal.
+				a.Ldr(w9, Field(offsetof(VURegs, branchpc)));
+				a.Str(w9, Field(VI(REG_TPC)));
+			}
+			else
+			{
+				StoreWord(a, block.next_pc[index], VI(REG_TPC));
+			}
 		}
 	}
 
@@ -1931,7 +2017,15 @@ namespace
 		StoreWord(a, live, offsetof(VURegs, fmaccount));
 		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Str(w28, Field(VI(REG_MAC_FLAG)));
-		StoreWord(a, block.next_pc[end - 1], VI(REG_TPC));
+		// A JR/JALR/BAL delay slot ending the region already published the right
+		// TPC itself (EmitControlFlow's block.delay case, run above in this same
+		// loop): its target isn't the compile-time-constant next_pc this generic
+		// epilogue otherwise stores, so don't clobber it with that stale value.
+		const bool last_is_register_branch_delay = block.delay[end - 1] && end >= 2 &&
+			!(block.instructions[end - 2].upper & 0x80000000) &&
+			IsRegisterBranch(DecodeLower(block.instructions[end - 2].lower));
+		if (!last_is_register_branch_delay)
+			StoreWord(a, block.next_pc[end - 1], VI(REG_TPC));
 		const bool upper_code = (last.upper & 0x80000000) ||
 		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
 		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
@@ -1949,6 +2043,12 @@ namespace
 		// pairs and the size limit end the trace.
 		u32 next_pc = pc, branch_target = 0;
 		bool pending_branch = false;
+		// JR/JALR/BAL: the target isn't a compile-time constant to continue tracing
+		// into (JR/JALR read it from a register; BAL's static target is deliberately
+		// not exploited, to keep one code path). EmitControlFlow resolves branchpc
+		// itself instead of relying on a precomputed branch_target/next_pc, so the
+		// trace simply ends once their delay slot has been emitted.
+		bool pending_branch_terminal = false;
 		std::array<bool, VU1_PROGSIZE / 8> visited{};
 		for (u32 i = 0; i < MaxInstructions && next_pc < VU1_PROGSIZE; i++)
 		{
@@ -1975,16 +2075,33 @@ namespace
 			const bool branch = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Branch;
 			if (branch && (pending_branch || i + 1 == MaxInstructions))
 				break;
+			const bool terminal_branch = !(ins.upper & 0x80000000) && IsRegisterBranch(DecodeLower(ins.lower));
+			// A register/link branch found in a pending delay slot (branch-in-branch)
+			// isn't natively resolved either, same as the nested-conditional case above.
+			if (terminal_branch && (pending_branch || i + 1 == MaxInstructions))
+				break;
 			visited[ins.pc / 8] = true;
 			block->delay[i] = pending_branch;
+			const bool finishing_terminal_delay = pending_branch && pending_branch_terminal;
+			// branch_target is meaningless for a terminal delay slot; EmitControlFlow
+			// recognizes that case from the preceding instruction and ignores it.
 			block->next_pc[i] = pending_branch ? branch_target : ins.pc + 8;
 			if (pending_branch)
+			{
 				pending_branch = false;
+				pending_branch_terminal = false;
+			}
 			if (branch || conditional)
 			{
 				const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
 				branch_target = (ins.pc + 8 + displacement) & VU1_PROGMASK;
 				pending_branch = true;
+				block->has_branches = true;
+			}
+			else if (terminal_branch)
+			{
+				pending_branch = true;
+				pending_branch_terminal = true;
 				block->has_branches = true;
 			}
 			next_pc = block->next_pc[i];
@@ -2053,6 +2170,8 @@ namespace
 				}
 			}
 			block->count++;
+			if (finishing_terminal_delay)
+				break; // JR/JALR/BAL's delay slot is native; the runtime target is not.
 		}
 		VU1.code = saved_code;
 		if (block->count)
