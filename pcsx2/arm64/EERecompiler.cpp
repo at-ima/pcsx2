@@ -36,17 +36,29 @@ namespace
 	// integer division per probe to index -- measured live as ~15-22% of
 	// total EE-thread time in a busy scene. A power-of-two table needs only a
 	// mask. Entries are never individually removed (only Reset()/
-	// ClearProvider() ever clear everything at once), so an empty slot
-	// unambiguously means "not present" -- no tombstones needed.
+	// ClearProvider() ever clear everything at once). A slot's generation
+	// tag tells whether it's live without needing to physically wipe the
+	// whole table on every clear: MapTLB() calls ClearProvider() very
+	// frequently during a normal (non-savestate) boot -- once per TLB remap,
+	// many times per boot stage -- so an O(BlockTableSize) fill() on every
+	// one of those, regardless of how few blocks were actually live, made
+	// boot itself pay for clearing hundreds of thousands of always-empty
+	// slots over and over (measured live: this alone made normal boot appear
+	// to hang indefinitely, while resuming a savestate -- which barely
+	// touches MapTLB -- was unaffected). Bumping a generation counter
+	// instead is O(1): a slot is live only if its tag matches the current
+	// generation, so an old generation's entries are implicitly all "empty"
+	// without visiting them.
 	struct BlockTableSlot
 	{
 		u32 pc = 0;
-		bool occupied = false;
+		u32 generation = 0;
 		Block* block = nullptr;
 	};
 	constexpr u32 BlockTableSize = 1u << 19; // 524288: generous vs. any realistic live block-pc count
 	std::array<BlockTableSlot, BlockTableSize> s_block_table{};
 	u32 s_block_table_count = 0;
+	u32 s_block_table_generation = 1; // 0 is never used, so a default-constructed slot starts "empty"
 	u32 HashBlockPc(u32 pc) { return ((pc >> 2) * 0x9E3779B1u) >> (32 - 19); } // Fibonacci hashing, top 19 bits
 	// Existing entry for pc, or nullptr. Linear-probes from the hashed slot;
 	// bounded by BlockTableSize, though a real miss resolves in O(1) average
@@ -56,7 +68,7 @@ namespace
 		for (u32 index = HashBlockPc(pc);; index = (index + 1) & (BlockTableSize - 1))
 		{
 			const BlockTableSlot& slot = s_block_table[index];
-			if (!slot.occupied)
+			if (slot.generation != s_block_table_generation)
 				return nullptr;
 			if (slot.pc == pc)
 				return slot.block;
@@ -74,18 +86,19 @@ namespace
 		for (u32 index = HashBlockPc(pc);; index = (index + 1) & (BlockTableSize - 1))
 		{
 			BlockTableSlot& slot = s_block_table[index];
-			if (!slot.occupied || slot.pc == pc)
+			const bool empty = slot.generation != s_block_table_generation;
+			if (empty || slot.pc == pc)
 			{
-				s_block_table_count += !slot.occupied;
+				s_block_table_count += empty;
 				s_block_storage.emplace_back();
-				slot = {pc, true, &s_block_storage.back()};
+				slot = {pc, s_block_table_generation, &s_block_storage.back()};
 				return *slot.block;
 			}
 		}
 	}
 	void ClearBlockTable()
 	{
-		s_block_table.fill({});
+		s_block_table_generation++;
 		s_block_table_count = 0;
 		std::deque<Block>{}.swap(s_block_storage);
 	}
