@@ -90,6 +90,12 @@ namespace
 		for (auto& block : s_blocks)
 			block.reset();
 		s_write = s_base;
+		// The pipeline stubs live at the start of the same buffer, so rewinding
+		// s_write without dropping them leaves prepare[] pointing at memory the
+		// next compiled block overwrites -- its Blr would then land in that
+		// block's own prologue and push a frame per call until the stack
+		// overflows. Same as arm64/VU1Recompiler.cpp's InvalidateAll.
+		s_pipeline = {};
 		s_options = Options();
 	}
 

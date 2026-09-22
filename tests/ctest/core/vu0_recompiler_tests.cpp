@@ -137,4 +137,17 @@ TEST_F(VU0RecompilerTest, BackToBackDividesKeepQInSyncWithTheInterpreter)
 		Compare(budget);
 	}
 }
+
+// Every other test here compares against the interpreter, which still passes if
+// the recompiler quietly compiles nothing and steps every pair instead -- the
+// results are identical either way. Assert that native code was actually
+// emitted, so that silent degradation to the interpreter is a test failure.
+TEST_F(VU0RecompilerTest, EmitsNativeCodeForASupportedBlock)
+{
+	ASSERT_EQ(CpuArm64VU0.GetCommittedCache(), 0u);
+	VU0.VI[REG_TPC].UL = 0;
+	VU0.cycle = 0;
+	CpuArm64VU0.Execute(64);
+	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
+}
 #endif
