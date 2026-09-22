@@ -9,9 +9,7 @@
 #include <cstddef>
 
 // Mirrors arm64/VU1Pipeline.h, reduced for VU0's simpler execution model: VU0
-// has no XGKICK/GIF path, and there is no standalone retire_queues entry point
-// (that exists on VU1 only to let DIV/SQRT/RSQRT/EFU ops re-drain queues
-// mid-pair, and VU0 blocks do not compile those ops yet -- see PERFORMANCE.md).
+// has no XGKICK/GIF path, so nothing here drives the GIF or waits on a packet.
 namespace Arm64VU0
 {
 	struct Instruction
@@ -38,6 +36,11 @@ namespace Arm64VU0
 		// register set from the Instruction's lregs.VIread rather than taking a
 		// compile-time dependency slot, so it does not fit prepare[] above.
 		const void* branch_prepare = nullptr;
+		// Drains the pipe queues on its own, for an op whose body forces the cycle
+		// forward mid-pair (DIV/SQRT/RSQRT waiting on a pending divide) and so has
+		// to re-run the retirement its own prepare call already did. Skips
+		// VIBackupCycles, which must not be decremented twice for one pair.
+		const void* retire_queues = nullptr;
 		size_t size = 0;
 	};
 
