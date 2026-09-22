@@ -48,6 +48,10 @@ namespace
 		u8 cycles = 0; // Zero means that incoming timing is still unknown.
 		u8 retired = 0;
 		u8 remaining = 0;
+		// A divide issued earlier in the block may still be in the FDIV pipe here,
+		// so this pair has to retire it itself instead of leaving that to the
+		// generic per-pair preparation it is replacing.
+		bool fdiv_pending = false;
 	};
 
 	struct Block
@@ -1734,21 +1738,36 @@ namespace
 			if ((ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread) ||
 				ins.lregs.pipe == VUPIPE_XGKICK || (i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
+			// Touching Q or P while an entry issued earlier is still in the FDIV/EFU
+			// pipe stalls the pair until that entry retires (_vuTestFDIVStalls), so
+			// VURegs::cycle jumps by an amount nothing here can predict. Hand the age
+			// tracking below an unknown advance instead of the nominal one; this is
+			// what keeps the pairs after a WAITQ or a Q read off the schedule until
+			// their producers' ages have provably recovered. Read before this pair's
+			// own issue updates fdiv_ready/efu_ready, since a pipe it arms itself
+			// cannot be what it stalls on.
+			constexpr u32 kQP = (1 << REG_Q) | (1 << REG_P);
+			if ((i < fdiv_ready || i < efu_ready) &&
+				((ins.uregs.VIread | ins.lregs.VIread | ins.uregs.VIwrite | ins.lregs.VIwrite) & kQP))
+				cycles = -1;
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
-			// A deferred region skips the shared preparation, so nothing would retire
-			// the single FDIV slot while its entry is outstanding. Keep those pairs
-			// on the generic path until the pipe has had its full latency.
+			// Divides are frequent enough in transform code that excluding their whole
+			// latency from scheduling costs far more than retiring the pipe's single
+			// slot inline: those pairs carry fdiv_pending instead and do it themselves
+			// (see EmitScheduledPrepare). Deferred regions still cannot cover them,
+			// since they hold the status flag in a host register.
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
 				fdiv_ready = i + ins.lregs.cycles + 1;
-			// Same as fdiv_ready, for the EFU pipe's single slot (ESADD..EEXP,
-			// retiring into P instead of Q).
+			// The EFU pipe's single slot (ESADD..EEXP, retiring into P) is rare enough
+			// that it keeps the simpler treatment: stay generic for its full latency.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
 				efu_ready = i + ins.lregs.cycles + 1;
-			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= fdiv_ready && i >= efu_ready &&
+			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= efu_ready &&
 				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
+				plan.fdiv_pending = i < fdiv_ready;
 				for (u32 j = i - 4; j < i; j++)
 				{
 					const auto& producer = block.instructions[j];
@@ -1914,6 +1933,32 @@ namespace
 			}
 			a.Str(w10, Field(offsetof(VURegs, fmacreadpos)));
 			StoreWord(a, plan.remaining, offsetof(VURegs, fmaccount));
+		}
+		if (plan.fdiv_pending)
+		{
+			// The FDIV slot the generic preparation would have drained, in
+			// VUPipeline::Retire's order: after the FMAC writeback above, because
+			// both merge into VI[REG_STATUS_FLAG]. Cheap when nothing is due, which
+			// is the common case even inside a divide's latency.
+			Label end;
+			constexpr size_t offset = offsetof(VURegs, fdiv);
+			a.Ldr(w10, Field(offset + offsetof(fdivPipe, enable)));
+			a.Cbz(w10, &end);
+			a.Ldr(x10, Field(offset + offsetof(fdivPipe, sCycle)));
+			a.Ldr(w11, Field(offset + offsetof(fdivPipe, Cycle)));
+			a.Sub(x10, x26, x10);
+			a.Cmp(x10, x11);
+			a.B(lo, &end);
+			a.Str(wzr, Field(offset + offsetof(fdivPipe, enable)));
+			a.Ldr(w10, Field(offset + offsetof(fdivPipe, reg)));
+			a.Str(w10, Field(VI(REG_Q)));
+			a.Ldr(w10, Field(VI(REG_STATUS_FLAG)));
+			a.And(w10, w10, 0xfcf);
+			a.Ldr(w11, Field(offset + offsetof(fdivPipe, statusflag)));
+			a.And(w11, w11, 0xc30);
+			a.Orr(w10, w10, w11);
+			a.Str(w10, Field(VI(REG_STATUS_FLAG)));
+			a.Bind(&end);
 		}
 		// Special work has drained at scheduled pairs. ILW clears readiness and
 		// keeps retirement generic until its queue drains; broader games need proper testing.
@@ -2196,16 +2241,21 @@ namespace
 				u32 first, end, cycles;
 			};
 			std::vector<DeferredRegion> regions;
+			// A deferred region keeps the status flag in a host register, so it cannot
+			// contain a pair that retires the FDIV pipe into the architectural one.
+			const auto deferrable = [&](u32 i) {
+				return block->schedule[i].cycles && !block->schedule[i].fdiv_pending;
+			};
 			for (u32 i = 7; i < block->count;)
 			{
-				if (!block->schedule[i].cycles)
+				if (!deferrable(i))
 				{
 					i++;
 					continue;
 				}
 				const u32 first = i;
 				u32 cycles = 0;
-				while (i < block->count && block->schedule[i].cycles)
+				while (i < block->count && deferrable(i))
 					cycles += block->schedule[i++].cycles;
 				if (i - first >= 8)
 					regions.push_back({first, i, cycles});

@@ -2455,6 +2455,36 @@ TEST_F(VU1RecompilerTest, WaitqStallsOnPendingFdivPipeAcrossBudgets)
 		}
 }
 
+TEST_F(VU1RecompilerTest, PairsInsideADivideLatencyStayScheduled)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// A divide's seven-cycle latency used to force every pair it covered onto the
+	// generic per-pair preparation, which measured as a sixth of all VU1 pairs in
+	// Ridge Racer V. Those pairs are scheduled now and retire the FDIV slot inline
+	// instead, so the divide's result, the status flag it merges and the FMAC
+	// queue all have to come out exactly as the interpreter leaves them -- for the
+	// pairs before the divide retires, the one it retires at, and the MULq that
+	// consumes Q afterwards (which stalls, so the pairs after it must fall back).
+	constexpr u32 kMadd = 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28;
+	constexpr u32 kMulQ = (15 << 21) | (1 << 11) | (1 << 6) | 0x1c;
+	for (u32 budget = 1; budget <= 34; budget++)
+	{
+		SCOPED_TRACE(testing::Message() << budget);
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.VI[REG_Q].UL = 0x3f800000;
+		VU1.VF[1].F[0] = 5.0f;
+		VU1.VF[1].F[1] = 2.0f;
+		for (u32 pc = 0; pc < 256; pc += 8)
+			Put(pc, kMadd, 0x3f800000);
+		Put(64, 0x2ff, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y at i=8
+		Put(160, kMulQ, 0x3f800000); // i=20, long after the divide has come due
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, WaitqExcludedFromPrecomputedSchedule)
 {
 	const VURegs initial = VU1, initial0 = VU0;
