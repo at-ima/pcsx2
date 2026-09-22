@@ -246,6 +246,10 @@ namespace
 		Fmeq,
 		Fmand,
 		Fmor,
+		Div,
+		Sqrt,
+		Rsqrt,
+		Waitq,
 		Branch,
 		Ibeq,
 		Ibne,
@@ -325,6 +329,14 @@ namespace
 				}
 				switch (code & 0x7ff)
 				{
+					case 0x3bc:
+						return Lower::Div;
+					case 0x3bd:
+						return Lower::Sqrt;
+					case 0x3be:
+						return Lower::Rsqrt;
+					case 0x3bf:
+						return Lower::Waitq;
 					case 0x37c:
 						return Lower::Lqi;
 					case 0x37d:
@@ -709,6 +721,57 @@ namespace
 		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
 	}
 
+	// Ported from VU1Recompiler.cpp. A pending divide has to finish before another
+	// FDIV-pipe op issues (_vuTestFDIVStalls), which can force VURegs::cycle
+	// forward mid-pair, so the queues this pair's prepare call already drained are
+	// drained again afterwards -- matching the interpreter running _vuTestPipes
+	// again after _vuTestFDIVStalls in its own per-instruction dispatch order.
+	void EmitFDIVStall(MacroAssembler& a)
+	{
+		Label not_pending;
+		a.Ldr(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+		a.Cbz(w9, &not_pending);
+		a.Ldr(x9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, sCycle)));
+		a.Ldr(w10, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, Cycle)));
+		a.Add(x9, x9, x10);
+		a.Cmp(x26, x9);
+		a.Csel(x26, x9, x26, lo);
+		a.Str(x26, Field(offsetof(VURegs, cycle)));
+		a.Ldr(w10, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, reg)));
+		a.Str(w10, Field(VI(REG_Q)));
+		a.Ldr(w10, Field(VI(REG_STATUS_FLAG)));
+		a.And(w10, w10, 0xfcf);
+		a.Ldr(w11, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, statusflag)));
+		a.And(w11, w11, 0xc30);
+		a.Orr(w10, w10, w11);
+		a.Str(w10, Field(VI(REG_STATUS_FLAG)));
+		// The forced advance above always reaches at least the entry's own ready
+		// cycle, so it is fully retired now. DIV/SQRT/RSQRT re-arm the pipe right
+		// after and would overwrite this either way, but WAITQ issues nothing and
+		// needs the pipe left empty.
+		a.Str(wzr, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(s_pipeline.retire_queues));
+		a.Blr(x16);
+		EmitBlockConstants(a);
+		a.Bind(&not_pending);
+	}
+
+	// w0 = result bits, w1 = statusflag bits, both already computed by the caller.
+	void EmitFDIVFinish(MacroAssembler& a, u32 cycles)
+	{
+		a.Str(w1, Field(offsetof(VURegs, statusflag)));
+		// The op also leaves its result in the staging Q field itself, distinct
+		// from the architectural VI(REG_Q) the FDIV pipe retires into later.
+		a.Str(w0, Field(offsetof(VURegs, q)));
+		a.Str(w0, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, reg)));
+		a.Str(w1, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, statusflag)));
+		a.Str(x26, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, sCycle)));
+		a.Mov(w9, cycles);
+		a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, Cycle)));
+		a.Mov(w9, 1);
+		a.Str(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
+	}
+
 	// Reduced from VU1Recompiler.cpp's EmitLower: only the non-FDIV/EFU-pipe
 	// cases DecodeLower can return (see above) are handled here.
 	void EmitLower(MacroAssembler& a, const VectorCache& cache, u32 code)
@@ -794,6 +857,142 @@ namespace
 			a.And(w0, w0, 0x3f);
 			a.Orr(w0, w0, (((code >> 21) & 1) << 11 | (code & 0x7ff)) & 0xfc0);
 			a.Str(w0, Field(offsetof(VURegs, statusflag)));
+			return;
+		}
+		if (op == Lower::Div)
+		{
+			// Mirrors _vuDIV/_vuFDIVAdd: compute now (matching the interpreter's
+			// immediate statusflag write), then stage Q into the shared FDIV pipe
+			// so the generic retirement code publishes it after 7 cycles, needs
+			// proper testing against every division-by-zero/sign combination.
+			EmitFDIVStall(a);
+			const u32 fsf = (code >> 21) & 3, ftf = (code >> 23) & 3;
+			LoadVector(a, cache, q0, fs);
+			LoadVector(a, cache, q1, ft);
+			a.Dup(v2.V4S(), v0.V4S(), fsf);
+			a.Dup(v3.V4S(), v1.V4S(), ftf);
+			ClampInput(a, v2); // fs, after vuDouble
+			ClampInput(a, v3); // ft, after vuDouble
+			a.Umov(w2, v2.V4S(), 0);
+			a.Umov(w3, v3.V4S(), 0);
+			Label is_zero, have_result, done;
+			a.Fcmp(s3, 0.0);
+			a.B(eq, &is_zero);
+			a.Fdiv(s4, s2, s3);
+			a.Dup(v4.V4S(), v4.V4S(), 0);
+			ClampInput(a, v4); // result, after vuDouble
+			a.Umov(w0, v4.V4S(), 0);
+			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+			a.And(w1, w1, 0xffffffcf);
+			a.B(&have_result);
+			a.Bind(&is_zero);
+			{
+				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+				a.And(w1, w1, 0xffffffcf);
+				a.Fcmp(s2, 0.0);
+				Label fs_nonzero;
+				a.B(ne, &fs_nonzero);
+				a.Orr(w1, w1, 0x10); // fs == 0 && ft == 0: invalid (I flag)
+				a.B(&done);
+				a.Bind(&fs_nonzero);
+				a.Orr(w1, w1, 0x20); // fs != 0 && ft == 0: divide-by-zero (D flag)
+				a.Bind(&done);
+			}
+			// Signed max float, matching the sign of fs's numerator over ft's zero.
+			a.Eor(w0, w2, w3);
+			a.Mov(w4, 0x7f7fffff);
+			a.Mov(w5, 0xff7fffff);
+			a.Tst(w0, 0x80000000);
+			a.Csel(w0, w5, w4, ne);
+			a.Bind(&have_result);
+			EmitFDIVFinish(a, 7);
+			return;
+		}
+		if (op == Lower::Sqrt)
+		{
+			// Mirrors _vuSQRT: q = sqrt(fabs(ft)), needs proper testing against
+			// every sign/denormal/non-finite combination.
+			EmitFDIVStall(a);
+			const u32 ftf = (code >> 23) & 3;
+			LoadVector(a, cache, q1, ft);
+			a.Dup(v3.V4S(), v1.V4S(), ftf);
+			ClampInput(a, v3); // ft, after vuDouble
+			a.Fabs(s4, s3);
+			a.Fsqrt(s4, s4);
+			a.Dup(v4.V4S(), v4.V4S(), 0);
+			ClampInput(a, v4); // result, after vuDouble
+			a.Umov(w0, v4.V4S(), 0);
+			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+			a.And(w1, w1, 0xffffffcf);
+			// "pl" (N==0) matches a plain "ft < 0.0" comparison, including the
+			// false-for-NaN case; "lt"/"ge" treat unordered operands as taken.
+			a.Fcmp(s3, 0.0);
+			Label not_negative;
+			a.B(pl, &not_negative);
+			a.Orr(w1, w1, 0x10); // I flag
+			a.Bind(&not_negative);
+			EmitFDIVFinish(a, 7);
+			return;
+		}
+		if (op == Lower::Rsqrt)
+		{
+			// Mirrors _vuRSQRT: q = fs / sqrt(fabs(ft)), with ft == 0 branching
+			// into a deeper zero-handling case than DIV's, needs proper testing
+			// against every sign/zero/denormal/non-finite combination.
+			EmitFDIVStall(a);
+			const u32 fsf = (code >> 21) & 3, ftf = (code >> 23) & 3;
+			LoadVector(a, cache, q0, fs);
+			LoadVector(a, cache, q1, ft);
+			a.Dup(v2.V4S(), v0.V4S(), fsf);
+			a.Dup(v3.V4S(), v1.V4S(), ftf);
+			ClampInput(a, v2); // fs, after vuDouble
+			ClampInput(a, v3); // ft, after vuDouble
+			a.Umov(w2, v2.V4S(), 0);
+			a.Umov(w3, v3.V4S(), 0);
+			Label ft_zero, have_result;
+			a.Fcmp(s3, 0.0);
+			a.B(eq, &ft_zero);
+			a.Fabs(s5, s3);
+			a.Fsqrt(s5, s5);
+			a.Fdiv(s4, s2, s5);
+			a.Dup(v4.V4S(), v4.V4S(), 0);
+			ClampInput(a, v4); // result, after vuDouble
+			a.Umov(w0, v4.V4S(), 0);
+			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+			a.And(w1, w1, 0xffffffcf);
+			// See the SQRT case: "pl" is the correct false-for-NaN "ft < 0.0" test.
+			a.Fcmp(s3, 0.0);
+			a.B(pl, &have_result);
+			a.Orr(w1, w1, 0x10); // I flag
+			a.B(&have_result);
+			a.Bind(&ft_zero);
+			{
+				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
+				a.And(w1, w1, 0xffffffcf);
+				a.Orr(w1, w1, 0x20); // D flag, always: division by zero
+				a.Eor(w0, w2, w3);
+				a.And(w0, w0, 0x80000000);
+				Label fs_zero;
+				a.Fcmp(s2, 0.0);
+				a.B(eq, &fs_zero);
+				// fs != 0: signed max float, matching the sign of fs over ft's zero.
+				a.Mov(w4, 0x7f7fffff);
+				a.Orr(w0, w0, w4);
+				a.B(&have_result);
+				a.Bind(&fs_zero);
+				// fs == 0 too: signed zero, and I joins D (both flags set).
+				a.Orr(w1, w1, 0x10);
+			}
+			a.Bind(&have_result);
+			EmitFDIVFinish(a, 13);
+			return;
+		}
+		if (op == Lower::Waitq)
+		{
+			// _vuWAITQ's body is empty; its only effect is the pending-FDIV stall
+			// every FDIV-pipe op takes before doing anything else. It does not
+			// issue a new pipe entry, so there is nothing to finish.
+			EmitFDIVStall(a);
 			return;
 		}
 		if (op == Lower::Ilw || op == Lower::Ilwr)

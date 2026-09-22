@@ -22,8 +22,7 @@ namespace
 		return (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | op;
 	}
 
-	// DIV Q, VFs[fsf], VFt[ftf]. VU0Recompiler.cpp never compiles this, so it
-	// always runs through the interpreter and leaves its result in the FDIV pipe.
+	// DIV Q, VFs[fsf], VFt[ftf].
 	constexpr u32 MakeDiv(u32 fs, u32 fsf, u32 ft, u32 ftf)
 	{
 		return (0x40u << 25) | (ftf << 23) | (fsf << 21) | (ft << 16) | (fs << 11) | 0x3bc;
@@ -99,6 +98,24 @@ namespace
 			EmuConfig.Cpu = m_cpu;
 		}
 
+		// Rewinds to a coherent starting state. Resetting VU0.cycle without also
+		// emptying the pipe queues would leave entries whose sCycle sits in the
+		// future relative to the rewound clock -- a state the emulator never
+		// reaches, and one the two execution paths resolve differently.
+		void Rewind()
+		{
+			VU0.VI[REG_TPC].UL = 0;
+			VU0.cycle = 0;
+			std::memset(VU0.fmac, 0, sizeof(VU0.fmac));
+			VU0.fmacreadpos = VU0.fmacwritepos = VU0.fmaccount = 0;
+			std::memset(VU0.ialu, 0, sizeof(VU0.ialu));
+			VU0.ialureadpos = VU0.ialuwritepos = VU0.ialucount = 0;
+			std::memset(&VU0.fdiv, 0, sizeof(VU0.fdiv));
+			std::memset(&VU0.efu, 0, sizeof(VU0.efu));
+			VU0.VIBackupCycles = 0;
+			VU0.branch = VU0.ebit = 0;
+		}
+
 		void Put(u32 pc, u32 upper, u32 lower)
 		{
 			std::memcpy(VU0.Micro + pc, &lower, 4);
@@ -136,12 +153,11 @@ namespace
 	};
 } // namespace
 
-// A compiled block never contains DIV itself (VU0Recompiler.cpp's Compile()
-// stops the block right before it, same as any other unsupported lower op), but
-// it does compile the ops that read Q afterward. The block's own cycle-driven
-// retire step therefore has to flush the FDIV pipe as it advances the cycle, or
-// a Q consumer past the divide's latency reads a stale value -- reproducing the
-// shape of the Ridge Racer V regression this fixes (see VU0Pipeline.cpp).
+// A divide stages its result in the FDIV pipe, and the block's own cycle-driven
+// retire step has to flush that pipe as it advances the cycle, or a Q consumer
+// past the divide's latency reads a stale value -- the shape of the Ridge Racer
+// V regression VU0Pipeline.cpp's FDIV retirement fixed. Back-to-back divides
+// additionally make the second one stall on the first.
 TEST_F(VU0RecompilerTest, BackToBackDividesKeepQInSyncWithTheInterpreter)
 {
 	constexpr u32 kMulQ = MakeUpper(0x1c, 15, 5, 6, 0);
@@ -149,8 +165,7 @@ TEST_F(VU0RecompilerTest, BackToBackDividesKeepQInSyncWithTheInterpreter)
 	for (u32 budget : {4u, 8u, 16u, 24u, 40u, 64u})
 	{
 		SCOPED_TRACE(testing::Message() << "budget=" << budget);
-		VU0.VI[REG_TPC].UL = 0;
-		VU0.cycle = 0;
+		Rewind();
 		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
 			Put(pc, kNopUpper, kNopLower);
 		Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
@@ -186,8 +201,7 @@ TEST_F(VU0RecompilerTest, BranchesWaitForAPendingIntegerLoad)
 	for (u32 budget : {4u, 8u, 16u, 32u, 64u})
 	{
 		SCOPED_TRACE(testing::Message() << "budget=" << budget);
-		VU0.VI[REG_TPC].UL = 0;
-		VU0.cycle = 0;
+		Rewind();
 		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
 			Put(pc, kNopUpper, kNopLower);
 		Put(0, kNopUpper, MakeIaddiu(3, 0, 0)); // vi3 = 0 (load address)
@@ -215,8 +229,7 @@ TEST_F(VU0RecompilerTest, ConditionalLoopBranchesMatchTheInterpreter)
 	for (u32 budget : {4u, 8u, 16u, 32u, 64u, 128u})
 	{
 		SCOPED_TRACE(testing::Message() << "budget=" << budget);
-		VU0.VI[REG_TPC].UL = 0;
-		VU0.cycle = 0;
+		Rewind();
 		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
 			Put(pc, kNopUpper, kNopLower);
 		Put(0, kNopUpper, MakeIaddiu(1, 0, 4)); // vi1 = 4
@@ -234,5 +247,17 @@ TEST_F(VU0RecompilerTest, ConditionalLoopBranchesMatchTheInterpreter)
 
 		Compare(budget);
 	}
+}
+
+// DIV/SQRT/RSQRT are the remaining reason VU0 traces were cut short, so assert
+// that a block starting on one is actually compiled rather than handed back to
+// the interpreter a pair at a time.
+TEST_F(VU0RecompilerTest, EmitsNativeCodeForABlockStartingOnADivide)
+{
+	ASSERT_EQ(CpuArm64VU0.GetCommittedCache(), 0u);
+	Rewind();
+	Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
+	CpuArm64VU0.Execute(64);
+	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
 }
 #endif
