@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <vector>
 
 // Native ARM64 block recompiler for VU0 micro-mode, mirroring
 // arm64/VU1Recompiler.cpp's codegen for the FMAC/upper-instruction set and a
@@ -18,11 +19,12 @@
 //  - VU0 has no XGKICK/GIF path (there is no Lower::Xgkick case at all).
 //  - VU0 always runs synchronously on the EE thread, so there is no
 //    MTVU-equivalent concept here.
-//  - A block never contains a branch (static or integer-conditional): the
-//    trace stops one pair before any lower op classified VUPIPE_BRANCH, same
-//    as it stops before any unsupported op. This also means a block can
-//    never revisit its own entry PC, so unlike VU1Recompiler.cpp there is no
-//    loop-to-entry back-edge to generate.
+//  - A block may contain a static B and integer-conditional branches: the
+//    trace follows the taken edge and the generated guard leaves the block on
+//    the fallthrough. JR/JALR/BAL still end it -- their continuation is not a
+//    compile-time constant -- as does any other lower op classified
+//    VUPIPE_BRANCH. A repeated PC also ends the trace, so unlike
+//    VU1Recompiler.cpp there is no loop-to-entry back-edge to generate yet.
 //  - A block never contains an E/M/D/T-bit pair (VU0's M-bit -- unlike
 //    VU1 -- ends interpreter execution after the pair; see VU0microInterp.cpp's
 //    VUFLAG_MFLAGSET check), or a DIV/SQRT/RSQRT/WAITQ/EFU-pipe (ESADD..WAITP)
@@ -63,6 +65,16 @@ namespace
 		using Function = void (*)(u64 start, u64 cycles);
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<u32, MaxInstructions * 2> words{};
+		// A trace that follows a branch is no longer one contiguous span of micro
+		// memory, so validation walks the traced ranges instead of one memcmp.
+		struct SourceRange
+		{
+			u32 pc, first, count;
+		};
+		std::vector<SourceRange> ranges;
+		std::array<u32, MaxInstructions> next_pc{};
+		std::array<bool, MaxInstructions> delay{};
+		bool has_branches = false;
 		u32 count = 0;
 		VectorCache cache;
 		Function function = nullptr;
@@ -197,9 +209,9 @@ namespace
 	// Reduced from VU1Recompiler.cpp's Lower: no Xgkick (VU0 has no GIF path),
 	// no Div/Sqrt/Rsqrt/Waitq (FDIV pipe) or Esadd..Waitp (EFU pipe) -- those
 	// opcodes fall straight through to Unsupported below, same as any other
-	// not-yet-natively-compiled instruction, and no branch entries: a branch
-	// is detected generically at compile time via lregs.pipe == VUPIPE_BRANCH
-	// (see Compile()) rather than by opcode, so it never needs its own enum case.
+	// not-yet-natively-compiled instruction. JR/JALR/BAL have no entry either:
+	// they are detected generically via lregs.pipe == VUPIPE_BRANCH in
+	// Compile(), which ends the trace there.
 	enum class Lower
 	{
 		Lq,
@@ -234,6 +246,13 @@ namespace
 		Fmeq,
 		Fmand,
 		Fmor,
+		Branch,
+		Ibeq,
+		Ibne,
+		Ibltz,
+		Ibgtz,
+		Iblez,
+		Ibgez,
 		Unsupported
 	};
 	Lower DecodeLower(u32 code)
@@ -272,6 +291,20 @@ namespace
 				return Lower::Fmor;
 			case 0x1c:
 				return Lower::Fcget;
+			case 0x20:
+				return Lower::Branch;
+			case 0x28:
+				return Lower::Ibeq;
+			case 0x29:
+				return Lower::Ibne;
+			case 0x2c:
+				return Lower::Ibltz;
+			case 0x2d:
+				return Lower::Ibgtz;
+			case 0x2e:
+				return Lower::Iblez;
+			case 0x2f:
+				return Lower::Ibgez;
 			case 8:
 				return Lower::Iaddiu;
 			case 9:
@@ -314,6 +347,12 @@ namespace
 				break;
 		}
 		return Lower::Unsupported;
+	}
+
+	bool IsIntegerBranch(Lower op)
+	{
+		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz ||
+		       op == Lower::Ibltz || op == Lower::Ibgez || op == Lower::Iblez;
 	}
 
 	void StoreWord(MacroAssembler& a, u32 value, size_t offset)
@@ -940,9 +979,86 @@ namespace
 			}
 			if (publish_code)
 				StoreWord(a, ins.lower, offsetof(VURegs, code));
-			EmitLower(a, cache, ins.lower);
+			const Lower lower_op = DecodeLower(ins.lower);
+			if (lower_op != Lower::Branch && !IsIntegerBranch(lower_op))
+				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
+		}
+	}
+
+	// Ported from VU1Recompiler.cpp's EmitControlFlow, minus its JR/JALR/BAL
+	// (register-target) path: Compile() still stops the trace before those, so
+	// they keep falling back to the interpreter. A branch publishes branchpc and
+	// VU->branch here; the following delay-slot pair clears VU->branch and
+	// overwrites the TPC the pipeline stub wrote with the resolved target.
+	// needs proper testing against microprograms with back-to-back branches.
+	void EmitControlFlow(MacroAssembler& a, const Block& block, u32 index)
+	{
+		const auto& ins = block.instructions[index];
+		const bool immediate = ins.upper & 0x80000000;
+		const Lower op = immediate ? Lower::Unsupported : DecodeLower(ins.lower);
+		if (!immediate && op == Lower::Branch)
+		{
+			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+			StoreWord(a, (ins.pc + 8 + displacement) & VU0_PROGMASK, offsetof(VURegs, branchpc));
+			StoreWord(a, 1, offsetof(VURegs, branch));
+		}
+		else if (!immediate && IsIntegerBranch(op))
+		{
+			Label done;
+			// VIBackupCycles/VIOldValue reproduce the interpreter's one-pair integer
+			// write delay, so a branch reading the register the previous pair wrote
+			// sees the pre-write value exactly as VU0microInterp.cpp does.
+			const auto load_operand = [&](const Register& dest, u32 reg) {
+				Label current;
+				a.Ldrsh(dest, Field(VI(reg)));
+				a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+				a.Cbz(w9, &current);
+				a.Ldr(w9, Field(offsetof(VURegs, VIRegNumber)));
+				a.Cmp(w9, reg);
+				a.B(ne, &current);
+				a.Ldrsh(dest, Field(offsetof(VURegs, VIOldValue)));
+				a.Bind(&current);
+			};
+			load_operand(w0, (ins.lower >> 11) & 15);
+			if (op == Lower::Ibgtz || op == Lower::Ibltz || op == Lower::Ibgez || op == Lower::Iblez)
+			{
+				// Skip (to done) on the condition opposite the one that takes the branch.
+				a.Cmp(w0, 0);
+				Condition skip;
+				switch (op)
+				{
+					case Lower::Ibgtz:
+						skip = le;
+						break;
+					case Lower::Ibltz:
+						skip = ge;
+						break;
+					case Lower::Ibgez:
+						skip = lt;
+						break;
+					default: // Iblez
+						skip = gt;
+						break;
+				}
+				a.B(skip, &done);
+			}
+			else
+			{
+				load_operand(w1, (ins.lower >> 16) & 15);
+				a.Cmp(w0, w1);
+				a.B(op == Lower::Ibeq ? ne : eq, &done);
+			}
+			const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+			StoreWord(a, (ins.pc + 8 + displacement) & VU0_PROGMASK, offsetof(VURegs, branchpc));
+			StoreWord(a, 1, offsetof(VURegs, branch));
+			a.Bind(&done);
+		}
+		else if (block.delay[index])
+		{
+			StoreWord(a, 0, offsetof(VURegs, branch));
+			StoreWord(a, block.next_pc[index], VI(REG_TPC));
 		}
 	}
 
@@ -1023,10 +1139,18 @@ namespace
 			InvalidateAll();
 		auto block = std::make_unique<Block>();
 		const u32 saved_code = VU0.code;
-		u32 next_pc = pc;
+		// Follow static B and taken integer-branch edges into one trace, with a
+		// single vector-cache and pipeline schedule. A repeated PC ends the trace:
+		// unlike VU1 there is no native loop-to-entry back-edge here yet, so a
+		// revisit simply becomes the next block's entry.
+		u32 next_pc = pc, branch_target = 0;
+		bool pending_branch = false;
+		std::array<bool, VU0_PROGSIZE / 8> visited{};
 		for (u32 i = 0; i < MaxInstructions && next_pc < VU0_PROGSIZE; i++)
 		{
 			auto& ins = block->instructions[i];
+			if (visited[next_pc / 8])
+				break;
 			ins.pc = next_pc;
 			std::memcpy(&ins.lower, VU0.Micro + ins.pc, 4);
 			std::memcpy(&ins.upper, VU0.Micro + ins.pc + 4, 4);
@@ -1044,7 +1168,18 @@ namespace
 			{
 				VU0.code = ins.lower;
 				VU0regs_LOWER_OPCODE[ins.lower >> 25](&ins.lregs);
-				if (ins.lregs.pipe == VUPIPE_BRANCH || DecodeLower(ins.lower) == Lower::Unsupported)
+				const Lower lower_op = DecodeLower(ins.lower);
+				const bool is_branch = lower_op == Lower::Branch || IsIntegerBranch(lower_op);
+				// JR/JALR/BAL still end the trace: their continuation is not a
+				// compile-time constant, so there is nothing to keep tracing into.
+				if (ins.lregs.pipe == VUPIPE_BRANCH && !is_branch)
+					break;
+				// A branch landing in another branch's delay slot is not resolved
+				// natively, and a branch as the final slot has nowhere to put its
+				// delay pair.
+				if (is_branch && (pending_branch || i + 1 == MaxInstructions))
+					break;
+				if (lower_op == Lower::Unsupported)
 					break;
 			}
 			VU0.code = ins.upper;
@@ -1077,8 +1212,45 @@ namespace
 					}
 				}
 			}
+			visited[ins.pc / 8] = true;
+			block->delay[i] = pending_branch;
+			block->next_pc[i] = pending_branch ? branch_target : ins.pc + 8;
+			if (pending_branch)
+				pending_branch = false;
+			if (!(ins.upper & 0x80000000))
+			{
+				const Lower lower_op = DecodeLower(ins.lower);
+				if (lower_op == Lower::Branch || IsIntegerBranch(lower_op))
+				{
+					const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+					branch_target = (ins.pc + 8 + displacement) & VU0_PROGMASK;
+					pending_branch = true;
+					block->has_branches = true;
+				}
+			}
+			// Record the traced spans so Matches() can revalidate a trace that is
+			// no longer one contiguous run of micro memory.
+			if (!block->ranges.empty() && block->ranges.back().pc + block->ranges.back().count * 8 == ins.pc)
+				block->ranges.back().count++;
+			else
+				block->ranges.push_back({ins.pc, i, 1});
 			block->count++;
-			next_pc += 8;
+			next_pc = block->next_pc[i];
+			if (pending_branch)
+				next_pc &= VU0_PROGMASK; // A delay pair may wrap micro memory.
+		}
+		// A trace may not end on an unretired branch: its delay pair carries the
+		// target, so drop the branch and let the interpreter retire it instead.
+		while (block->count && block->delay[block->count - 1] == false &&
+			   !(block->instructions[block->count - 1].upper & 0x80000000) &&
+			   (DecodeLower(block->instructions[block->count - 1].lower) == Lower::Branch ||
+				   IsIntegerBranch(DecodeLower(block->instructions[block->count - 1].lower))))
+		{
+			block->count--;
+			while (!block->ranges.empty() && block->ranges.back().first >= block->count)
+				block->ranges.pop_back();
+			if (!block->ranges.empty())
+				block->ranges.back().count = block->count - block->ranges.back().first;
 		}
 		VU0.code = saved_code;
 		if (block->count)
@@ -1127,6 +1299,18 @@ namespace
 				EmitPair(a, cache, ins, true);
 				EmitFinish(a, ins);
 				EmitIntegerIssue(a, ins);
+				EmitControlFlow(a, *block, i);
+				if (!(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower)) &&
+					i + 1 < block->count)
+				{
+					// The trace followed the taken edge, so only that path may run the
+					// connected delay pair. On the fallthrough there is no pending
+					// branch: leave with the TPC the pipeline stub already wrote
+					// (this pair's pc + 8, i.e. the delay slot) and let the dispatcher
+					// pick the trace up from there.
+					a.Ldr(w9, Field(offsetof(VURegs, branch)));
+					a.Cbz(w9, &exit);
+				}
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
 				a.B(hs, &exit);
@@ -1155,17 +1339,29 @@ namespace
 		return *result;
 	}
 
-	// A block's pairs are always contiguous (no branches, no wraparound), so
-	// validation is a single memcmp over the whole traced span. An
-	// unsupported-first-pair block still caches (and must still validate)
-	// the one pair that was rejected, so self-modified code at pc that
-	// becomes supported later is recompiled instead of falling back forever.
-	bool Matches(const Block& block, u32 pc)
+	// A trace that follows a branch is not one contiguous span, so validation
+	// walks the recorded source ranges. An unsupported-first-pair block still
+	// caches (and must still validate) the one pair that was rejected, so
+	// self-modified code at pc that becomes supported later is recompiled
+	// instead of falling back forever.
+	bool Matches(const Block& block, u32 pc, u64 max_pairs)
 	{
 		if (!block.count)
 			return std::memcmp(block.words.data(), VU0.Micro + pc, 8) == 0;
-		return std::memcmp(block.words.data(), VU0.Micro + pc, block.count * 8) == 0;
+		// Every pair advances at least one cycle, so a short call cannot reach the
+		// tail of a long trace; only validate as far as this call could run.
+		for (const auto& range : block.ranges)
+		{
+			const u32 count = static_cast<u32>(std::min<u64>(range.count, max_pairs));
+			if (std::memcmp(block.words.data() + range.first * 2, VU0.Micro + range.pc, count * 8) != 0)
+				return false;
+			max_pairs -= count;
+			if (!max_pairs)
+				break;
+		}
+		return true;
 	}
+
 } // namespace
 
 Arm64VU0Recompiler CpuArm64VU0;
@@ -1255,13 +1451,19 @@ void Arm64VU0Recompiler::Execute(u32 cycles)
 			Step();
 			continue;
 		}
+		const u64 remaining = cycles - (VU0.cycle - start);
 		Block* block = s_blocks[pc / 8].get();
-		if (!block || !Matches(*block, pc))
+		if (!block || !Matches(*block, pc, remaining))
 			block = &Compile(pc);
-		if (block->function)
+		// A restored chained-delay state still needs interpreter branch retirement.
+		if (block->function && !(block->has_branches && VU0.takedelaybranch))
+		{
 			block->function(start, cycles);
+		}
 		else
+		{
 			Step();
+		}
 	}
 	VU0.VI[REG_TPC].UL >>= 3;
 	VU0.nextBlockCycles = (VU0.cycle - cpuRegs.cycle) + 1;

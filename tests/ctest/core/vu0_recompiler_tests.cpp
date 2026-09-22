@@ -29,6 +29,25 @@ namespace
 		return (0x40u << 25) | (ftf << 23) | (fsf << 21) | (ft << 16) | (fs << 11) | 0x3bc;
 	}
 
+	// Lower branch: target is pc + 8 + (sign-extended imm11 * 8).
+	constexpr u32 MakeBranch(u32 op, u32 is, u32 it, u32 pc, u32 target)
+	{
+		const u32 imm = ((target - pc - 8) / 8) & 0x7ff;
+		return (op << 25) | (it << 16) | (is << 11) | imm;
+	}
+
+	// IADDIU vit, vis, imm -- used to seed the loop counters the branches test.
+	constexpr u32 MakeIaddiu(u32 it, u32 is, u32 imm)
+	{
+		return (8u << 25) | ((imm & 0x7800) << 10) | (it << 16) | (is << 11) | (imm & 0x7ff);
+	}
+
+	// ISUBIU vit, vis, imm.
+	constexpr u32 MakeIsubiu(u32 it, u32 is, u32 imm)
+	{
+		return (9u << 25) | ((imm & 0x7800) << 10) | (it << 16) | (is << 11) | (imm & 0x7ff);
+	}
+
 	class VU0RecompilerTest : public testing::Test
 	{
 	protected:
@@ -149,5 +168,39 @@ TEST_F(VU0RecompilerTest, EmitsNativeCodeForASupportedBlock)
 	VU0.cycle = 0;
 	CpuArm64VU0.Execute(64);
 	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
+}
+
+// A backward integer-conditional branch is the shape a VU0 microprogram loop
+// actually takes, and the one the recompiler has to get right to keep a trace
+// going instead of handing every branch plus its delay slot to the interpreter.
+// The branch's own register read must observe the interpreter's one-pair integer
+// write delay (VIBackupCycles), so the counter is updated in the pair right
+// before the branch on purpose.
+TEST_F(VU0RecompilerTest, ConditionalLoopBranchesMatchTheInterpreter)
+{
+	constexpr u32 kMul = MakeUpper(0x2a, 15, 9, 5, 6);
+
+	for (u32 budget : {4u, 8u, 16u, 32u, 64u, 128u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		VU0.VI[REG_TPC].UL = 0;
+		VU0.cycle = 0;
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeIaddiu(1, 0, 4)); // vi1 = 4
+		Put(8, kNopUpper, MakeIaddiu(2, 0, 0)); // vi2 = 0
+		// loop:
+		Put(16, kMul, kNopLower);
+		Put(24, kNopUpper, MakeIsubiu(1, 1, 1)); // vi1 -= 1, read by the branch below
+		Put(32, kMul, MakeBranch(0x29, 1, 2, 32, 16)); // IBNE vi1, vi2 -> loop
+		Put(40, kMul, kNopLower); // delay slot
+		// fallthrough
+		Put(48, kMul, kNopLower);
+		Put(56, kNopUpper, MakeBranch(0x20, 0, 0, 56, 72)); // B -> 72
+		Put(64, kMul, kNopLower); // delay slot
+		Put(72, kMul, kNopLower);
+
+		Compare(budget);
+	}
 }
 #endif
