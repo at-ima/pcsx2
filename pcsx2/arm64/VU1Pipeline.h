@@ -15,6 +15,12 @@ namespace Arm64VU1
 		u32 pc;
 		u32 lower;
 		u32 upper;
+		// What the preparation stubs publish for this pair, precomputed and kept
+		// adjacent so one Ldp replaces three loads and the upper/lower select on
+		// a path that runs once per executed pair. `tpc` is pc + 8; `code` is the
+		// word the interpreter would have left in VURegs::code.
+		u32 tpc;
+		u32 code;
 		_VURegsNum uregs{};
 		_VURegsNum lregs{};
 		std::array<u8, 32> readMasks{};

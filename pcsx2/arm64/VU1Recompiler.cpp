@@ -2110,6 +2110,12 @@ namespace
 			std::memcpy(&ins.upper, VU1.Micro + ins.pc + 4, 4);
 			block->words[i * 2] = ins.lower;
 			block->words[i * 2 + 1] = ins.upper;
+			// What the preparation stubs publish, so they need neither the +8 nor
+			// the upper/lower select at runtime. The interpreter leaves whichever
+			// half it decoded last in VURegs::code, and it skips the lower half of
+			// an E-bit pair.
+			ins.tpc = ins.pc + 8;
+			ins.code = (ins.upper & 0x80000000) ? ins.upper : ins.lower;
 			if (DecodeUpper(ins.upper).op == Op::Unsupported ||
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
 				break;

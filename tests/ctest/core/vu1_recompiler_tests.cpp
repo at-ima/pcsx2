@@ -1278,6 +1278,9 @@ TEST_F(VU1RecompilerTest, PipelineCalloutPublishesAndReloadsVectorCache)
 	ins.pc = 40;
 	ins.upper = 0x800002ff;
 	ins.lower = 0x3f800000;
+	// Precomputed by Compile() in the recompiler; part of the stubs' input contract.
+	ins.tpc = ins.pc + 8;
+	ins.code = ins.upper;
 	ins.lregs.VIread = 1 << 2;
 	for (u32 entry = 0; entry < wrappers.size(); entry++)
 	{

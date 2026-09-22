@@ -35,14 +35,9 @@ namespace Arm64VU1
 			a.Ldr(x9, field(offsetof(VURegs, cycle)));
 			a.Mov(w15, w9); // Interpreter truncates cyclesBeforeOp to u32.
 			a.Add(x9, x9, 1);
-			a.Ldr(w10, MemOperand(x0, offsetof(Instruction, pc)));
-			a.Add(w10, w10, 8);
+			a.Ldp(w10, w11, MemOperand(x0, offsetof(Instruction, tpc)));
 			a.Str(w10, vi(REG_TPC));
-			a.Ldr(w10, MemOperand(x0, offsetof(Instruction, upper)));
-			a.Ldr(w11, MemOperand(x0, offsetof(Instruction, lower)));
-			a.Tst(w10, 0x80000000);
-			a.Csel(w10, w10, w11, ne);
-			a.Str(w10, field(offsetof(VURegs, code)));
+			a.Str(w11, field(offsetof(VURegs, code)));
 			if (dependency == -1)
 				a.B(&scan);
 			else
