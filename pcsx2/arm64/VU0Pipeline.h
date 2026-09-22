@@ -9,12 +9,9 @@
 #include <cstddef>
 
 // Mirrors arm64/VU1Pipeline.h, reduced for VU0's simpler execution model: VU0
-// has no XGKICK/GIF path and this initial provider only natively compiles
-// straight-line blocks (no branches survive into a block; see
-// VU0Recompiler.cpp), so there is no branch_prepare entry and no standalone
-// retire_queues entry point (those exist on VU1 only to let DIV/SQRT/RSQRT/
-// EFU ops re-drain queues mid-pair, and VU0 blocks do not compile those ops
-// yet either -- see PERFORMANCE.md).
+// has no XGKICK/GIF path, and there is no standalone retire_queues entry point
+// (that exists on VU1 only to let DIV/SQRT/RSQRT/EFU ops re-drain queues
+// mid-pair, and VU0 blocks do not compile those ops yet -- see PERFORMANCE.md).
 namespace Arm64VU0
 {
 	struct Instruction
@@ -36,6 +33,11 @@ namespace Arm64VU0
 		// to read-free, incoming, and scheduled dependencies 0..3. Preserve
 		// x19..x29 and SP.
 		std::array<const void*, 6> prepare{};
+		// Entry for an integer-conditional branch pair, which has to wait for a
+		// pending integer load feeding the register it tests. It reads that
+		// register set from the Instruction's lregs.VIread rather than taking a
+		// compile-time dependency slot, so it does not fit prepare[] above.
+		const void* branch_prepare = nullptr;
 		size_t size = 0;
 	};
 

@@ -1292,8 +1292,12 @@ namespace
 			{
 				const auto& ins = block->instructions[i];
 				a.Add(x0, x23, i * sizeof(Instruction));
+				// An integer branch tests registers a pending integer load may still
+				// owe it, so it needs the entry that waits for that load.
+				const bool integer_branch = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread;
 				const u32 selected_prepare = ins.readsVF ? ins.dependency + 2 : 0;
-				a.Mov(x16, reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
+				a.Mov(x16, integer_branch ? reinterpret_cast<uintptr_t>(s_pipeline.branch_prepare) :
+											reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
 				a.Blr(x16);
 				a.Ldr(x26, Field(offsetof(VURegs, cycle)));
 				EmitPair(a, cache, ins, true);

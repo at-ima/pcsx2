@@ -48,6 +48,13 @@ namespace
 		return (9u << 25) | ((imm & 0x7800) << 10) | (it << 16) | (is << 11) | (imm & 0x7ff);
 	}
 
+	// ILW.x vit, offset(vis) -- an integer load, which issues into the IALU pipe
+	// and only lands in vit some cycles later.
+	constexpr u32 MakeIlw(u32 it, u32 is, u32 offset)
+	{
+		return (4u << 25) | (1u << 21) | (it << 16) | (is << 11) | (offset & 0x7ff);
+	}
+
 	class VU0RecompilerTest : public testing::Test
 	{
 	protected:
@@ -168,6 +175,31 @@ TEST_F(VU0RecompilerTest, EmitsNativeCodeForASupportedBlock)
 	VU0.cycle = 0;
 	CpuArm64VU0.Execute(64);
 	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
+}
+
+// An integer load lands in its destination register some cycles after it
+// issues, so a branch testing that register has to wait for the load to retire
+// rather than reading the stale value. The compiled branch gets that wait from
+// the pipeline's branch entry (VU0Pipeline.cpp), not from its own codegen.
+TEST_F(VU0RecompilerTest, BranchesWaitForAPendingIntegerLoad)
+{
+	for (u32 budget : {4u, 8u, 16u, 32u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		VU0.VI[REG_TPC].UL = 0;
+		VU0.cycle = 0;
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeIaddiu(3, 0, 0)); // vi3 = 0 (load address)
+		Put(8, kNopUpper, MakeIaddiu(2, 0, 0)); // vi2 = 0 (compare operand)
+		Put(16, kNopUpper, MakeIlw(1, 3, 0)); // vi1 = mem[vi3], still in flight
+		Put(24, kNopUpper, MakeBranch(0x28, 1, 2, 24, 48)); // IBEQ vi1, vi2 -> 48
+		Put(32, kNopUpper, kNopLower); // delay slot
+		Put(40, kNopUpper, MakeIaddiu(4, 0, 1));
+		Put(48, kNopUpper, MakeIaddiu(5, 0, 1));
+
+		Compare(budget);
+	}
 }
 
 // A backward integer-conditional branch is the shape a VU0 microprogram loop
