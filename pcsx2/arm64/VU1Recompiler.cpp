@@ -1714,9 +1714,20 @@ namespace
 		{
 			const auto& ins = block.instructions[i];
 			int cycles = -1;
-			if (i >= 3)
+			// A pair that reads no VF has nothing for the FMAC hazard scan to match,
+			// so it advances exactly one cycle whatever the incoming pipeline holds.
+			// That holds in the block's prologue too, where the dependency resolution
+			// below cannot run yet (most prologue pairs read no VF). Leaving it
+			// unknown there marks the ages of earlier producers unknown as well, and
+			// a later pair whose own stall depends on one of them inherits that,
+			// which can carry the unknown forward into the producers a scheduled
+			// pair has to account for. The overrides further down still demote the
+			// cases that stall on something other than the FMAC pipe.
+			if (!ins.readsVF)
+				cycles = 1;
+			else if (i >= 3)
 			{
-				if (!ins.readsVF || ins.dependency == 0)
+				if (ins.dependency == 0)
 					cycles = 1;
 				else
 				{

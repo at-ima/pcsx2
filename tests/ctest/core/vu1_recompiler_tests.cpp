@@ -2488,6 +2488,43 @@ TEST_F(VU1RecompilerTest, PairsInsideADivideLatencyStayScheduled)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ProloguePairsWithoutVFReadsKeepProducerAgesKnown)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// A pair in the first three slots of a block used to leave its cycle advance
+	// unknown unconditionally, since the dependency resolution that computes it
+	// only runs from the fourth pair on. That was needlessly strict for a pair
+	// that reads no VF, which cannot stall on the FMAC pipe at all, and an
+	// unknown advance there poisoned the age of every earlier producer in reach.
+	// The poison reaches the precomputed schedule through a chain: pair 1 is an
+	// FMAC producer that reads only VF0 (so no VF read counts), pair 4 consumes
+	// its VF5 three slots back, and without a known age for pair 1 pair 4's own
+	// advance is unknown too, which in turn poisons pair 3's age -- one of the
+	// producers pair 7's schedule has to account for. With the fix pair 7 and on
+	// are scheduled; without it pair 7 falls back. The generic path was always
+	// correct, so this checks the newly scheduled pairs against the interpreter,
+	// not that the old behaviour was wrong.
+	constexpr u32 kProduce = 0x80000000 | (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28; // VF3 = f(VF1, VF2)
+	constexpr u32 kFromVF0 = 0x80000000 | (15 << 21) | (5 << 6) | 0x28; // VF5 = f(VF0, VF0): FMAC, no VF read
+	constexpr u32 kUseVF5 = 0x80000000 | (15 << 21) | (2 << 16) | (5 << 11) | (6 << 6) | 0x28; // VF6 = f(VF5, VF2)
+	for (u32 budget = 1; budget <= 40; budget++)
+	{
+		SCOPED_TRACE(testing::Message() << budget);
+		VU0 = initial0;
+		VU1 = initial;
+		Put(0, kProduce, 0x3f800000);
+		Put(8, kFromVF0, 0x3f800000);
+		Put(16, 0x800002ff, 0x3f800000); // no VF reads, no FMAC
+		Put(24, kProduce, 0x3f800000); // independent producer, the one pair 7 must account for
+		Put(32, kUseVF5, 0x3f800000); // reads VF5, three FMAC-bearing slots back to pair 1
+		for (u32 pc = 40; pc < 256; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, WaitqExcludedFromPrecomputedSchedule)
 {
 	const VURegs initial = VU1, initial0 = VU0;
