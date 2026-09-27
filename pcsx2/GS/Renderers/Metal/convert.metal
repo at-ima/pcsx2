@@ -175,17 +175,50 @@ fragment float4 ps_convert_depth16_rgb5a1(ConvertShaderData data [[stage_in]], C
 	return convert_depth16_rgba8(res.sample(data.t)) / 255.f;
 }
 
+// With the factor known at compile time the loops unroll and every read can be
+// in flight at once. The runtime loop issues them one after another, which made
+// each native-scaling downsample of a 6x target cost ~350us on Apple GPUs,
+// about a quarter of the GPU frame in Shadow of the Colossus. The sum order is
+// unchanged, so the output is bit-identical (checked in game and against the
+// runtime loop for factors 1-12, steps 1-2 and out-of-bounds edges; needs
+// proper testing in more games).
+template <uint F>
+static float4 downsample_fixed(texture2d<float> texture, uint2 coord, uint step)
+{
+	float4 result = float4(0.0, 0.0, 0.0, 0.0);
+	for (uint yoff = 0; yoff < F; yoff++)
+	{
+		for (uint xoff = 0; xoff < F; xoff++)
+			result += texture.read(coord + uint2(xoff, yoff) * step, 0);
+	}
+	return result;
+}
+
 fragment float4 ps_downsample_copy(ConvertShaderData data [[stage_in]],
 	texture2d<float> texture [[texture(GSMTLTextureIndexNonHW)]],
 	constant GSMTLDownsamplePSUniform& uniform [[buffer(GSMTLBufferIndexUniforms)]])
 {
 	uint2 coord = max(uint2(data.p.xy) * uniform.downsample_factor, uniform.clamp_min);
+	// step_multiplier is 1 or 2.
+	const uint step = uint(uniform.step_multiplier);
 
-	float4 result = float4(0.0, 0.0, 0.0, 0.0);
-	for (uint yoff = 0; yoff < uniform.downsample_factor; yoff++)
+	float4 result;
+	switch (uniform.downsample_factor)
 	{
-		for (uint xoff = 0; xoff < uniform.downsample_factor; xoff++)
-			result += texture.read(coord + uint2(xoff * uniform.step_multiplier, yoff * uniform.step_multiplier), 0);
+		case 2: result = downsample_fixed<2>(texture, coord, step); break;
+		case 3: result = downsample_fixed<3>(texture, coord, step); break;
+		case 4: result = downsample_fixed<4>(texture, coord, step); break;
+		case 5: result = downsample_fixed<5>(texture, coord, step); break;
+		case 6: result = downsample_fixed<6>(texture, coord, step); break;
+		case 8: result = downsample_fixed<8>(texture, coord, step); break;
+		default:
+			result = float4(0.0, 0.0, 0.0, 0.0);
+			for (uint yoff = 0; yoff < uniform.downsample_factor; yoff++)
+			{
+				for (uint xoff = 0; xoff < uniform.downsample_factor; xoff++)
+					result += texture.read(coord + uint2(xoff * uniform.step_multiplier, yoff * uniform.step_multiplier), 0);
+			}
+			break;
 	}
 	result /= uniform.weight;
 	return result;
