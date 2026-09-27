@@ -13,7 +13,7 @@ sections unless a section says so.
 | 09-20..21 | Saru! Get You! 3 | "Saru! Get You! 3: VU0, IOP and EE dispatch" |
 | 09-21..22 | Ridge Racer V | "Ridge Racer V: VU0 correctness" |
 | 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
-| 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" |
+| 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" (includes block linking) |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2490,6 +2490,26 @@ remaining generic reasons, per 2M block entries:
 | 1.8M | Flag reads |
 | 1.2M | Q/P reads or writes |
 | 1.1M | ILW latency |
+
+**Block linking (later the same day).**
+
+- An exit with a known next PC (an untaken integer branch, or the end of a
+  trace that does not loop) jumps to the next block's linked entry through a
+  `LinkSlot`. Execute() fills the slot the first time that exit returns.
+- Micro memory only changes between Execute() calls. A slot is taken only if
+  its target passed source validation in the current call (`validated_epoch`
+  against `s_epoch`), so the validate-before-entry contract still holds.
+- A profiled target is linked only from a deterministic exit: the source is
+  profiled and every pair up to the exit has a known cycle advance
+  (`known_prefix`).
+- Evicting a variant or InvalidateAll bumps `s_link_generation`, which drops
+  every link. All blocks share one frame layout for this.
+- Measured with the same counters, in ABBA order, three pairs:
+  - Instructions per VU1 cycle: 169.7 -> 154.9 (-8.8%).
+  - Cycles per VU1 cycle: 27.35 -> 25.72 (-6.0%).
+  - Against the start of the day that is about -10%.
+- The capped runs that followed are unusable: Time Machine was running, and
+  old and new builds degraded alike.
 
 Per-pair MAC/status flag computation is about 25 instructions of a deferred
 FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,

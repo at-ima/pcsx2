@@ -2965,6 +2965,59 @@ TEST_F(VU1RecompilerTest, ProfiledEntriesScheduleFromTheFirstPair)
 	EXPECT_GT(CpuArm64VU1.GetCommittedCache(), committed);
 }
 
+TEST_F(VU1RecompilerTest, LinkedExitsEnterTheNextBlockDirectly)
+{
+	// A counted loop whose untaken IBEQ ends each native block. The next block
+	// is entered from the generated exit instead of through Execute(), after
+	// passing source validation once per Execute() call.
+	const VURegs initial = VU1, initial0 = VU0;
+	auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+	constexpr u32 kNop = 0x8000033c;
+	auto load = [&](u32 variant) {
+		Put(0, add(3, 1, 2), 0x10000000 | (1 << 16) | 20); // IADDIU VI1, VI0, 20
+		Put(8, add(4, 3, 2), kNop);
+		Put(16, add(5, 4, 1), kNop);
+		Put(24, add(3, 5, 2), 0x12000000 | (1 << 16) | (1 << 11) | 1); // ISUBIU VI1, VI1, 1
+		Put(32, add(4, 3, 1), 0x50000000 | (1 << 11) | 3); // IBEQ VI1, VI0 -> 64
+		Put(40, add(5, 4, 2), kNop);
+		Put(48, add(6 + variant, 5, 1), 0x40000000 | 0x7fc); // B -> 24
+		Put(56, add(3, 6, 2), kNop);
+		Put(64, add(7, 3, 4), kNop);
+		Put(72, 0x400002ff, kNop); // E bit
+		Put(80, 0x2ff, kNop);
+	};
+	auto run = [&](u32 budget) {
+		VU0 = initial0;
+		VU1 = initial;
+		Compare(budget);
+	};
+	load(0);
+	for (u32 budget = 1; budget <= 260; budget++)
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		run(budget);
+		if (HasFatalFailure())
+			return;
+	}
+
+	// Every loop iteration ends a block; linked, Execute() enters only a few.
+	const u64 dispatches = CpuArm64VU1.GetDispatchCount();
+	run(1000);
+	EXPECT_LT(CpuArm64VU1.GetDispatchCount() - dispatches, 8u);
+
+	// Pair 48 belongs only to the block the first one links to. Rewritten
+	// without Clear(), the first block still validates, and its exit must not
+	// take the link into code validated by an earlier Execute() call.
+	load(1);
+	for (u32 budget : {40u, 120u, 1000u})
+	{
+		SCOPED_TRACE(testing::Message() << "edited budget=" << budget);
+		run(budget);
+		if (HasFatalFailure())
+			return;
+	}
+}
+
 TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
 {
 	const VURegs initial = VU1, initial0 = VU0;

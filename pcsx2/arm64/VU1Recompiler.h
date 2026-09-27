@@ -22,6 +22,8 @@ public:
 	void Execute(u32 cycles) override;
 	void Clear(u32 addr, u32 size) override;
 	size_t GetCommittedCache() const override;
+	// Blocks Execute() has entered itself, not through a linked exit.
+	u64 GetDispatchCount() const;
 };
 
 extern Arm64VU1Recompiler CpuArm64VU1;

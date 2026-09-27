@@ -96,6 +96,23 @@ namespace
 		}
 	};
 
+	// An exit whose next PC is known links to the next block through one of
+	// these: the generated exit jumps to `entry` without returning to
+	// Execute(), provided the link is from the current generation, the target
+	// passed source validation in this Execute() call, and the architectural
+	// state lets Execute() enter a block at all. Execute() fills a slot the
+	// first time the exit returns to it (see s_pending_link).
+	struct LinkSlot
+	{
+		const void* entry = nullptr;
+		const u32* epoch = nullptr; // the target's Block::validated_epoch
+		u32 generation = 0;
+		u32 pc = 0;
+		// The exit state follows from the block's own incoming profile, so a
+		// profiled target compiled for the state seen once always matches.
+		bool deterministic = false;
+	};
+
 	struct Block
 	{
 		using Function = void (*)(u64 start, u64 cycles, u32 packet_pending);
@@ -110,6 +127,13 @@ namespace
 		// since the loop edge arrives with a different state.
 		bool profiled = false;
 		IncomingProfile incoming;
+		// The Execute() call in which this block last passed full source
+		// validation; micro memory only changes between calls.
+		u32 validated_epoch = 0;
+		const void* linked_entry = nullptr;
+		// Leading pairs whose cycle advance the analysis knows exactly.
+		u32 known_prefix = 0;
+		std::vector<LinkSlot> links;
 		struct SourceRange
 		{
 			u32 pc, first, count;
@@ -134,6 +158,13 @@ namespace
 	constexpr u8 MaxProfiledCompiles = 24;
 	std::array<std::vector<std::unique_ptr<Block>>, VU1_PROGSIZE / 8> s_blocks;
 	std::array<u8, VU1_PROGSIZE / 8> s_profiled_compiles;
+	// Bumped whenever a compiled block may be freed or its code reused, which
+	// drops every link. Slots start at generation 0.
+	u32 s_link_generation = 1;
+	u32 s_epoch = 1;
+	// Set by a linked exit that could not link, for Execute() to fill.
+	LinkSlot* s_pending_link = nullptr;
+	u64 s_dispatches = 0;
 	u8* s_base = nullptr;
 	u8* s_write = nullptr;
 	u8* s_end = nullptr;
@@ -157,6 +188,7 @@ namespace
 		for (auto& variants : s_blocks)
 			variants.clear();
 		s_profiled_compiles.fill(0);
+		s_link_generation++;
 		s_write = s_base;
 		s_pipeline = {};
 		s_options = Options();
@@ -1803,6 +1835,7 @@ namespace
 		}
 		u32 integer_ready = 0, efu_ready = 0;
 		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
+		block.known_prefix = block.count;
 		for (u32 i = 0; i < block.count; i++)
 		{
 			const auto& ins = block.instructions[i];
@@ -1903,6 +1936,8 @@ namespace
 			// that it keeps the simpler treatment: stay generic for its full latency.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
 				efu_ready = i + ins.lregs.cycles + 1;
+			if (cycles <= 0 && block.known_prefix == block.count)
+				block.known_prefix = i;
 			// Without a profile the first seven pairs stay generic: three whose
 			// stalls depend on the unknown incoming entries, then four for the
 			// ages of their producers to become known.
@@ -2453,23 +2488,37 @@ namespace
 			}
 			const bool deferred = !regions.empty();
 			std::array<Label, MaxInstructions> deferred_entries, resumes;
-			Label exit, loop_entry, finished;
-			const int saved_size = deferred ? 96 : 80;
-			// Save only the d8..d15 registers this block modifies.
-			// Round paired saves up to retain 16-byte stack alignment.
-			const u32 saved_vectors = (cache.count + 1) & ~1u;
-			const int frame_size = saved_size + saved_vectors * 8;
+			Label exit, loop_entry, finished, linked_entry, entry, common_entry, link_exit, link_request, restore;
+			// Every block saves the same registers in the same frame, so a linked
+			// exit can enter the next block in it and that block's exit returns
+			// straight to Execute(). One slot per integer-branch exit plus the end.
+			constexpr int saved_size = 96;
+			constexpr int frame_size = saved_size + 64;
+			block->links.resize(block->count + 1);
+			u32 link_count = 0;
+			std::array<Label, MaxInstructions + 1> link_sites;
+			const auto add_link = [&](u32 pair) {
+				block->links[link_count].deterministic = block->profiled && pair < block->known_prefix;
+				return &link_sites[link_count++];
+			};
+			// Entered from another block's exit: the frame, start and budget are
+			// already in place, and a linked exit never has a packet pending.
+			a.Bind(&linked_entry);
+			a.Str(wzr, MemOperand(sp, 72));
+			a.B(&common_entry);
+			a.Bind(&entry);
 			a.Stp(x19, x20, MemOperand(sp, -frame_size, PreIndex));
 			a.Stp(x21, x22, MemOperand(sp, 16));
 			a.Stp(x23, x24, MemOperand(sp, 32));
 			a.Stp(x25, x26, MemOperand(sp, 48));
 			a.Str(lr, MemOperand(sp, 64));
 			a.Str(w2, MemOperand(sp, 72));
-			if (deferred)
-				a.Stp(x27, x28, MemOperand(sp, 80));
-			if (cache.count)
-				for (u32 slot = 0; slot < saved_vectors; slot += 2)
-					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
+			a.Stp(x27, x28, MemOperand(sp, 80));
+			for (u32 slot = 0; slot < 8; slot += 2)
+				a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
+			a.Mov(x20, x0);
+			a.Mov(x21, x1);
+			a.Bind(&common_entry);
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			u32 scheduled_pairs = 0;
 			for (u32 i = first_scheduled; i < block->count; i++)
@@ -2485,8 +2534,6 @@ namespace
 				EmitScheduleGuard(a);
 			// Keep queue insertion and budget checks off the cycle store/load chain.
 			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
-			a.Mov(x20, x0);
-			a.Mov(x21, x1);
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Ldr(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
@@ -2602,7 +2649,7 @@ namespace
 					// The fallthrough path has no pending branch. Publish the common
 					// cache at exit; only the taken path executes the connected delay.
 					a.Ldr(w9, Field(offsetof(VURegs, branch)));
-					a.Cbz(w9, &exit);
+					a.Cbz(w9, add_link(i));
 				}
 				a.Sub(x9, x26, x20);
 				a.Cmp(x9, x21);
@@ -2643,33 +2690,94 @@ namespace
 				a.Str(w9, MemOperand(sp, 72));
 				a.B(&loop_entry);
 			}
+			else
+				a.B(add_link(block->count - 1));
+			for (u32 k = 0; k < link_count; k++)
+			{
+				a.Bind(&link_sites[k]);
+				a.Mov(x0, reinterpret_cast<uintptr_t>(&block->links[k]));
+				a.B(&link_exit);
+			}
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
-			if (cache.count)
-				for (u32 slot = 0; slot < saved_vectors; slot += 2)
-					a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
-			if (deferred)
-				a.Ldp(x27, x28, MemOperand(sp, 80));
+			a.Bind(&restore);
+			for (u32 slot = 0; slot < 8; slot += 2)
+				a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
+			a.Ldp(x27, x28, MemOperand(sp, 80));
 			a.Ldr(lr, MemOperand(sp, 64));
 			a.Ldp(x25, x26, MemOperand(sp, 48));
 			a.Ldp(x23, x24, MemOperand(sp, 32));
 			a.Ldp(x21, x22, MemOperand(sp, 16));
 			a.Ldp(x19, x20, MemOperand(sp, frame_size, PostIndex));
 			a.Ret();
+			// x0 = the exit's LinkSlot. Publish the state the next block (or
+			// Execute()) reads, then take the link if it is current and
+			// Execute() would enter a block at this point too.
+			a.Bind(&link_exit);
+			a.Str(x26, Field(offsetof(VURegs, cycle)));
+			for (u32 slot = 0; slot < cache.count; slot++)
+				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_link_generation));
+			a.Ldr(w9, MemOperand(x16));
+			a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, generation)));
+			a.Cmp(w9, w10);
+			a.B(ne, &link_request);
+			a.Ldr(x11, MemOperand(x0, offsetof(LinkSlot, entry)));
+			a.Ldr(x12, MemOperand(x0, offsetof(LinkSlot, epoch)));
+			a.Ldr(w12, MemOperand(x12));
+			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_epoch));
+			a.Ldr(w13, MemOperand(x16));
+			a.Cmp(w12, w13);
+			a.B(ne, &link_request);
+			a.Sub(x9, x26, x20);
+			a.Cmp(x9, x21);
+			a.B(hs, &restore);
+			if (s_options & 32)
+			{
+				a.Ldr(w9, Field(offsetof(VURegs, flags)));
+				a.Tbz(w9, __builtin_ctz(VUFLAG_MTVURUNNING), &restore);
+			}
+			else
+			{
+				a.Mov(x16, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+				a.Ldr(w9, MemOperand(x16));
+				a.Tbz(w9, 8, &restore);
+			}
+			a.Ldr(w9, Field(offsetof(VURegs, branch)));
+			a.Ldr(w10, Field(offsetof(VURegs, ebit)));
+			a.Orr(w9, w9, w10);
+			a.Ldrb(w10, Field(offsetof(VURegs, takedelaybranch)));
+			a.Orr(w9, w9, w10);
+			a.Ldr(w10, Field(offsetof(VURegs, xgkickenable)));
+			a.Orr(w9, w9, w10);
+			a.Cbnz(w9, &restore);
+			a.Ldr(w9, Field(VI(REG_TPC)));
+			a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, pc)));
+			a.Cmp(w9, w10);
+			a.B(ne, &restore);
+			a.Br(x11);
+			a.Bind(&link_request);
+			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_pending_link));
+			a.Str(x0, MemOperand(x16));
+			a.B(&restore);
 			a.FinalizeCode();
 			const size_t size = a.GetSizeOfCodeGenerated();
 			HostSys::EndCodeWrite();
 			HostSys::FlushInstructionCache(s_write, static_cast<u32>(size));
-			block->function = reinterpret_cast<Block::Function>(s_write);
+			block->function = reinterpret_cast<Block::Function>(s_write + entry.GetLocation());
+			block->linked_entry = s_write + linked_entry.GetLocation();
 			s_write += (size + 15) & ~size_t(15);
 		}
 		// An evicted variant's code stays in the buffer until the next
 		// InvalidateAll, like any other replaced block.
 		auto& variants = s_blocks[pc / 8];
 		if (variants.size() >= MaxVariants)
+		{
 			variants.pop_back();
+			s_link_generation++;
+		}
 		variants.insert(variants.begin(), std::move(block));
 		return *variants.front();
 	}
@@ -2800,6 +2908,7 @@ void Arm64VU1Recompiler::Clear(u32, u32)
 	// Retaining them avoids recompiling identical program uploads.
 }
 size_t Arm64VU1Recompiler::GetCommittedCache() const { return s_base ? s_write - s_base : 0; }
+u64 Arm64VU1Recompiler::GetDispatchCount() const { return s_dispatches; }
 
 void Arm64VU1Recompiler::Execute(u32 cycles)
 {
@@ -2813,6 +2922,16 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 	// writing it corrupted the EE's VIF1 stall handling. Use the VU1-local flag the
 	// MTVU dispatcher sets instead; the interpreter clears it at the E-bit.
 	const bool mtvu = THREAD_VU1;
+	// Micro memory only changes between Execute() calls, so a block that
+	// passes source validation once in this call may be linked to for the
+	// rest of it.
+	if (++s_epoch == 0)
+	{
+		s_epoch = 1;
+		s_link_generation++;
+	}
+	LinkSlot* pending_link = nullptr;
+	u32 pending_generation = 0;
 	VU1.VI[REG_TPC].UL <<= 3;
 	const u64 start = VU1.cycle;
 	while (VU1.cycle - start < cycles)
@@ -2832,6 +2951,7 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		if (VU1.branch || VU1.ebit || (pc & 7))
 		{
 			Step();
+			pending_link = nullptr;
 			continue;
 		}
 		const bool pending = PacketXgkickPending();
@@ -2853,6 +2973,9 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 				continue;
 			if (!Matches(candidate, pc, remaining))
 				continue;
+			// A budget shorter than the block validated only a prefix.
+			if (remaining >= candidate.count)
+				variants[i]->validated_epoch = s_epoch;
 			if (!usable)
 			{
 				unprofiled = i;
@@ -2876,15 +2999,36 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		}
 		else
 			block = &Compile(pc, nullptr);
+		if (found == variants.size())
+			block->validated_epoch = s_epoch; // compiled from the current source
 		// A restored chained-delay state still requires interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU1.takedelaybranch))
 		{
+			// Link the exit that just returned here, unless a compile since then
+			// may have freed its block. Any exit may enter an unprofiled block,
+			// whose entry guard checks the incoming state; a profiled one only
+			// from an exit whose state is always the one seen now.
+			if (pending_link && pending_generation == s_link_generation &&
+				block->validated_epoch == s_epoch && (!block->profiled || pending_link->deterministic))
+			{
+				pending_link->entry = block->linked_entry;
+				pending_link->epoch = &block->validated_epoch;
+				pending_link->pc = pc;
+				pending_link->generation = s_link_generation;
+			}
+			s_pending_link = nullptr;
+			pending_generation = s_link_generation;
 			// The generated first-pair boundary publishes the delayed transfer,
 			// including its lower store, even when that pair exhausts the budget.
+			s_dispatches++;
 			block->function(start, cycles, pending);
+			pending_link = s_pending_link;
 		}
 		else
+		{
 			Step();
+			pending_link = nullptr;
+		}
 	}
 	VU1.VI[REG_TPC].UL >>= 3;
 	// nextBlockCycles pairs VU1.cycle with the EE clock for the synchronous path.
