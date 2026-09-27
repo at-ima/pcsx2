@@ -2780,6 +2780,38 @@ TEST_F(VU1RecompilerTest, MfpReadsPAtEachDistanceFromTheEfuOp)
 		}
 }
 
+TEST_F(VU1RecompilerTest, SwappedProgramsAtTheSamePcReuseTheirCompiledBlocks)
+{
+	// Burnout 3 uploads different microprograms to the same address within each
+	// frame. With one cached block per entry PC every swap back recompiled.
+	const VURegs initial = VU1, initial0 = VU0;
+	auto load = [this](u32 op) {
+		for (u32 pc = 0; pc < 64; pc += 8)
+			Put(pc, (15 << 21) | (2 << 16) | (1 << 11) | (1 << 6) | op, 0); // op.xyzw VF1, VF1, VF2
+		Put(64, 0x400002ff, 0); // E bit
+		Put(72, 0x2ff, 0);
+	};
+	auto run = [&](u32 op) {
+		VU0 = initial0;
+		VU1 = initial;
+		load(op);
+		Compare(64);
+	};
+	run(0x28); // ADD
+	run(0x2a); // MUL
+	const size_t committed = CpuArm64VU1.GetCommittedCache();
+	for (u32 i = 0; i < 3; i++)
+	{
+		run(0x28);
+		if (HasFatalFailure())
+			return;
+		run(0x2a);
+		if (HasFatalFailure())
+			return;
+	}
+	EXPECT_EQ(CpuArm64VU1.GetCommittedCache(), committed);
+}
+
 TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
 {
 	const VURegs initial = VU1, initial0 = VU0;

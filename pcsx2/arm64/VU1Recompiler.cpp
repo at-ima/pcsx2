@@ -74,7 +74,12 @@ namespace
 		Function function = nullptr;
 	};
 
-	std::array<std::unique_ptr<Block>, VU1_PROGSIZE / 8> s_blocks;
+	// Games often upload several microprograms to the same micro memory in turn
+	// (Burnout 3 swaps them within every frame). One block per entry PC made each
+	// swap back fail source validation and recompile, which took most of the VU1
+	// thread's time. Keep a few variants per PC, most recently used first.
+	constexpr size_t MaxVariants = 8;
+	std::array<std::vector<std::unique_ptr<Block>>, VU1_PROGSIZE / 8> s_blocks;
 	u8* s_base = nullptr;
 	u8* s_write = nullptr;
 	u8* s_end = nullptr;
@@ -95,8 +100,8 @@ namespace
 
 	void InvalidateAll()
 	{
-		for (auto& block : s_blocks)
-			block.reset();
+		for (auto& variants : s_blocks)
+			variants.clear();
 		s_write = s_base;
 		s_pipeline = {};
 		s_options = Options();
@@ -2508,9 +2513,13 @@ namespace
 			block->function = reinterpret_cast<Block::Function>(s_write);
 			s_write += (size + 15) & ~size_t(15);
 		}
-		auto& result = s_blocks[pc / 8];
-		result = std::move(block);
-		return *result;
+		// An evicted variant's code stays in the buffer until the next
+		// InvalidateAll, like any other replaced block.
+		auto& variants = s_blocks[pc / 8];
+		if (variants.size() >= MaxVariants)
+			variants.pop_back();
+		variants.insert(variants.begin(), std::move(block));
+		return *variants.front();
 	}
 
 	bool PacketXgkickPending()
@@ -2625,8 +2634,17 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		}
 		const bool pending = PacketXgkickPending();
 		const u64 remaining = cycles - (VU1.cycle - start);
-		Block* block = s_blocks[pc / 8].get();
-		if (!block || !Matches(*block, pc, remaining))
+		auto& variants = s_blocks[pc / 8];
+		Block* block = nullptr;
+		for (size_t i = 0; i < variants.size(); i++)
+		{
+			if (!Matches(*variants[i], pc, remaining))
+				continue;
+			std::rotate(variants.begin(), variants.begin() + i, variants.begin() + i + 1);
+			block = variants.front().get();
+			break;
+		}
+		if (!block)
 			block = &Compile(pc);
 		// A restored chained-delay state still requires interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU1.takedelaybranch))
