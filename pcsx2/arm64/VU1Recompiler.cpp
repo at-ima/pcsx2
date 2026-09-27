@@ -50,10 +50,17 @@ namespace
 		u8 cycles = 0; // Zero means that incoming timing is still unknown.
 		u8 retired = 0;
 		u8 remaining = 0;
+		// Bit k: the k-th retired entry (oldest first) comes from a CLIP/FCSET,
+		// which also writes back VI[REG_CLIP_FLAG] when it retires.
+		u8 clip_retires = 0;
 		// A divide issued earlier in the block may still be in the FDIV pipe here,
 		// so this pair has to retire it itself instead of leaving that to the
 		// generic per-pair preparation it is replacing.
 		bool fdiv_pending = false;
+		// Likewise for ILW/ILWR results in the IALU pipe. Only integer branches
+		// stall on them, so every other pair keeps its timing and just drops
+		// the entries that are due (VUPipeline::FlushIALU).
+		bool ialu_pending = false;
 		// Deferred regions keep retired flags in host registers, batch the backup
 		// countdown and cannot exit mid-region. A pair that observes any of that
 		// is still scheduled, but ends the region.
@@ -1962,10 +1969,14 @@ namespace
 			// Without a profile the first seven pairs stay generic: three whose
 			// stalls depend on the unknown incoming entries, then four for the
 			// ages of their producers to become known.
-			if ((block.profiled || i >= 7) && cycles > 0 && i >= integer_ready && i >= efu_ready)
+			if ((block.profiled || i >= 7) && cycles > 0 && i >= efu_ready)
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
+				plan.ialu_pending = i < integer_ready;
+				// Deferred regions do not issue into the IALU pipe.
+				if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
+					plan.deferrable = false;
 				for (u32 k = 0; k < phantoms && plan.cycles; k++)
 				{
 					if (phantom_ages[k] < 0)
@@ -1997,9 +2008,12 @@ namespace
 						plan.remaining++;
 					else
 					{
-						if ((producer.uregs.VIwrite | producer.lregs.VIwrite) &
-							((1 << REG_STATUS_FLAG) | (1 << REG_CLIP_FLAG)))
+						// FSSET's status write stays on the generic path.
+						const u32 flags = producer.uregs.VIwrite | producer.lregs.VIwrite;
+						if (flags & (1 << REG_STATUS_FLAG))
 							plan.cycles = 0;
+						if (flags & (1 << REG_CLIP_FLAG))
+							plan.clip_retires |= 1 << plan.retired;
 						plan.retired++;
 					}
 				}
@@ -2047,7 +2061,7 @@ namespace
 	// flight there is the block's own or the profiled incoming one: an in-block
 	// divide stalls until any earlier one retires, and every later pair that
 	// does not retire the slot is past that divide's latency.
-	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false)
+	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false, bool ialu_pending = false)
 	{
 		// Bit 0 validates incoming FMAC timing and excludes callbacks. Bit 1
 		// additionally permits scheduled execution once special queues drain.
@@ -2057,7 +2071,8 @@ namespace
 		for (size_t offset : {offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable),
 				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount)})
 		{
-			if (fdiv_pending && offset == offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable))
+			if ((fdiv_pending && offset == offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)) ||
+				(ialu_pending && offset == offsetof(VURegs, ialucount)))
 				continue;
 			a.Ldr(w9, Field(offset));
 			a.Cbnz(w9, &done);
@@ -2163,6 +2178,32 @@ namespace
 		a.Bind(&end);
 	}
 
+	// Drop the IALU entries that are due at cycle x26, like VUPipeline::FlushIALU.
+	void EmitIALURetire(MacroAssembler& a)
+	{
+		Label loop, store, end;
+		a.Ldr(w11, Field(offsetof(VURegs, ialucount)));
+		a.Cbz(w11, &end);
+		a.Ldr(w12, Field(offsetof(VURegs, ialureadpos)));
+		a.Bind(&loop);
+		a.Mov(w13, sizeof(ialuPipe));
+		a.Madd(x13, x12, x13, x19);
+		a.Add(x13, x13, offsetof(VURegs, ialu));
+		a.Ldr(x14, MemOperand(x13, offsetof(ialuPipe, sCycle)));
+		a.Ldr(w13, MemOperand(x13, offsetof(ialuPipe, Cycle)));
+		a.Sub(x14, x26, x14);
+		a.Cmp(x14, x13);
+		a.B(lo, &store);
+		a.Add(w12, w12, 1);
+		a.And(w12, w12, 3);
+		a.Subs(w11, w11, 1);
+		a.B(ne, &loop);
+		a.Bind(&store);
+		a.Str(w12, Field(offsetof(VURegs, ialureadpos)));
+		a.Str(w11, Field(offsetof(VURegs, ialucount)));
+		a.Bind(&end);
+	}
+
 	void EmitScheduledPrepare(MacroAssembler& a, const Block& block, u32 index)
 	{
 		const auto& plan = block.schedule[index];
@@ -2178,6 +2219,11 @@ namespace
 				a.Mov(w11, sizeof(fmacPipe));
 				a.Madd(x12, x10, x11, x19);
 				a.Add(x12, x12, offsetof(VURegs, fmac));
+				if (plan.clip_retires & (1 << i))
+				{
+					a.Ldr(w11, MemOperand(x12, offsetof(fmacPipe, clipflag)));
+					a.Str(w11, Field(VI(REG_CLIP_FLAG)));
+				}
 				a.Ldr(w11, MemOperand(x12, offsetof(fmacPipe, statusflag)));
 				a.And(w11, w11, 15);
 				// All sticky bits survive, but only the last MAC/non-sticky flags
@@ -2201,8 +2247,9 @@ namespace
 		// both merge into VI[REG_STATUS_FLAG].
 		if (plan.fdiv_pending)
 			EmitFDIVSlotRetire(a, w10, true);
-		// Special work has drained at scheduled pairs. ILW clears readiness and
-		// keeps retirement generic until its queue drains; broader games need proper testing.
+		if (plan.ialu_pending)
+			EmitIALURetire(a);
+		// Needs proper testing across more games.
 		EmitBackupCountdown(a, plan.cycles);
 	}
 
@@ -2247,6 +2294,11 @@ namespace
 			{
 				const u32 slot = (issued - plan.remaining - plan.retired + j) & 3;
 				const VRegister flags(28 + slot, 128);
+				if (plan.clip_retires & (1 << j))
+				{
+					a.Umov(w9, flags.V4S(), 2);
+					a.Str(w9, Field(VI(REG_CLIP_FLAG)));
+				}
 				a.Umov(w9, flags.V4S(), 1);
 				a.And(w9, w9, 15);
 				a.And(w25, w25, 0xff0);
@@ -2257,6 +2309,8 @@ namespace
 			}
 			if (plan.fdiv_pending)
 				EmitFDIVSlotRetire(a, w25, false);
+			if (plan.ialu_pending)
+				EmitIALURetire(a);
 			// Only an integer write can inspect/reset the backup countdown in a
 			// supported pair. Accumulate time until that observer or the block exit.
 			backup_cycles += plan.cycles;
@@ -2614,7 +2668,7 @@ namespace
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || region_start))
 				{
-					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending);
+					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending, block->schedule[i].ialu_pending);
 					readiness_checked = true;
 				}
 				if (region_start)
@@ -2668,8 +2722,6 @@ namespace
 				}
 				EmitFinish(a, ins);
 				EmitIntegerIssue(a, ins);
-				if (scheduled && ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
-					a.And(w25, w25, 1);
 				EmitControlFlow(a, *block, i);
 				if (!kick && (i == 0 || block->instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				{

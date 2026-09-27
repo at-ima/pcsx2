@@ -3383,6 +3383,39 @@ TEST_F(VU1RecompilerTest, UnprofiledEntryWaitsForIncomingDivideOrEfu)
 			}
 }
 
+TEST_F(VU1RecompilerTest, ClipFlagRetiresOnScheduledAndDeferredPairs)
+{
+	// A CLIP's result reaches VI[REG_CLIP_FLAG] when its FMAC entry retires,
+	// four cycles later. Place CLIPs so that retirement lands on scheduled pairs
+	// and inside deferred regions, read the flag with FCGET, and compare the
+	// state at every budget.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 first : {8u, 12u, 20u})
+		for (u32 gap : {1u, 4u, 9u})
+			for (bool fcget : {false, true})
+			{
+				for (u32 i = 0; i < 40; i++)
+					Put(i * 8, (15 << 21) | (6 << 16) | (5 << 11) | ((1 + i % 4) << 6) | 0x28, 0x8000033c); // ADD VFn, VF5, VF6
+				Put(first * 8, (14 << 21) | (1 << 16) | (20 << 11) | 0x1ff, 0x8000033c); // CLIPw.xyz VF20, VF1w
+				Put((first + gap) * 8, (14 << 21) | (20 << 16) | (6 << 11) | 0x1ff, 0x8000033c); // CLIPw.xyz VF6, VF20w
+				if (fcget)
+					Put(34 * 8, (15 << 21) | (6 << 16) | (5 << 11) | (1 << 6) | 0x28, 0x38000000 | (7 << 16)); // FCGET VI7
+				for (u32 pc = 40 * 8; pc < VU1_PROGSIZE; pc += 8)
+					Put(pc, 0x800002ff, 0x3f800000);
+				for (u32 budget : {12u, 16u, 24u, 32u, 48u})
+				{
+					SCOPED_TRACE(testing::Message() << "first=" << first << " gap=" << gap << " fcget=" << fcget << " budget=" << budget);
+					CpuArm64VU1.Reset();
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[REG_CLIP_FLAG].UL = 0x00abcdef;
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+}
+
 TEST_F(VU1RecompilerTest, ReadinessPassesOnlyDividesThePairRetires)
 {
 	// A readiness check that finds the FDIV slot busy may enable the schedule

@@ -2638,6 +2638,42 @@ such a machine, a spinning core spends the shared thermal budget, so the
 patch is left out. Wall-clock A/B runs are not usable there; compare
 frequency-independent cycle counts instead.
 
+**CLIP and ILW no longer force generic pairs.** Same state, after the
+changes above. Generic pairs were 16.1% of all pairs. The larger groups:
+
+| Share of all pairs | Reason |
+| --- | --- |
+| 3.8% | A retiring producer's age is unknown |
+| 3.6% | After an ILW |
+| 3.3% | A retiring entry writes the clip flag |
+| 2.2% | Q writers |
+
+- **Clip flag.** Only CLIP and FCSET write the clip flag through the FMAC
+  pipe, and for an in-block producer that is known at compile time.
+  `clip_retires` marks those retired entries. Scheduled pairs copy the
+  slot's clipflag to `VI[REG_CLIP_FLAG]`, and deferred pairs copy lane 2 of
+  the q28-q31 snapshot. FSSET's status write stays generic.
+- **IALU.** Only integer branches stall on the IALU pipe
+  (`_vuTestLowerStalls`), so ILW does not change other pairs' timing. Pairs
+  inside an ILW's latency carry `ialu_pending` and drop due entries at
+  runtime (`EmitIALURetire`, like `FlushIALU`). Readiness skips the
+  `ialucount` check for them. An ILW pair is scheduled but not deferrable,
+  and it no longer clears the readiness bit.
+- Five mutants were each caught: no clip copy (scheduled or deferred), no
+  IALU retire (scheduled or deferred), and readiness skipping `ialucount`
+  for every pair. The deferred clip mutant needed the new
+  `ClipFlagRetiresOnScheduledAndDeferredPairs`.
+- Generic pairs: 16.1% -> 9.5%.
+- ABBA, counters only (one run paused at boot and is dropped):
+  - Instructions per VU1 cycle: 84.4 -> 81.9 (-2.9%).
+  - Cycles per VU1 cycle: 13.90 -> 13.56 (-2.4%).
+- The estimate of about -10% came from per-pair costs fitted to two games,
+  and it was too optimistic.
+
+For scale: ARMSX2, which ports x86 microVU to ARM64, holds 60 fps in this
+scene on the same machine and reaches about 120 fps uncapped. This backend
+runs it at about 65% speed.
+
 ## Burnout 3: EE interpreter fallbacks
 
 2026-09-27, `BURN_OUT_3_003` save state. About 15 s after loading, the race
