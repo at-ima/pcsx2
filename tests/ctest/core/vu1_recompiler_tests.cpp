@@ -41,6 +41,39 @@ namespace
 			: : : "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15");
 	}
 
+	// The VU1 state a backend has to reproduce. Generated code may leave state
+	// that nothing reads in a different form: the current-opcode scratch, the
+	// positions of the FMAC/IALU queues, free queue slots and idle FDIV/EFU
+	// slots. Queues compare as their live entries, oldest first. The flag
+	// scratch fields stay: FSSET, FDIV and CLIP read them.
+	VURegs Observable(const VURegs& state)
+	{
+		VURegs regs;
+		std::memcpy(&regs, &state, sizeof(regs));
+		regs.code = 0;
+		const auto compact = [](auto& queue, u32& readpos, u32& writepos, u32 count) {
+			std::array<u8, sizeof(queue)> live{};
+			for (u32 k = 0; k < count && k < 4; k++)
+				std::memcpy(live.data() + k * sizeof(queue[0]), &queue[(readpos + k) & 3], sizeof(queue[0]));
+			std::memcpy(queue, live.data(), sizeof(queue));
+			readpos = 0;
+			writepos = count & 3;
+		};
+		compact(regs.fmac, regs.fmacreadpos, regs.fmacwritepos, regs.fmaccount);
+		compact(regs.ialu, regs.ialureadpos, regs.ialuwritepos, regs.ialucount);
+		if (!regs.fdiv.enable)
+			std::memset(&regs.fdiv, 0, sizeof(regs.fdiv));
+		if (!regs.efu.enable)
+			std::memset(&regs.efu, 0, sizeof(regs.efu));
+		return regs;
+	}
+
+	bool SameObservableState(const VURegs& a, const VURegs& b)
+	{
+		const VURegs x = Observable(a), y = Observable(b);
+		return std::memcmp(&x, &y, sizeof(x)) == 0;
+	}
+
 	class VU1RecompilerTest : public testing::Test
 	{
 	protected:
@@ -114,7 +147,7 @@ namespace
 			ASSERT_EQ(VU1.VI[REG_TPC].UL, expected1.VI[REG_TPC].UL);
 			ASSERT_EQ(std::memcmp(VU1.VF, expected1.VF, sizeof(VU1.VF)), 0);
 			ASSERT_EQ(std::memcmp(VU1.VI, expected1.VI, sizeof(VU1.VI)), 0);
-			ASSERT_EQ(std::memcmp(&VU1, &expected1, sizeof(VU1)), 0);
+			ASSERT_TRUE(SameObservableState(VU1, expected1));
 			ASSERT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
 			ASSERT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
 			ASSERT_EQ(vif1Regs.stat._u32, expected_vifstat);
@@ -124,6 +157,43 @@ namespace
 		VURegs m_saved0, m_saved1;
 	};
 } // namespace
+
+TEST_F(VU1RecompilerTest, ObservableStateIgnoresOnlyUnreadState)
+{
+	VURegs base;
+	std::memcpy(&base, &VU1, sizeof(base));
+	base.fmacreadpos = 3;
+	base.fmaccount = 2;
+	base.fmacwritepos = 1;
+	base.fmac[3].macflag = 0x11;
+	base.fmac[0].macflag = 0x22;
+	base.fdiv.enable = 0;
+	const auto differs = [&](auto&& change) {
+		VURegs other;
+		std::memcpy(&other, &base, sizeof(other));
+		change(other);
+		return !SameObservableState(base, other);
+	};
+	// Unread: opcode scratch, free slots, idle divide, queue rotation.
+	EXPECT_FALSE(differs([](VURegs& r) { r.code ^= 1; }));
+	EXPECT_FALSE(differs([](VURegs& r) { r.fmac[1].macflag ^= 1; }));
+	EXPECT_FALSE(differs([](VURegs& r) { r.fdiv.statusflag ^= 0x30; }));
+	EXPECT_FALSE(differs([&](VURegs& r) {
+		std::memcpy(&r.fmac[0], &base.fmac[3], sizeof(fmacPipe));
+		std::memcpy(&r.fmac[1], &base.fmac[0], sizeof(fmacPipe));
+		std::memset(&r.fmac[3], 0, sizeof(fmacPipe));
+		r.fmacreadpos = 0;
+		r.fmacwritepos = 2;
+	}));
+	// Read later: live entries and their order, counts, flag scratch.
+	EXPECT_TRUE(differs([](VURegs& r) { r.fmac[0].macflag ^= 1; }));
+	EXPECT_TRUE(differs([](VURegs& r) { std::swap(r.fmac[3].macflag, r.fmac[0].macflag); }));
+	EXPECT_TRUE(differs([](VURegs& r) { r.fmaccount = 1; }));
+	EXPECT_TRUE(differs([](VURegs& r) { r.statusflag ^= 1; }));
+	EXPECT_TRUE(differs([](VURegs& r) { r.clipflag ^= 1; }));
+	EXPECT_TRUE(differs([](VURegs& r) { r.fdiv.enable = 1; }));
+	EXPECT_TRUE(differs([](VURegs& r) { r.cycle++; }));
+}
 
 TEST_F(VU1RecompilerTest, BlockBoundaryPreservesHostVectorRegisters)
 {
@@ -1643,7 +1713,7 @@ TEST_F(VU1PacketXgkickTest, NativeKickMatchesReferenceStepsAcrossEveryBudget)
 					std::memcpy(packet.data(), gifUnit.gifPath[0].buffer, size);
 					reset();
 					CpuArm64VU1.Execute(budget);
-					ASSERT_EQ(std::memcmp(&VU1, &expected, sizeof(VU1)), 0);
+					ASSERT_TRUE(SameObservableState(VU1, expected));
 					ASSERT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
 					ASSERT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
 					ASSERT_EQ(gifUnit.gifPath[0].curSize, size);
@@ -1691,7 +1761,7 @@ TEST_F(VU1PacketXgkickTest, NativePacketContinuationMatchesSplitExecution)
 		std::memcpy(packet.data(), gifUnit.gifPath[0].buffer, packet.size());
 		reset();
 		CpuArm64VU1.Execute(budget);
-		EXPECT_EQ(std::memcmp(&VU1, &expected, sizeof(VU1)), 0);
+		EXPECT_TRUE(SameObservableState(VU1, expected));
 		EXPECT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
 		EXPECT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
 		ASSERT_EQ(gifUnit.gifPath[0].curSize, packet.size());
