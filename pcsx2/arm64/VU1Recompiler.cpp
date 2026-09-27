@@ -67,7 +67,7 @@ namespace
 	};
 	// Packed, since Execute() captures and compares one on every dispatch:
 	// the entry count (3 bits) and the divide (6 bits), then 22 bits for each
-	// FMAC entry, oldest first, two in each word.
+	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56.
 	struct IncomingProfile
 	{
 		u64 words[2] = {};
@@ -75,8 +75,11 @@ namespace
 		u32 Count() const { return words[0] & 7; }
 		// Pairs the incoming FDIV entry may still be pending; 0 if none.
 		u32 Fdiv() const { return (words[0] >> 3) & 63; }
+		// Pairs an incoming ILW/ILWR result may still be pending; 0 if the IALU
+		// pipe is empty.
+		u32 Ialu() const { return (words[0] >> 53) & 15; }
 		static u32 Shift(u32 k) { return k < 2 ? 9 + 22 * k : 22 * (k - 2); }
-		void Set(u32 count, u32 fdiv) { words[0] |= count | (fdiv << 3); }
+		void Set(u32 count, u32 fdiv, u32 ialu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53); }
 		void SetFmac(u32 k, const IncomingFmac& e)
 		{
 			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) | (e.xyzwlower << 17);
@@ -123,9 +126,12 @@ namespace
 		bool has_branches = false;
 		bool loops_to_entry = false;
 		// Compiled for exactly this incoming state; Execute() only enters it
-		// when the state matches. Never set on a block that loops to its entry,
-		// since the loop edge arrives with a different state.
+		// when the state matches. Such a block never loops natively: its loop
+		// edge arrives with a different state and links to that one's variant.
 		bool profiled = false;
+		// Compiled for a profile that its loop edge could not keep, so it runs
+		// unprofiled for every incoming state instead of being tried again.
+		bool profile_rejected = false;
 		IncomingProfile incoming;
 		// The Execute() call in which this block last passed full source
 		// validation; micro memory only changes between calls.
@@ -1833,7 +1839,7 @@ namespace
 			incoming[k] = block.incoming.Fmac(k);
 			phantom_ages[k] = incoming[k].age;
 		}
-		u32 integer_ready = 0, efu_ready = 0;
+		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0, efu_ready = 0;
 		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
 		block.known_prefix = block.count;
 		for (u32 i = 0; i < block.count; i++)
@@ -2438,14 +2444,30 @@ namespace
 				break; // JR/JALR/BAL's delay slot is native; the runtime target is not.
 		}
 		VU1.code = saved_code;
-		if (profile && block->count && !block->loops_to_entry)
-		{
-			block->profiled = true;
-			block->incoming = *profile;
-		}
 		if (block->count)
 		{
-			AnalyzeRetirement(*block);
+			if (profile)
+			{
+				// A profiled loop leaves through its end exit and links back to a
+				// variant for the state the loop edge arrives with. That needs the
+				// edge's state to be the same every time; otherwise keep the native
+				// loop and the generic prologue.
+				block->profiled = true;
+				block->incoming = *profile;
+				const bool loops = block->loops_to_entry;
+				block->loops_to_entry = false;
+				AnalyzeRetirement(*block);
+				if (loops && block->known_prefix != block->count)
+				{
+					block->profiled = false;
+					block->profile_rejected = true;
+					block->incoming = {};
+					block->loops_to_entry = true;
+					AnalyzeRetirement(*block);
+				}
+			}
+			else
+				AnalyzeRetirement(*block);
 			AssignVectorCache(*block);
 			const VectorCache& cache = block->cache;
 			if (!s_pipeline.prepare[0])
@@ -2528,8 +2550,10 @@ namespace
 			// schedule already accounts for the one special entry it admits, a
 			// pending divide.
 			const bool scheduled = block->profiled ? scheduled_pairs != 0 : scheduled_pairs >= 4;
+			// With the IALU pipe occupied, the first readiness check after the
+			// generic pairs that drain it enables the schedule.
 			if (block->profiled && scheduled)
-				a.Mov(w25, 3);
+				a.Mov(w25, block->incoming.Ialu() ? 1 : 3);
 			else if (scheduled)
 				EmitScheduleGuard(a);
 			// Keep queue insertion and budget checks off the cycle store/load chain.
@@ -2792,7 +2816,7 @@ namespace
 	// divide is admitted and described instead. Anything else stays unprofiled.
 	bool CaptureProfile(IncomingProfile& profile)
 	{
-		if (VU1.xgkickenable || VU1.efu.enable || VU1.ialucount)
+		if (VU1.xgkickenable || VU1.efu.enable)
 			return false;
 		const u64 cycle = VU1.cycle;
 		if (cycle >= ~u64(0) - (MaxInstructions * 4 + 4))
@@ -2807,10 +2831,27 @@ namespace
 			// by the pair after this many.
 			fdiv = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
 		}
+		// ILW/ILWR results only delay integer branches, and the generic
+		// preparation drains the pipe; the schedule stays off until it has.
+		u32 ialu = 0;
+		if (VU1.ialucount)
+		{
+			if (VU1.ialucount > 4 || VU1.ialureadpos > 3 || VU1.ialuwritepos != ((VU1.ialureadpos + VU1.ialucount) & 3))
+				return false;
+			u64 ready = 0;
+			for (u32 k = 0; k < VU1.ialucount; k++)
+			{
+				const ialuPipe& entry = VU1.ialu[(VU1.ialureadpos + k) & 3];
+				if (entry.sCycle > cycle || entry.Cycle > 8)
+					return false;
+				ready = std::max<u64>(ready, entry.sCycle + entry.Cycle);
+			}
+			ialu = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
+		}
 		const u32 count = VU1.fmaccount;
 		if (count > 4 || VU1.fmacreadpos > 3 || VU1.fmacwritepos != ((VU1.fmacreadpos + count) & 3))
 			return false;
-		profile.Set(count, fdiv);
+		profile.Set(count, fdiv, ialu);
 		u64 previous = 0;
 		for (u32 k = 0; k < count; k++)
 		{
@@ -2961,14 +3002,14 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		const bool profilable = !pending && s_profiled_compiles[pc / 8] < MaxProfiledCompiles && CaptureProfile(profile);
 		// Prefer a variant compiled for this incoming state. An unprofiled one
 		// with the same source serves when the state cannot be profiled, and
-		// always for a block that loops to its entry, which is never profiled.
+		// always once profiling its loop was rejected.
 		size_t found = variants.size(), unprofiled = variants.size();
 		for (size_t i = 0; i < variants.size(); i++)
 		{
 			const Block& candidate = *variants[i];
 			if (candidate.profiled && (!profilable || !(candidate.incoming == profile)))
 				continue;
-			const bool usable = candidate.profiled || !profilable || candidate.loops_to_entry || !candidate.count;
+			const bool usable = candidate.profiled || !profilable || candidate.profile_rejected || !candidate.count;
 			if (!usable && unprofiled != variants.size())
 				continue;
 			if (!Matches(candidate, pc, remaining))

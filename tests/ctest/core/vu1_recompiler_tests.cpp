@@ -2877,6 +2877,20 @@ TEST_F(VU1RecompilerTest, ProfiledEntriesScheduleFromTheFirstPair)
 			VU1.fdiv.reg.UL = 0x3fc00000;
 			VU1.fdiv.statusflag = next() & 0xc30;
 		}
+		// ILW results still in flight delay the integer branches below.
+		if (seed % 4 == 1)
+		{
+			VU1.ialucount = 1 + next() % 2;
+			VU1.ialureadpos = next() % 4;
+			VU1.ialuwritepos = (VU1.ialureadpos + VU1.ialucount) & 3;
+			for (u32 n = 0; n < VU1.ialucount; n++)
+			{
+				auto& ialu = VU1.ialu[(VU1.ialureadpos + n) & 3];
+				ialu.sCycle = cycle - next() % 6;
+				ialu.Cycle = 4;
+				ialu.reg = 1 << (1 + next() % 3);
+			}
+		}
 		for (u32 i = 0; i < 24; i++)
 		{
 			const u32 fs = 1 + next() % 4, ft = 1 + next() % 4, fd = 1 + next() % 4;
@@ -3015,6 +3029,55 @@ TEST_F(VU1RecompilerTest, LinkedExitsEnterTheNextBlockDirectly)
 		run(budget);
 		if (HasFatalFailure())
 			return;
+	}
+}
+
+TEST_F(VU1RecompilerTest, ProfiledLoopsLinkBackToTheirLoopEdgeVariant)
+{
+	// A loop to the block's own entry used to rerun its generic prologue every
+	// iteration. Entered with a profile, it now leaves through its end exit and
+	// links to a variant for the state its loop edge arrives with, as long as
+	// that state is the same every time. An ILW whose result the loop branch
+	// may wait for keeps it the native, unprofiled loop instead.
+	const VURegs initial = VU1, initial0 = VU0;
+	auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+	constexpr u32 kNop = 0x8000033c;
+	for (u32 with_load : {0u, 1u})
+	{
+		CpuArm64VU1.Reset();
+		Put(0, add(3, 1, 2), 0x12000000 | (1 << 16) | (1 << 11) | 1); // ISUBIU VI1, VI1, 1
+		Put(8, add(4, 3, 2), with_load ? 0x08000000 | (1 << 21) | (2 << 16) : kNop); // ILW.x VI2, 0(VI0)
+		Put(16, add(5, 4, 1), 0x52000000 | (1 << 11) | 0x7fd); // IBNE VI1, VI0 -> 0
+		Put(24, add(3, 5, 2), kNop);
+		Put(32, 0x400002ff, kNop); // E bit
+		Put(40, 0x2ff, kNop);
+		auto run = [&](u32 budget) {
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 100;
+			VU1.VI[1].UL = 12;
+			// Two FMAC results in flight make the first entry profilable.
+			VU1.fmaccount = 2;
+			VU1.fmacwritepos = 2;
+			for (u32 n = 0; n < 2; n++)
+			{
+				VU1.fmac[n].sCycle = 98 + n;
+				VU1.fmac[n].Cycle = 4;
+				VU1.fmac[n].regupper = 1 + n;
+				VU1.fmac[n].xyzwupper = 15;
+			}
+			Compare(budget);
+		};
+		for (u32 budget = 1; budget <= 120; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "load=" << with_load << " budget=" << budget);
+			run(budget);
+			if (HasFatalFailure())
+				return;
+		}
+		const u64 dispatches = CpuArm64VU1.GetDispatchCount();
+		run(1000);
+		EXPECT_LT(CpuArm64VU1.GetDispatchCount() - dispatches, 6u) << "load=" << with_load;
 	}
 }
 

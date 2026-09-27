@@ -2512,6 +2512,25 @@ remaining generic reasons, per 2M block entries:
 - The capped runs that followed are unusable: Time Machine was running, and
   old and new builds degraded alike.
 
+**Loop blocks and pending IALU entries (later the same day).** These made up
+the largest generic reason above: 4.8M pairs per 2M entries.
+
+- A block that loops to its entry can now be profiled. It then leaves
+  through its end exit and links back to the variant for the state its loop
+  edge arrives with. That needs every pair's cycle advance to be known
+  (`known_prefix == count`). Otherwise the block is marked
+  `profile_rejected` and stays an unprofiled native loop.
+- The IALU pipe (ILW/ILWR results) no longer prevents profiling. The profile
+  stores how many pairs the latest result may still be pending. An integer
+  branch before that point keeps its wait, and the schedule starts only after
+  the generic pairs that drain the pipe.
+- Tests cover random incoming IALU entries and a profiled loop that links
+  back to itself. Burnout 3, Ridge Racer V and Saru! Get You! 3 render
+  correctly. Not measured with the counters yet. Seeding
+  `integer_ready` with 0 instead of the profile's value is caught only when
+  the `w25` entry value is also wrong; each of the two changes alone is not
+  caught.
+
 Per-pair MAC/status flag computation is about 25 instructions of a deferred
 FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
 but it conflicts with this design's exact interpreter state at every pair
