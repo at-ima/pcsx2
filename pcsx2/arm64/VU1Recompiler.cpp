@@ -924,8 +924,38 @@ namespace
 		StoreMAC(a, cache, op, code);
 	}
 
+	// The VI backup (_vuBackupVI) as a deferred region knows it at compile time.
+	// Every pair's cycle count is known there, so the state is static after the
+	// first backup in the region. (The incoming countdown is not bounded by two:
+	// a restored state may hold anything.) Memory is brought up to date at the
+	// region's exits.
+	struct StaticViBackup
+	{
+		bool known = false;
+		u32 left = 0;
+		int reg = -1;
+		bool reg_dirty = false;
+	};
+	StaticViBackup* s_vi_backup = nullptr;
+
 	void BackupVI(MacroAssembler& a, u32 reg)
 	{
+		if (s_vi_backup && s_vi_backup->known)
+		{
+			auto& backup = *s_vi_backup;
+			// Repeated writes keep the value from before the chain.
+			if (!(backup.left && backup.reg == static_cast<int>(reg)))
+			{
+				a.Ldrh(w9, Field(VI(reg)));
+				a.Str(w9, Field(offsetof(VURegs, VIOldValue)));
+				backup.reg = static_cast<int>(reg);
+				backup.reg_dirty = true;
+			}
+			backup.left = 2;
+			return;
+		}
+		if (s_vi_backup)
+			*s_vi_backup = {true, 2, static_cast<int>(reg), false};
 		Label done;
 		a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
 		a.Ldr(w10, Field(offsetof(VURegs, VIRegNumber)));
@@ -1649,6 +1679,12 @@ namespace
 		{
 			Label done;
 			const auto load_operand = [&](const Register& dest, u32 reg) {
+				if (s_vi_backup && s_vi_backup->known)
+				{
+					const bool old = s_vi_backup->left && s_vi_backup->reg == static_cast<int>(reg);
+					a.Ldrsh(dest, Field(old ? offsetof(VURegs, VIOldValue) : VI(reg)));
+					return;
+				}
 				Label current;
 				a.Ldrsh(dest, Field(VI(reg)));
 				a.Ldrb(w9, Field(offsetof(VURegs, VIBackupCycles)));
@@ -2301,6 +2337,7 @@ namespace
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+		StaticViBackup vi;
 		// Whether v25 may hold sticky status bits not yet in w25.
 		bool raw_retired = false;
 	};
@@ -2331,7 +2368,14 @@ namespace
 	// batched backup countdown and TPC.
 	void EmitRegionExit(MacroAssembler& a, const Block& block, const RegionSlots& state, u32 last_index)
 	{
-		if (state.backup_cycles)
+		if (state.vi.known)
+		{
+			a.Mov(w9, state.vi.left);
+			a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
+			if (state.vi.reg_dirty)
+				StoreWord(a, state.vi.reg, offsetof(VURegs, VIRegNumber));
+		}
+		else if (state.backup_cycles)
 			EmitBackupCountdown(a, std::min(state.backup_cycles, 255u));
 		EmitStickyFold(a, state);
 		const auto& last = block.instructions[last_index];
@@ -2371,9 +2415,8 @@ namespace
 		                                           IsRegisterBranch(DecodeLower(block.instructions[last_index - 1].lower));
 		if (!last_is_register_branch_delay)
 			StoreWord(a, block.next_pc[last_index], VI(REG_TPC));
-		const bool upper_code = (last.upper & 0x80000000) ||
-		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
-		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
+		// VURegs::code is decoding scratch that nothing reads after this point:
+		// generated code and the interpreter set it before using it.
 	}
 
 	// An untaken integer branch inside a deferred region leaves through a stub
@@ -2510,13 +2553,18 @@ namespace
 			if (plan.ialu_pending)
 				EmitIALURetire(a);
 			// Only an integer write or branch can inspect/reset the backup
-			// countdown in a supported pair. Accumulate time until that observer
-			// or the block exit.
-			backup_cycles += plan.cycles;
-			if ((ins.lregs.VIwrite & 0xffff) || integer_branch)
+			// countdown in a supported pair. Until the state is static, accumulate
+			// time until that observer or the block exit.
+			if (state.vi.known)
+				state.vi.left -= std::min(state.vi.left, static_cast<u32>(plan.cycles));
+			else
 			{
-				EmitBackupCountdown(a, std::min(backup_cycles, 255u));
-				backup_cycles = 0;
+				backup_cycles += plan.cycles;
+				if ((ins.lregs.VIwrite & 0xffff) || integer_branch)
+				{
+					EmitBackupCountdown(a, std::min(backup_cycles, 255u));
+					backup_cycles = 0;
+				}
 			}
 			// Q/P are final in memory here, like the clip flag; status and MAC
 			// live in w25/w28.
@@ -2531,11 +2579,13 @@ namespace
 			const Entry kind = HasFmac(ins) ? kinds[issued] : Entry::Normal;
 			const u32 macs = s_store_mac_count;
 			s_raw_flag_slot = kind == Entry::Raw ? static_cast<int>(issued & 3) : -1;
+			s_vi_backup = &state.vi;
 			EmitPair(a, block.cache, ins, false);
 			s_raw_flag_slot = -1;
 			pxAssertRel((s_store_mac_count != macs) == (HasFmac(ins) && UpdatesMacFlags(ins.upper)),
 				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);
+			s_vi_backup = nullptr;
 			if (HasFmac(ins))
 			{
 				const u32 slot = issued++ & 3;
@@ -3258,9 +3308,14 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 	u32 pending_generation = 0;
 	VU1.VI[REG_TPC].UL <<= 3;
 	const u64 start = VU1.cycle;
+	// Pick the run gate once. Written as one conditional expression, clang
+	// loaded both words every iteration and selected one; under MTVU the EE
+	// keeps writing VU0's line, and that load was ~10% of the MTVU thread.
+	const u32* const run_gate = mtvu ? &VU1.flags : &VU0.VI[REG_VPU_STAT].UL;
+	const u32 run_mask = mtvu ? VUFLAG_MTVURUNNING : 0x100;
 	while (VU1.cycle - start < cycles)
 	{
-		if (!(mtvu ? (VU1.flags & VUFLAG_MTVURUNNING) : (VU0.VI[REG_VPU_STAT].UL & 0x100)))
+		if (!(*run_gate & run_mask))
 		{
 			if (VU1.branch == 1)
 			{

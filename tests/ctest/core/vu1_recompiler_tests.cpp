@@ -3374,6 +3374,58 @@ TEST_F(VU1RecompilerTest, UnobservedFlagResultsKeepStickyBitsAndReaderValues)
 	}
 }
 
+TEST_F(VU1RecompilerTest, RegionBranchesSeeTheViBackup)
+{
+	// An integer branch reads the value a VI register had before a write in the
+	// previous pair or two (_vuBackupVI). Inside a deferred region that backup
+	// is tracked at compile time. Random writes and branches over few values,
+	// ending in an E bit so large budgets enter the region.
+	const VURegs initial = VU1, initial0 = VU0;
+	u32 random = 0x9e3779b9;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	constexpr u32 count = 32;
+	for (u32 seed = 0; seed < 64; seed++)
+	{
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 1000;
+		for (u32 r = 1; r < 4; r++)
+			VU1.VI[r].UL = next() % 3;
+		for (u32 i = 0; i < count; i++)
+		{
+			const u32 fs = 1 + next() % 4, ft = 1 + next() % 4, fd = 5 + next() % 3;
+			const u32 upper = (15 << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; // ADD
+			u32 lower = 0x8000033c;
+			switch (next() % 4)
+			{
+				case 0:
+				case 1:
+					lower = 0x10000000 | ((1 + next() % 3) << 16) | ((1 + next() % 3) << 11) | (next() % 3); // IADDIU
+					break;
+				case 2:
+					lower = (next() % 2 ? 0x52000000 : 0x50000000) | ((1 + next() % 3) << 16) | ((1 + next() % 3) << 11) | 1; // IBNE/IBEQ +1
+					break;
+			}
+			Put(i * 8, upper, lower);
+		}
+		Put(count * 8, 0x400002ff, 0x8000033c);
+		Put(count * 8 + 8, 0x2ff, 0x8000033c);
+		for (u32 pc = count * 8 + 16; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		const VURegs state = VU1;
+		for (u32 budget : {5u, 12u, 20u, 40u, 80u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = state;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, FlagQAndBranchReadersScheduleOutsideDeferredRegions)
 {
 	// Flag tests, Q readers and integer branches used to take the generic
