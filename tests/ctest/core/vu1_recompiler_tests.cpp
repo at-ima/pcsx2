@@ -2747,6 +2747,39 @@ TEST_F(VU1RecompilerTest, EfuReciprocalsKeepTheOverflowClampBounds)
 	EmuConfig.Cpu.Recompiler.vu1Overflow = overflow;
 }
 
+TEST_F(VU1RecompilerTest, MfpReadsPAtEachDistanceFromTheEfuOp)
+{
+	// MFP copies P into the masked lanes without waiting for a pending EFU op,
+	// so the value depends on where it lands in ESADD's 11-cycle latency. The
+	// following MUL reads its result through the FMAC hazard, and the ADD
+	// filler makes the block long enough for the precomputed schedule.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 mfp_at : {1u, 3u, 8u, 12u, 14u})
+		for (u32 budget : {1u, 2u, 5u, 12u, 20u, 40u})
+		{
+			SCOPED_TRACE(testing::Message() << "mfp_at=" << mfp_at << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VI[REG_P].F = -7.0f; // stale P, visible before ESADD retires
+			VU1.VF[1].F[0] = 3.0f;
+			VU1.VF[1].F[1] = 4.0f;
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				VU1.VF[4].F[lane] = 1.5f + lane;
+				VU1.VF[5].F[lane] = 0.25f * lane;
+				VU1.VF[6].F[lane] = 2.0f;
+			}
+			Put(0, 0x2ff, 0x8000073c | (1 << 11)); // ESADD VF1
+			for (u32 pc = 8; pc < 256; pc += 8)
+				Put(pc, (15 << 21) | (6 << 16) | (5 << 11) | (5 << 6) | 0x28, 0); // ADD.xyzw VF5, VF5, VF6
+			Put(mfp_at * 8, 0x2ff, 0x8000067c | (0xb << 21) | (2 << 16)); // MFP.xzw VF2
+			Put(mfp_at * 8 + 8, (15 << 21) | (4 << 16) | (2 << 11) | (3 << 6) | 0x2a, 0); // MUL.xyzw VF3, VF2, VF4
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+}
+
 TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
 {
 	const VURegs initial = VU1, initial0 = VU0;

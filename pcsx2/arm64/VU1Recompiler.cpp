@@ -214,6 +214,7 @@ namespace
 		Move,
 		Mr32,
 		Mfir,
+		Mfp,
 		Mtir,
 		Ilw,
 		Ilwr,
@@ -348,6 +349,8 @@ namespace
 						return Lower::Mr32;
 					case 0x3fd:
 						return Lower::Mfir;
+					case 0x67c:
+						return Lower::Mfp;
 					case 0x3fc:
 						return Lower::Mtir;
 					case 0x3bc:
@@ -1326,13 +1329,21 @@ namespace
 			StoreMasked(a, v0, MemOperand(x1), mask);
 			return;
 		}
-		if (op == Lower::Move || op == Lower::Mr32 || op == Lower::Mfir)
+		if (op == Lower::Move || op == Lower::Mr32 || op == Lower::Mfir || op == Lower::Mfp)
 		{
 			if (!ft)
 				return;
 			if (op == Lower::Mfir)
 			{
 				a.Ldrsh(w0, Field(VI(is)));
+				a.Dup(v0.V4S(), w0);
+			}
+			else if (op == Lower::Mfp)
+			{
+				// Reads P as it stands: MFP does not wait for a pending EFU op
+				// (that is WAITP's job). Pairs reading P while one is pending
+				// stay on the generic path, which retires it at the right cycle.
+				a.Ldr(w0, Field(VI(REG_P)));
 				a.Dup(v0.V4S(), w0);
 			}
 			else
