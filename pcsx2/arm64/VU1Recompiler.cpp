@@ -2024,12 +2024,9 @@ namespace
 				// stays generic.
 				if (ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P)))
 					plan.cycles = 0;
-				// Flag readers observe what deferred regions keep in registers; an
-				// integer branch reads the VI backup countdown and may exit.
-				if (((ins.uregs.VIread | ins.lregs.VIread) &
-						((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG) | (1 << REG_Q) | (1 << REG_P))) ||
-					integer_branch)
-					plan.deferrable = false;
+				// Flag, Q and P readers stay in a region, which publishes the
+				// status and MAC flags it keeps in registers before them. An
+				// untaken integer branch leaves it through its own exit.
 				block.schedule[i] = plan;
 			}
 			for (u32 k = 0; k < phantoms; k++)
@@ -2256,38 +2253,113 @@ namespace
 	// A fully budgeted, callback-free region can keep its four FMAC flag
 	// snapshots in q28..q31. Queue metadata and cycle stamps are compile-time
 	// facts and only need materializing when returning to the dispatcher.
-	void EmitDeferredRegion(MacroAssembler& a, const Block& block, u32 first, u32 end)
+	// The FMAC slots a deferred region has written: which pair issued each and
+	// when, relative to the region's start.
+	struct RegionSlots
+	{
+		struct Slot
+		{
+			int writer = -1;
+			u32 issue_cycle = 0;
+			u32 order = 0;
+		};
+		std::array<Slot, 4> slots{};
+		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+	};
+
+	void EmitRegionSlotAddress(MacroAssembler& a, u32 relative)
+	{
+		a.Add(w0, w27, relative & 3);
+		a.And(w0, w0, 3);
+		a.Mov(w1, sizeof(fmacPipe));
+		a.Madd(x0, x0, x1, x19);
+		a.Add(x0, x0, offsetof(VURegs, fmac));
+	}
+
+	// Publish what a deferred region keeps in registers, as of the end of pair
+	// `last`: the live FMAC entries, queue positions, status/MAC flags, the
+	// batched backup countdown and TPC.
+	void EmitRegionExit(MacroAssembler& a, const Block& block, const RegionSlots& state, u32 last_index)
+	{
+		if (state.backup_cycles)
+			EmitBackupCountdown(a, std::min(state.backup_cycles, 255u));
+		const auto& last = block.instructions[last_index];
+		const u32 live = block.schedule[last_index].remaining + HasFmac(last);
+		// Only live entries are ever read again (queue walks start at fmacreadpos
+		// and cover fmaccount entries). Retired slots keep stale contents.
+		for (u32 slot = 0; slot < 4; slot++)
+		{
+			const auto& entry = state.slots[slot];
+			if (entry.writer < 0 || entry.order + live < state.issued)
+				continue;
+			EmitRegionSlotAddress(a, slot);
+			EmitFmacMetadata(a, block.instructions[entry.writer]);
+			a.Sub(x9, x26, state.elapsed - entry.issue_cycle);
+			a.Str(x9, MemOperand(x0, offsetof(fmacPipe, sCycle)));
+			a.Mov(w9, 4);
+			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, Cycle)));
+			a.Str(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
+			a.Umov(w9, VRegister(28 + slot, 128).V4S(), 2);
+			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
+		}
+		a.Add(w9, w27, state.issued & 3);
+		a.And(w9, w9, 3);
+		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
+		a.Sub(w9, w9, live);
+		a.And(w9, w9, 3);
+		a.Str(w9, Field(offsetof(VURegs, fmacreadpos)));
+		StoreWord(a, live, offsetof(VURegs, fmaccount));
+		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
+		a.Str(w28, Field(VI(REG_MAC_FLAG)));
+		// A JR/JALR/BAL delay slot ending the region already published the right
+		// TPC itself (EmitControlFlow's block.delay case, run above in this same
+		// loop): its target isn't the compile-time-constant next_pc this generic
+		// epilogue otherwise stores, so don't clobber it with that stale value.
+		const bool last_is_register_branch_delay = block.delay[last_index] && last_index >= 1 &&
+		                                           !(block.instructions[last_index - 1].upper & 0x80000000) &&
+		                                           IsRegisterBranch(DecodeLower(block.instructions[last_index - 1].lower));
+		if (!last_is_register_branch_delay)
+			StoreWord(a, block.next_pc[last_index], VI(REG_TPC));
+		const bool upper_code = (last.upper & 0x80000000) ||
+		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
+		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
+	}
+
+	// An untaken integer branch inside a deferred region leaves through a stub
+	// the block emits out of line: `label` publishes the region's state as of
+	// pair `index` and continues at the branch's link exit.
+	struct RegionBranchExit
+	{
+		Label label;
+		RegionSlots state;
+		u32 index;
+	};
+
+	void EmitDeferredRegion(MacroAssembler& a, const Block& block, u32 first, u32 end,
+		std::vector<std::unique_ptr<RegionBranchExit>>& branch_exits)
 	{
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
 					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
 		a.Ldr(w27, Field(offsetof(VURegs, fmacwritepos)));
 		a.Ldr(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Ldr(w28, Field(VI(REG_MAC_FLAG)));
-		auto slot_address = [&](u32 relative) {
-			a.Add(w0, w27, relative & 3);
-			a.And(w0, w0, 3);
-			a.Mov(w1, sizeof(fmacPipe));
-			a.Madd(x0, x0, x1, x19);
-			a.Add(x0, x0, offsetof(VURegs, fmac));
-		};
 		for (u32 slot = 0; slot < 4; slot++)
 		{
-			slot_address(slot);
+			EmitRegionSlotAddress(a, slot);
 			a.Ldr(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
 			a.Ldr(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
 			a.Ins(VRegister(28 + slot, 128).V4S(), 2, w9);
 		}
-		struct Slot
-		{
-			int writer = -1;
-			u32 issue_cycle = 0;
-		};
-		std::array<Slot, 4> slots{};
-		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+		RegionSlots state;
+		auto& slots = state.slots;
+		u32& issued = state.issued;
+		u32& elapsed = state.elapsed;
+		u32& backup_cycles = state.backup_cycles;
 		for (u32 i = first; i < end; i++)
 		{
 			const auto& plan = block.schedule[i];
 			const auto& ins = block.instructions[i];
+			const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 			elapsed += plan.cycles;
 			a.Add(x26, x26, plan.cycles);
 			for (u32 j = 0; j < plan.retired; j++)
@@ -2311,14 +2383,22 @@ namespace
 				EmitFDIVSlotRetire(a, w25, false);
 			if (plan.ialu_pending)
 				EmitIALURetire(a);
-			// Only an integer write can inspect/reset the backup countdown in a
-			// supported pair. Accumulate time until that observer or the block exit.
+			// Only an integer write or branch can inspect/reset the backup
+			// countdown in a supported pair. Accumulate time until that observer
+			// or the block exit.
 			backup_cycles += plan.cycles;
-			if (ins.lregs.VIwrite & 0xffff)
+			if ((ins.lregs.VIwrite & 0xffff) || integer_branch)
 			{
 				EmitBackupCountdown(a, std::min(backup_cycles, 255u));
 				backup_cycles = 0;
 			}
+			// Q/P are final in memory here, like the clip flag; status and MAC
+			// live in w25/w28.
+			const u32 reads = ins.uregs.VIread | ins.lregs.VIread;
+			if (reads & (1 << REG_STATUS_FLAG))
+				a.Str(w25, Field(VI(REG_STATUS_FLAG)));
+			if (reads & (1 << REG_MAC_FLAG))
+				a.Str(w28, Field(VI(REG_MAC_FLAG)));
 			EmitPair(a, block.cache, ins, false);
 			EmitControlFlow(a, block, i);
 			if (HasFmac(ins))
@@ -2328,49 +2408,20 @@ namespace
 				a.Ldr(VRegister(28 + slot, 128), Field(offsetof(VURegs, macflag)));
 				slots[slot].writer = i;
 				slots[slot].issue_cycle = elapsed;
+				slots[slot].order = issued - 1;
+			}
+			if (integer_branch && i + 1 < block.count)
+			{
+				// Not taken: the trace continues elsewhere.
+				auto exit = std::make_unique<RegionBranchExit>();
+				exit->state = state;
+				exit->index = i;
+				a.Ldr(w9, Field(offsetof(VURegs, branch)));
+				a.Cbz(w9, &exit->label);
+				branch_exits.push_back(std::move(exit));
 			}
 		}
-		if (backup_cycles)
-			EmitBackupCountdown(a, std::min(backup_cycles, 255u));
-		// Restore even inactive overwritten slots: save states and differential
-		// execution observe the complete architectural queue, not just live entries.
-		for (u32 slot = 0; slot < 4; slot++)
-		{
-			if (slots[slot].writer < 0)
-				continue;
-			slot_address(slot);
-			EmitFmacMetadata(a, block.instructions[slots[slot].writer]);
-			a.Sub(x9, x26, elapsed - slots[slot].issue_cycle);
-			a.Str(x9, MemOperand(x0, offsetof(fmacPipe, sCycle)));
-			a.Mov(w9, 4);
-			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, Cycle)));
-			a.Str(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
-			a.Umov(w9, VRegister(28 + slot, 128).V4S(), 2);
-			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
-		}
-		const auto& last = block.instructions[end - 1];
-		const u32 live = block.schedule[end - 1].remaining + HasFmac(last);
-		a.Add(w9, w27, issued & 3);
-		a.And(w9, w9, 3);
-		a.Str(w9, Field(offsetof(VURegs, fmacwritepos)));
-		a.Sub(w9, w9, live);
-		a.And(w9, w9, 3);
-		a.Str(w9, Field(offsetof(VURegs, fmacreadpos)));
-		StoreWord(a, live, offsetof(VURegs, fmaccount));
-		a.Str(w25, Field(VI(REG_STATUS_FLAG)));
-		a.Str(w28, Field(VI(REG_MAC_FLAG)));
-		// A JR/JALR/BAL delay slot ending the region already published the right
-		// TPC itself (EmitControlFlow's block.delay case, run above in this same
-		// loop): its target isn't the compile-time-constant next_pc this generic
-		// epilogue otherwise stores, so don't clobber it with that stale value.
-		const bool last_is_register_branch_delay = block.delay[end - 1] && end >= 2 &&
-			!(block.instructions[end - 2].upper & 0x80000000) &&
-			IsRegisterBranch(DecodeLower(block.instructions[end - 2].lower));
-		if (!last_is_register_branch_delay)
-			StoreWord(a, block.next_pc[end - 1], VI(REG_TPC));
-		const bool upper_code = (last.upper & 0x80000000) ||
-		                        (last.uregs.VFwrite && last.uregs.VFwrite == last.lregs.VFwrite);
-		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
+		EmitRegionExit(a, block, state, end - 1);
 	}
 
 	Block& Compile(u32 pc, const IncomingProfile* profile)
@@ -2757,11 +2808,12 @@ namespace
 			}
 			if (deferred)
 				a.B(&finished);
+			std::vector<std::unique_ptr<RegionBranchExit>> branch_exits;
 			for (u32 r = 0; r < regions.size(); r++)
 			{
 				const auto& region = regions[r];
 				a.Bind(&deferred_entries[r]);
-				EmitDeferredRegion(a, *block, region.first, region.end);
+				EmitDeferredRegion(a, *block, region.first, region.end, branch_exits);
 				// The emitter borrows w25 for flags. Entry proved both guards and
 				// no special work can be issued inside the region.
 				a.Mov(w25, 3);
@@ -2774,6 +2826,12 @@ namespace
 					a.B(lo, &resumes[r]);
 				}
 				a.B(region.end == block->count ? &finished : &exit);
+			}
+			for (const auto& branch_exit : branch_exits)
+			{
+				a.Bind(&branch_exit->label);
+				EmitRegionExit(a, *block, branch_exit->state, branch_exit->index);
+				a.B(add_link(branch_exit->index));
 			}
 			a.Bind(&finished);
 			if (block->loops_to_entry)
