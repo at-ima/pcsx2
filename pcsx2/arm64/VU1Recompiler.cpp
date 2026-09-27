@@ -52,6 +52,10 @@ namespace
 		// so this pair has to retire it itself instead of leaving that to the
 		// generic per-pair preparation it is replacing.
 		bool fdiv_pending = false;
+		// Deferred regions keep retired flags in host registers, batch the backup
+		// countdown and cannot exit mid-region. A pair that observes any of that
+		// is still scheduled, but ends the region.
+		bool deferrable = true;
 	};
 
 	// Pipeline state a block was entered with, captured by Execute() so that
@@ -1240,8 +1244,9 @@ namespace
 		if (op == Lower::Esadd || op == Lower::Ersadd || op == Lower::Eleng || op == Lower::Erleng)
 		{
 			// _vuESADD/_vuERSADD/_vuELENG/_vuERLENG all reduce fs.xyz to
-			// p = fs.x^2 + fs.y^2 + fs.z^2 (left-to-right, matching the
-			// interpreter's evaluation order), then diverge: ESADD stores it
+			// p = fs.x^2 + fs.y^2 + fs.z^2, which clang contracts on ARM64 into
+			// x*x followed by two fused multiply-adds; match that rounding.
+			// They then diverge: ESADD stores it
 			// directly, ERSADD takes its reciprocal (skipped when zero), ELENG
 			// takes its square root (skipped when negative or NaN), ERLENG
 			// chains both. None of the four clamp their output, matching the
@@ -1254,10 +1259,8 @@ namespace
 			a.Dup(v3.V4S(), v0.V4S(), 1);
 			a.Dup(v4.V4S(), v0.V4S(), 2);
 			a.Fmul(s2, s2, s2);
-			a.Fmul(s3, s3, s3);
-			a.Fmul(s4, s4, s4);
-			a.Fadd(s5, s2, s3);
-			a.Fadd(s5, s5, s4);
+			a.Fmadd(s5, s3, s3, s2);
+			a.Fmadd(s5, s4, s4, s5);
 			if (op == Lower::Ersadd)
 			{
 				Label done;
@@ -1910,25 +1913,31 @@ namespace
 			// VI waits and kick/transfer callbacks can change timing. Forget exact
 			// producer ages until enough new pairs establish a known schedule.
 			// An integer branch waits only for ILW/ILWR results in the IALU pipe.
-			// A profiled block was entered with that pipe empty, so once its own
-			// loads have matured the branch advances like any other pair (it
-			// still takes the branch preparation, which does the same wait).
-			const bool integer_wait = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread &&
-			                          !(block.profiled && i >= integer_ready);
+			// Once the block's own loads have matured the branch advances like any
+			// other pair: a profiled block knows its incoming entries, and an
+			// unprofiled one's have retired after four pairs (ILW latency is four,
+			// and every pair advances at least one cycle).
+			const bool integer_branch = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread;
+			const bool integer_wait = integer_branch && !(i >= integer_ready && (block.profiled || i >= 4));
 			if (integer_wait || ins.lregs.pipe == VUPIPE_XGKICK ||
 				(i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
-			// Touching Q or P while an entry issued earlier is still in the FDIV/EFU
-			// pipe stalls the pair until that entry retires (_vuTestFDIVStalls), so
-			// VURegs::cycle jumps by an amount nothing here can predict. Hand the age
-			// tracking below an unknown advance instead of the nominal one; this is
-			// what keeps the pairs after a WAITQ or a Q read off the schedule until
-			// their producers' ages have provably recovered. Read before this pair's
-			// own issue updates fdiv_ready/efu_ready, since a pipe it arms itself
-			// cannot be what it stalls on.
-			constexpr u32 kQP = (1 << REG_Q) | (1 << REG_P);
-			if ((i < fdiv_ready || i < efu_ready) &&
-				((ins.uregs.VIread | ins.lregs.VIread | ins.uregs.VIwrite | ins.lregs.VIwrite) & kQP))
+			// A divide/WAITQ or an EFU op/WAITP issued while an earlier entry is
+			// still in its pipe stalls the pair until that entry retires
+			// (_vuTestFDIVStalls/_vuTestEFUStalls), so VURegs::cycle jumps by an
+			// amount nothing here can predict. Hand the age tracking below an
+			// unknown advance instead. Reading Q or P does not stall: a scheduled
+			// pair retires a pending divide itself (fdiv_pending) before it reads
+			// Q, and waits for the EFU pipe to drain (efu_ready) before it can read
+			// P. Read before this pair's own issue updates fdiv_ready/efu_ready,
+			// since a pipe it arms itself cannot be what it stalls on.
+			const bool fdiv_op = ins.lregs.pipe == VUPIPE_FDIV, efu_op = ins.lregs.pipe == VUPIPE_EFU;
+			if ((fdiv_op && i < fdiv_ready) || (efu_op && i < efu_ready))
+				cycles = -1;
+			// An unprofiled block may be entered with a divide (up to 13 cycles)
+			// or an EFU operation (up to 54) in flight. Each pair advances at
+			// least one cycle.
+			if (!block.profiled && ((fdiv_op && i < 13) || (efu_op && i < 54)))
 				cycles = -1;
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
@@ -1947,8 +1956,7 @@ namespace
 			// Without a profile the first seven pairs stay generic: three whose
 			// stalls depend on the unknown incoming entries, then four for the
 			// ages of their producers to become known.
-			if ((block.profiled || i >= 7) && cycles > 0 && i >= integer_ready && i >= efu_ready &&
-				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
+			if ((block.profiled || i >= 7) && cycles > 0 && i >= integer_ready && i >= efu_ready)
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
@@ -1989,16 +1997,19 @@ namespace
 						plan.retired++;
 					}
 				}
-				// Deferred regions keep retired flags in host registers. Materialize
-				// them before an instruction observes architectural flag, Q or P
-				// state. Q and P retire from the FDIV/EFU pipes on the same
-				// generic per-pair path. An FDIV/EFU issue also stamps its own
-				// sCycle and stalls on the previous entry, so it needs the exact
-				// cycle rather than a batched one.
+				// A scheduled pair retires FMAC entries into memory, so it can read
+				// the flags. Q and P are final here (a pending divide is retired
+				// above via fdiv_pending, and the EFU is idle). An FDIV/EFU issue
+				// stamps its own sCycle and stalls on the previous entry, so it
+				// stays generic.
+				if (ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P)))
+					plan.cycles = 0;
+				// Flag readers observe what deferred regions keep in registers; an
+				// integer branch reads the VI backup countdown and may exit.
 				if (((ins.uregs.VIread | ins.lregs.VIread) &
 						((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG) | (1 << REG_CLIP_FLAG) | (1 << REG_Q) | (1 << REG_P))) ||
-					(ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))))
-					plan.cycles = 0;
+					integer_branch)
+					plan.deferrable = false;
 				block.schedule[i] = plan;
 			}
 			for (u32 k = 0; k < phantoms; k++)
@@ -2489,7 +2500,7 @@ namespace
 			std::vector<DeferredRegion> regions;
 			// A pair inside a divide's latency retires the FDIV slot into the
 			// status flag a deferred region keeps in w25.
-			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0; };
+			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0 && block->schedule[i].deferrable; };
 			// Unprofiled blocks never schedule their first seven pairs.
 			const u32 first_scheduled = block->profiled ? 0 : 7;
 			for (u32 i = first_scheduled; i < block->count;)

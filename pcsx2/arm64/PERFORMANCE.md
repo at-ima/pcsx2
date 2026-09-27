@@ -2531,6 +2531,30 @@ the largest generic reason above: 4.8M pairs per 2M entries.
   the `w25` entry value is also wrong; each of the two changes alone is not
   caught.
 
+**Flag, Q/P and branch readers (`BURN_OUT_3_004`).** Another VU1-bound race
+section. Removing flag work alone could save only 2-3%, so this change
+schedules more of the generic pairs instead.
+
+- Flag readers, Q/P readers and integer branches are now scheduled. They set
+  `deferrable = false`, which ends a deferred region: the region keeps flags in
+  registers and cannot exit mid-region. Only Q/P writers still take the generic
+  preparation.
+- Only a divide/WAITQ stalls on a pending divide, and only an EFU op/WAITP on
+  the EFU pipe. Reading Q or P does not stall, so a Q/P reader no longer makes
+  the following ages unknown.
+- An unprofiled block may be entered with a divide or an EFU op in flight, so
+  an FDIV/EFU op within the first 13/54 pairs has an unknown advance. HEAD
+  missed this; `UnprofiledEntryWaitsForIncomingDivideOrEfu` fails there.
+- An integer branch in an unprofiled block counts as matured from pair 4
+  (ILW latency).
+- The new randomized test also caught an ESADD-family rounding mismatch.
+  Clang contracts the interpreter's `x*x + y*y + z*z` into fmul + two fmadd,
+  and the JIT now does the same.
+- Measured with the same counters, in ABBA order, three pairs, `-unlimited`:
+  - Instructions per VU1 cycle: 154.3 -> 134.5 (-12.9%).
+  - Cycles per VU1 cycle: 25.46 -> 23.23 (-8.8%).
+  - Each pair moved the same way.
+
 Per-pair MAC/status flag computation is about 25 instructions of a deferred
 FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
 but it conflicts with this design's exact interpreter state at every pair

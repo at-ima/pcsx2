@@ -3232,4 +3232,153 @@ TEST_F(VU1RecompilerTest, IswWritesEachMaskedLaneIndependently)
 }
 
 
+TEST_F(VU1RecompilerTest, FlagQAndBranchReadersScheduleOutsideDeferredRegions)
+{
+	// Flag tests, Q readers and integer branches used to take the generic
+	// preparation wherever they appeared. They are now scheduled, but end
+	// deferred regions. Random long programs mixing them with the divides,
+	// ILWs and EFU ops that bound their timing, entered both profiled and
+	// unprofiled (an EFU op in flight prevents profiling), with a divide in
+	// flight too, against the interpreter at every budget.
+	const VURegs initial = VU1, initial0 = VU0;
+	u32 random = 0x13579bdf;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	constexpr u32 flag_tests[] = {0x10, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c};
+	constexpr u32 count = 48;
+	for (u32 seed = 0; seed < 64; seed++)
+	{
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = seed & 1 ? 5000 : ~u64(0) - 6000;
+		const u64 cycle = VU1.cycle;
+		VU1.VI[REG_STATUS_FLAG].UL = next() & 0xfff;
+		VU1.VI[REG_MAC_FLAG].UL = next() & 0xffff;
+		VU1.VI[REG_CLIP_FLAG].UL = next() & 0xffffff;
+		VU1.VI[REG_Q].UL = 0x40000000;
+		VU1.VI[REG_P].UL = 0x3f000000;
+		for (u32 r = 1; r < 4; r++)
+			VU1.VI[r].UL = next() % 3;
+		if (seed % 2 == 0)
+		{
+			// Unprofiled: an EFU op in flight, and often a divide.
+			VU1.efu.enable = 1;
+			VU1.efu.sCycle = cycle - next() % 4;
+			VU1.efu.Cycle = 5 + next() % 50;
+			VU1.efu.reg.UL = 0x3e800000;
+		}
+		if (seed % 4 < 2)
+		{
+			VU1.fdiv.enable = 1;
+			VU1.fdiv.sCycle = cycle - next() % 4;
+			VU1.fdiv.Cycle = next() % 2 ? 7 : 13;
+			VU1.fdiv.reg.UL = 0x3fc00000;
+			VU1.fdiv.statusflag = next() & 0xc30;
+		}
+		for (u32 i = 0; i < count; i++)
+		{
+			const u32 fs = 1 + next() % 4, ft = 1 + next() % 4, fd = 1 + next() % 4;
+			u32 upper = ((next() & 15) << 21) | (ft << 16) | (fs << 11) | (fd << 6) | (next() % 2 ? 0x28 : 0x2a); // ADD/MUL
+			u32 lower = 0x8000033c; // MOVE with no destination lanes
+			switch (next() % 14)
+			{
+				case 0:
+				case 1:
+				case 2:
+				{
+					const u32 top = flag_tests[next() % std::size(flag_tests)];
+					const u32 imm = next() & 0xfff;
+					lower = (top << 25) | ((imm >> 11) << 21) | ((1 + next() % 3) << 16) | ((next() % 4) << 11) | (imm & 0x7ff);
+					break;
+				}
+				case 3:
+					upper = (15 << 21) | (fs << 11) | (fd << 6) | 0x1c; // MULq
+					break;
+				case 4:
+					if (next() % 3 == 0)
+						lower = 0x800003bc | (1 << 23) | (fs << 16) | (ft << 11); // DIV Q, VFft.x / VFfs.y
+					break;
+				case 5:
+					lower = next() % 4 ? 0x800003bf : 0x8000067c | ((next() & 15) << 21) | (fd << 16); // WAITQ, or MFP
+					break;
+				case 6:
+					if (next() % 3 == 0)
+						lower = 0x08000000 | (1 << 21) | ((1 + next() % 3) << 16) | (next() % 8); // ILW.x VIn, imm(VI0)
+					break;
+				case 7:
+				case 8:
+					lower = (next() % 2 ? 0x52000000 : 0x50000000) | ((1 + next() % 3) << 16) | ((1 + next() % 3) << 11) | 1; // IBNE/IBEQ +1
+					break;
+				case 9:
+					upper = 0x1ff | (ft << 16) | (fs << 11); // CLIP
+					break;
+				case 10:
+					if (next() % 4 == 0)
+						lower = 0x8000073c | (fs << 11); // ESADD
+					break;
+			}
+			Put(i * 8, upper, lower);
+		}
+		for (u32 pc = count * 8; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		const VURegs state = VU1;
+		for (u32 budget = 1; budget <= 72; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = state;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, UnprofiledEntryWaitsForIncomingDivideOrEfu)
+{
+	// An EFU op in flight keeps the entry unprofiled, so the compiler does not
+	// know how long the incoming divide or EFU op still runs. A WAITQ (or an
+	// EFU op) inside that window stalls by an unknown amount, and the ages the
+	// schedule computes after it must not assume otherwise: the ADD after it
+	// reads a result from before the stall, then a deferred region follows.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (bool efu : {false, true})
+		for (u32 wait_at : {7u, 8u, 10u})
+			for (u32 latency : {9u, 13u, 30u})
+			{
+				if (!efu && latency > 13)
+					continue;
+				Put(0, 0x2ff, 0);
+				for (u32 i = 0; i < 40; i++)
+					Put(i * 8, (15 << 21) | (6 << 16) | (5 << 11) | ((1 + i % 4) << 6) | 0x28, 0x8000033c); // ADD VFn, VF5, VF6
+				Put((wait_at - 1) * 8, (15 << 21) | (6 << 16) | (5 << 11) | (2 << 6) | 0x28, 0x8000033c); // ADD VF2
+				Put(wait_at * 8, 0x2ff, efu ? 0x8000073c | (3 << 11) : 0x800003bf); // ESADD VF3, or WAITQ
+				Put((wait_at + 1) * 8, (15 << 21) | (6 << 16) | (2 << 11) | (7 << 6) | 0x2a, 0x8000033c); // MUL VF7, VF2, VF6
+				for (u32 pc = 40 * 8; pc < VU1_PROGSIZE; pc += 8)
+					Put(pc, 0x800002ff, 0x3f800000);
+				for (u32 budget : {12u, 20u, 32u, 48u})
+				{
+					SCOPED_TRACE(testing::Message() << "efu=" << efu << " wait_at=" << wait_at << " latency=" << latency << " budget=" << budget);
+					CpuArm64VU1.Reset();
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 1000;
+					VU1.efu.enable = 1;
+					VU1.efu.sCycle = VU1.cycle;
+					VU1.efu.Cycle = efu ? latency : 5;
+					VU1.efu.reg.UL = 0x3e800000;
+					if (!efu)
+					{
+						VU1.fdiv.enable = 1;
+						VU1.fdiv.sCycle = VU1.cycle;
+						VU1.fdiv.Cycle = latency;
+						VU1.fdiv.reg.UL = 0x3fc00000;
+					}
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+}
+
 #endif
