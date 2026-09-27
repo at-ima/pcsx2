@@ -298,50 +298,54 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		return {};
 	s_last_dispatch_pc = pc;
 	s_last_dispatch_block = block;
-	// A branch that lands back on this exact block's own entry pc (a common
-	// delay/poll-loop shape -- see the s_last_dispatch_pc comment above) is
-	// provably still `block`: no lookup can find anything else. Looping here
-	// instead of returning skips a full intExecuteWithBackend round trip
-	// (switch dispatch, intFinishBranch, event-deadline check) on every single
-	// iteration of such a loop, not just the block lookup that 3f5ca209f
-	// already made free. This trusts the cached `block` pointer across
-	// iterations exactly as much as s_last_dispatch_pc already does across
-	// separate TryExecute() calls -- see its comment -- just for longer;
-	// kMaxSelfLoopIterations bounds how long that trust window stays open.
+	const u64 result = block->function(&cpuRegs);
+	const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
+	block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+	return {static_cast<EEBlockExit>((result >> CodeGenerator::ExitShift) & CodeGenerator::ExitMask),
+		static_cast<u32>(result >> 32)};
+}
+
+EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
+{
+	// Keeps running blocks here instead of returning to intExecuteWithBackend
+	// after each one. Returning cost a full round trip per block -- the
+	// driver's switch, an indirect call back into TryExecute and its
+	// prologue -- which sampled at a large share of the EE thread in
+	// Burnout 3, where most blocks are a few instructions ending in a branch.
+	// A Continue exit needs nothing from the driver. A taken branch needs
+	// intFinishBranch's pc commit, the cycle commit and the event-deadline
+	// check, done below exactly as the driver does them. Anything else goes
+	// back to the driver. The cap bounds how long a pending exit request can
+	// wait, since exit_requested is not visible here.
 	// needs proper testing across a wider range of games.
-	constexpr u32 kMaxSelfLoopIterations = 4096;
-	for (u32 iterations = 0;; iterations++)
+	constexpr u32 kMaxChainedBlocks = 4096;
+	for (u32 blocks = 1;; blocks++)
 	{
-		const u64 result = block->function(&cpuRegs);
-		const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
-		block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
-		const auto exit = static_cast<EEBlockExit>((result >> CodeGenerator::ExitShift) & CodeGenerator::ExitMask);
-		const u32 target = static_cast<u32>(result >> 32);
-		if (exit != EEBlockExit::TakenBranch || target != pc || iterations >= kMaxSelfLoopIterations)
-			return {exit, target};
+		const EEBlockResult result = TryExecute(block_cycles);
+		if (blocks >= kMaxChainedBlocks)
+			return result;
+		if (result.exit == EEBlockExit::Continue)
+			continue;
+		if (result.exit != EEBlockExit::TakenBranch)
+			return result;
 		// Replicates intFinishBranch()'s effect on this (non-interpreter-
 		// execution) path -- its WaitLoop speedhack branch is gated on
 		// Cpu->usesInterpreterExecution, which is false here, so nothing else
 		// from intFinishBranch applies. branch2 (Interpreter.cpp) is written
 		// but never read there, so it needs no equivalent here.
 		cpuRegs.branch = 1;
-		cpuRegs.pc = target;
+		cpuRegs.pc = result.target;
 		cpuRegs.branch = 0;
 		intUpdateCPUCycles();
 		if (EEBranchEventDue(/*backend_active=*/true, /*exit_requested=*/false, cpuRegs.cycle, cpuRegs.nextEventCycle))
 		{
-			// pc/cycles are already committed above, unlike the normal return
-			// path below -- returning TakenBranch here would make
-			// intExecuteWithBackend redo intFinishBranch/intUpdateCPUCycles a
-			// second time and double-count cycles (intUpdateCPUCycles() always
-			// adds at least 1 cycle, even for a near-zero residual). Run the
-			// event test ourselves instead and report a plain Continue so the
-			// caller's switch does nothing further.
-			intEventTest(); // may fastjmp out of this function entirely; does not return in that case
+			// pc/cycles are already committed above, so returning TakenBranch
+			// would make the driver commit them a second time
+			// (intUpdateCPUCycles() always adds at least 1 cycle). Run the
+			// event test here and report a plain Continue instead.
+			intEventTest(); // may fastjmp out of this function entirely
 			return {EEBlockExit::Continue, 0};
 		}
-		// Same block, no event due yet: loop back without a full TryExecute()
-		// re-entry.
 	}
 }
 
@@ -363,7 +367,7 @@ namespace
 		// Keep the interpreter's instruction-level debugger checks in development builds.
 		intCpu.Execute();
 #else
-		intExecuteWithBackend(&Arm64EE::TryExecute);
+		intExecuteWithBackend(&Arm64EE::ExecuteChained);
 #endif
 	}
 	void ClearProvider(u32, u32)

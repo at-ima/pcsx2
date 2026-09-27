@@ -645,7 +645,7 @@ TEST_F(EERecompilerTest, ConditionalBranchesPreserveDelayAndEventBoundaries)
 // needs proper testing across a wider range of games.
 TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 {
-	for (u32 initial_t0 : {1u, 2u, 5u, 5000u}) // 5000 exercises kMaxSelfLoopIterations (4096)
+	for (u32 initial_t0 : {1u, 2u, 5u, 5000u}) // 5000 exercises kMaxChainedBlocks (4096)
 	{
 		SCOPED_TRACE(testing::Message() << "initial_t0=" << initial_t0);
 		Init(0);
@@ -697,14 +697,14 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 		}
 		const cpuRegisters expected = cpuRegs;
 
-		// Native, driven exactly like intExecuteWithBackend drives TryExecute().
+		// Native, driven exactly like intExecuteWithBackend drives the provider.
 		cpuRegs = initial;
 		u32 native_cycles = 0;
 		EEBlockResult result;
 		u32 outer_calls = 0;
 		do
 		{
-			result = Arm64EE::TryExecute(native_cycles);
+			result = Arm64EE::ExecuteChained(native_cycles);
 			ASSERT_TRUE(result);
 			if (result.exit == EEBlockExit::TakenBranch)
 			{
@@ -713,7 +713,7 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 				cpuRegs.branch = 0;
 			}
 			ASSERT_LT(++outer_calls, 10u);
-		} while (result.exit == EEBlockExit::TakenBranch && result.target == Base);
+		} while (result.exit == EEBlockExit::TakenBranch || result.exit == EEBlockExit::Continue);
 
 		EXPECT_EQ(native_cycles, expected_cycles);
 		// cpuRegs.cycle itself isn't compared: intUpdateCPUCycles() (Interpreter.cpp)
@@ -729,6 +729,64 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 		EXPECT_EQ(std::memcmp(&actual_no_cycle, &expected_no_cycle, sizeof(cpuRegisters)), 0);
 		if (HasFailure())
 			return;
+	}
+}
+
+// ExecuteChained runs blocks back to back, doing the driver's branch commit
+// itself. Two blocks that jump to each other must end exactly where running
+// one block per TryExecute() call with that commit in between ends.
+TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
+{
+	for (u32 initial_t0 : {1u, 3u, 3000u}) // 3000 round trips cross kMaxChainedBlocks
+	{
+		SCOPED_TRACE(testing::Message() << "initial_t0=" << initial_t0);
+		Init(0);
+		program[0] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // ADDIU $1, $1, -1
+		program[1] = (2u << 26) | ((Base + 32) >> 2); // J Base+32
+		program[2] = (9u << 26) | (2 << 21) | (2 << 16) | 1u; // delay: ADDIU $2, $2, 1
+		program[8] = (9u << 26) | (3 << 21) | (3 << 16) | 2u; // ADDIU $3, $3, 2
+		program[9] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfff6u; // BNE $1, $0, Base
+		program[10] = (9u << 26) | (4 << 21) | (4 << 16) | 1u; // delay: ADDIU $4, $4, 1
+		cpuRegs.GPR.r[1].UD[0] = initial_t0;
+		// Keep the event deadline away, as in SelfLoopingBranchMatchesManualReplay.
+		cpuRegs.nextEventCycle = u64(1) << 40;
+		const cpuRegisters initial = cpuRegs;
+
+		auto run = [&](bool chained, u32& cycles) {
+			cpuRegs = initial;
+			cycles = 0;
+			EEBlockResult result;
+			u32 calls = 0;
+			do
+			{
+				result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
+				ASSERT_TRUE(result);
+				if (result.exit == EEBlockExit::TakenBranch)
+				{
+					cpuRegs.branch = 1;
+					cpuRegs.pc = result.target;
+					cpuRegs.branch = 0;
+				}
+				ASSERT_LT(++calls, 10000u);
+			} while (result.exit == EEBlockExit::TakenBranch || result.exit == EEBlockExit::Continue);
+			if (!chained)
+				ASSERT_GT(calls, 2 * initial_t0 - 1);
+		};
+		u32 stepped_cycles, chained_cycles;
+		run(false, stepped_cycles);
+		if (HasFatalFailure())
+			return;
+		cpuRegisters stepped = cpuRegs;
+		run(true, chained_cycles);
+		if (HasFatalFailure())
+			return;
+		EXPECT_EQ(chained_cycles, stepped_cycles);
+		EXPECT_EQ(cpuRegs.GPR.r[3].UL[0], initial.GPR.r[3].UL[0] + 2 * initial_t0); // ran every round trip
+		// cpuRegs.cycle is advanced by intUpdateCPUCycles() only on the chained
+		// path; see SelfLoopingBranchMatchesManualReplay.
+		cpuRegisters chained_no_cycle = cpuRegs;
+		stepped.cycle = chained_no_cycle.cycle = 0;
+		EXPECT_EQ(std::memcmp(&chained_no_cycle, &stepped, sizeof(cpuRegisters)), 0);
 	}
 }
 

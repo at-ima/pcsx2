@@ -12,7 +12,11 @@ namespace Arm64EE
 {
 	// Block compiler entry point, also used by differential tests. The CPU provider
 	// owns selection/lifetime; the shared execution driver owns fallback and events.
+	// Runs exactly one block.
 	EEBlockResult TryExecute(u32& block_cycles);
+	// What the provider registers with the driver: runs blocks back to back,
+	// doing the driver's branch and event bookkeeping itself.
+	EEBlockResult ExecuteChained(u32& block_cycles);
 	void Reset();
 	void Shutdown();
 	size_t GetCommittedCache();
