@@ -5,6 +5,7 @@
 #include "arm64/EECodeGenerator.h"
 #include "R5900OpcodeTables.h"
 #include "vtlb.h"
+#include "common/HostSys.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
 
 #include <algorithm>
@@ -746,6 +747,130 @@ namespace
 		}
 	}
 
+	// Set by Compile() for the block being emitted.
+	struct ExitInfo
+	{
+		bool linkable = false;
+		std::span<const u32> cycles;
+		u8* buffer = nullptr;
+	} s_exit;
+
+	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
+	// same CP0.Config bit TryExecute uses) into w11, with x13 = block_cycles
+	// and x12 = &g_link_state. Branches to `off` when chaining is off.
+	// Clobbers x9-x13 only, so x0 and a taken branch's x15 survive.
+	void EmitAddCycles(MacroAssembler& a, u32 completed, Label* off)
+	{
+		using namespace Arm64EE::CodeGenerator;
+		a.Mov(x12, reinterpret_cast<uintptr_t>(&g_link_state));
+		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, chaining)));
+		a.Cbz(w9, off);
+		a.Ldr(x13, MemOperand(x12, offsetof(LinkState, block_cycles)));
+		a.Ldr(w10, MemOperand(x0, offsetof(cpuRegisters, CP0) + 16 * sizeof(u32))); // Config
+		a.Ubfx(w10, w10, 18, 1);
+		a.Mov(w11, 2);
+		a.Sub(w10, w11, w10);
+		a.Mov(w11, s_exit.cycles[completed]);
+		a.Mul(w10, w10, w11);
+		a.Ldr(w11, MemOperand(x13));
+		a.Add(w11, w11, w10);
+	}
+
+	// A returning exit: w0 = value, plus x15 (already shifted) as the target
+	// when `with_target`. While chaining, a linkable block also adds its own
+	// cycles and says so, since the caller may have entered a different block.
+	void EmitReturn(MacroAssembler& a, u32 completed, u32 value, bool with_target)
+	{
+		using namespace Arm64EE::CodeGenerator;
+		if (s_exit.linkable && completed)
+		{
+			Label off, done;
+			EmitAddCycles(a, completed, &off);
+			a.Str(w11, MemOperand(x13));
+			a.Mov(x16, CyclesCommitted);
+			a.B(&done);
+			a.Bind(&off);
+			a.Mov(x16, 0);
+			a.Bind(&done);
+			a.Mov(w0, value);
+			a.Orr(x0, x0, x16);
+		}
+		else
+		{
+			a.Mov(w0, value);
+		}
+		if (with_target)
+			a.Orr(x0, x0, x15);
+		a.Ret();
+	}
+
+	enum class LinkKind
+	{
+		Taken, // the driver's intFinishBranch + intUpdateCPUCycles + deadline check
+		EventTest, // deadline check only
+		Continue, // nothing
+	};
+
+	// The chaining path of an exit whose next pc is known at compile time. pc
+	// and code must already describe the completed prefix. Jumps to `classic`
+	// when chaining is off; otherwise does the driver's work for this exit and
+	// either jumps to the linked block or returns to C++.
+	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, Label* classic)
+	{
+		using namespace Arm64EE::CodeGenerator;
+		Label request, due, literal;
+		EmitAddCycles(a, completed, classic);
+		if (kind == LinkKind::Taken)
+		{
+			a.Mov(w9, next);
+			a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
+			// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
+			// cycle += max(block_cycles >> 3, 1); block_cycles &= 7.
+			a.Lsr(w10, w11, 3);
+			a.Cmp(w10, 1);
+			a.Csinc(w10, w10, wzr, hs);
+			a.And(w11, w11, 7);
+			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+			a.Add(x9, x9, x10);
+			a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+		}
+		a.Str(w11, MemOperand(x13));
+		if (kind != LinkKind::Continue)
+		{
+			// EEBranchEventDue(): signed 64-bit distance to the deadline.
+			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
+			a.Sub(x9, x9, x10);
+			a.Tbz(x9, 63, &due);
+		}
+		// A link is only valid in the generation it was made in: any drop of
+		// compiled blocks bumps it, including one from a write fault taken
+		// inside the block that is running now.
+		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, generation)));
+		a.Adr(x10, &literal);
+		a.Ldr(w10, MemOperand(x10));
+		a.Cmp(w9, w10);
+		a.B(ne, &request);
+		u64 slot;
+		{
+			vixl::ExactAssemblyScope scope(&a, 2 * kInstructionSize);
+			slot = reinterpret_cast<uintptr_t>(s_exit.buffer + a.GetCursorOffset()) -
+			       reinterpret_cast<uintptr_t>(SysMemory::GetEERec());
+			a.b(&request); // PatchLink() retargets this to the next block
+			a.bind(&literal);
+			a.dc32(0); // generation of the link; 0 is never current
+		}
+		a.Bind(&request);
+		a.Mov(x0, (slot << 32) | LinkRequest | CyclesCommitted);
+		a.Ret();
+		if (kind != LinkKind::Continue)
+		{
+			a.Bind(&due);
+			a.Mov(x0, EventDue | CyclesCommitted);
+			a.Ret();
+		}
+	}
+
 	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding)
 	{
 		using namespace Arm64EE::CodeGenerator;
@@ -799,18 +924,31 @@ namespace
 		}
 		Emit(a, delay);
 		EmitPosition(a, pc + 8, delay);
+		// JR/JALR targets are only known at run time; those still return.
+		if (s_exit.linkable && op != 0)
+		{
+			const u32 target = (op == 2 || op == 3) ? (((pc + 4) & 0xf0000000u) | ((code & 0x03ffffffu) << 2)) :
+			                                          pc + 4 + static_cast<int16_t>(code) * 4;
+			Label classic;
+			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, &classic);
+			a.Bind(&classic);
+		}
 		a.Lsl(x15, x15, 32);
-		a.Mov(w0, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch));
-		a.Orr(x0, x0, x15);
-		a.Ret();
+		EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
 		if (conditional)
 		{
 			a.Bind(&untaken);
 			EmitPosition(a, pc + (likely ? 8 : 4), code);
 			// BEQ/BNE and annulled likely branches test events without committing
 			// cycles. Other untaken branches simply continue at the delay slot.
-			a.Mov(w0, (preceding + 1) | EncodeExit((likely || op == 4 || op == 5) ? EEBlockExit::EventTest : EEBlockExit::Continue));
-			a.Ret();
+			const bool event_test = likely || op == 4 || op == 5;
+			if (s_exit.linkable)
+			{
+				Label classic;
+				EmitLinkedExit(a, event_test ? LinkKind::EventTest : LinkKind::Continue, preceding + 1, pc + (likely ? 8 : 4), &classic);
+				a.Bind(&classic);
+			}
+			EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
 		}
 	}
 
@@ -962,9 +1100,25 @@ bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 code)
 	return SupportsInteger(code);
 }
 
-size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words)
+Arm64EE::CodeGenerator::LinkState Arm64EE::CodeGenerator::g_link_state;
+
+void Arm64EE::CodeGenerator::PatchLink(u8* slot, const void* target, u32 generation)
+{
+	// The code buffer is 64 MiB, well inside B's +-128 MiB range.
+	const s64 delta = reinterpret_cast<const u8*>(target) - slot;
+	const u32 b = 0x14000000u | (static_cast<u32>(delta >> 2) & 0x03ffffffu);
+	HostSys::BeginCodeWrite();
+	std::memcpy(slot + 4, &generation, sizeof(generation));
+	std::memcpy(slot, &b, sizeof(b));
+	HostSys::EndCodeWrite();
+	HostSys::FlushInstructionCache(slot, 8);
+}
+
+size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
+	std::span<const u32> cycles, bool linkable)
 {
 	MacroAssembler a(buffer, capacity);
+	s_exit = {linkable, cycles, buffer};
 	std::array<Label, MaxInstructions + 1> exits;
 	if (std::any_of(words.begin(), words.end(), [](u32 code) { return MemorySize(code) != 0; }))
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
@@ -993,8 +1147,15 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		{
 			EmitPosition(a, pc + completed * 4, words[completed - 1]);
 		}
-		a.Mov(w0, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled));
-		a.Ret();
+		// The end of the block falls through to the next pc. Earlier exits stop
+		// before an access the interpreter has to perform, so they still return.
+		if (linkable && completed && completed == words.size())
+		{
+			Label classic;
+			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, &classic);
+			a.Bind(&classic);
+		}
+		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)
 			break;
 	}

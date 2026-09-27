@@ -105,6 +105,8 @@ namespace
 	void ClearBlockTable()
 	{
 		s_block_table_generation++;
+		// Invalidates every native link made so far (see LinkState).
+		Arm64EE::CodeGenerator::g_link_state.generation = s_block_table_generation;
 		s_block_table_count = 0;
 		std::deque<Block>{}.swap(s_block_storage);
 	}
@@ -122,6 +124,9 @@ namespace
 	u8* s_write = nullptr;
 	u8* s_write_limit = nullptr;
 	bool s_goemon_tlb_hack = false;
+	// Native links inline intUpdateCPUCycles() for the default cycle rate only.
+	s8 s_cycle_rate = 0;
+	bool Linkable() { return s_cycle_rate == 0; }
 	// 1-entry "most recently dispatched" cache, checked before s_lookup. A
 	// branch that loops back to its own containing block's entry pc (a very
 	// common delay/poll-loop shape) makes intExecuteWithBackend call
@@ -198,7 +203,8 @@ namespace
 		block.trusted = tracked && page_type != ProtMode_Manual;
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
-			pc, source, std::span(block.words.data(), block.word_count));
+			pc, source, std::span(block.words.data(), block.word_count),
+			std::span(block.cycles.data(), block.word_count + 1), Linkable());
 		HostSys::EndCodeWrite();
 		HostSys::FlushInstructionCache(s_write, static_cast<u32>(size));
 		block.function = reinterpret_cast<Block::Function>(s_write);
@@ -218,6 +224,7 @@ __noinline void Arm64EE::Reset()
 	// out of the per-block memory-manager call path.
 	s_write_limit = SysMemory::GetEERecEnd() - 16 * 1024;
 	s_goemon_tlb_hack = EmuConfig.Gamefixes.GoemonTlbHack;
+	s_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 }
 
 void Arm64EE::Shutdown()
@@ -230,102 +237,172 @@ void Arm64EE::Shutdown()
 	s_write_limit = nullptr;
 }
 
-EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
+namespace
 {
-	using namespace vtlb_private;
-	const u32 pc = cpuRegs.pc;
-	if (!CHECK_EEREC || cpuRegs.branch || (pc & 3))
-		return {};
-	const auto mapping = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
-	// Never prefetch through MMIO or unmapped memory: the interpreter must
-	// perform that read with its original exception PC and handler semantics.
-	if (mapping.isHandler(pc))
-		return {};
-	const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
-	if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_write > s_write_limit)
-		Reset();
-	// Checked before s_lookup: see the comment on its declaration. Reset() /
-	// ClearProvider() invalidate it alongside s_lookup and the block table.
-	// s_lookup is only touched on a miss here; it is large enough that reading
-	// it unconditionally cost a cache miss on most dispatches.
-	const Block* block = s_last_dispatch_pc == pc ? s_last_dispatch_block : nullptr;
-	LookupEntry* lookup = nullptr;
-	// Mix page and instruction bits to avoid concentrating same-offset blocks
-	// in one slot. The full PC tag keeps virtual aliases distinct.
-	const auto get_lookup = [pc]() { return &s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)]; };
-	if (!block)
+	// Finds (compiling if needed) and validates the block at cpuRegs.pc, or
+	// returns nullptr when the interpreter has to run the next instruction.
+	const Block* LookupBlock()
 	{
-		lookup = get_lookup();
-		block = lookup->pc == pc ? lookup->block : nullptr;
+		using namespace vtlb_private;
+		const u32 pc = cpuRegs.pc;
+		if (!CHECK_EEREC || cpuRegs.branch || (pc & 3))
+			return nullptr;
+		const auto mapping = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+		// Never prefetch through MMIO or unmapped memory: the interpreter must
+		// perform that read with its original exception PC and handler semantics.
+		if (mapping.isHandler(pc))
+			return nullptr;
+		const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
+		if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_cycle_rate != EmuConfig.Speedhacks.EECycleRate ||
+			s_write > s_write_limit)
+			Arm64EE::Reset();
+		// Checked before s_lookup: see the comment on its declaration. Reset() /
+		// ClearProvider() invalidate it alongside s_lookup and the block table.
+		// s_lookup is only touched on a miss here; it is large enough that reading
+		// it unconditionally cost a cache miss on most dispatches.
+		const Block* block = s_last_dispatch_pc == pc ? s_last_dispatch_block : nullptr;
+		LookupEntry* lookup = nullptr;
+		// Mix page and instruction bits to avoid concentrating same-offset blocks
+		// in one slot. The full PC tag keeps virtual aliases distinct.
+		const auto get_lookup = [pc]() { return &s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)]; };
 		if (!block)
 		{
-			// Only opcode-level rejection is cached here. Branch/delay rejection
-			// still uses a Block and validates both instruction words below.
-			if (lookup->pc == pc && lookup->rejected_source == source && lookup->rejected_word == source[0])
-				return {};
-			block = FindBlock(pc);
+			lookup = get_lookup();
+			block = lookup->pc == pc ? lookup->block : nullptr;
+			if (!block)
+			{
+				// Only opcode-level rejection is cached here. Branch/delay rejection
+				// still uses a Block and validates both instruction words below.
+				if (lookup->pc == pc && lookup->rejected_source == source && lookup->rejected_word == source[0])
+					return nullptr;
+				block = FindBlock(pc);
+				*lookup = {pc, 0, block, nullptr};
+			}
+		}
+		// Trusted blocks need no per-entry recheck (see Block::trusted). Others --
+		// compiled on a page that already faulted (ProtMode_Manual), or whose
+		// physical mapping does not match source -- compare every entry.
+		if (!block || block->source != source ||
+			(!block->trusted && std::memcmp(source, block->words.data(), block->word_count * 4) != 0))
+		{
+			if (!lookup)
+				lookup = get_lookup();
+			// Validated cache hits need no opcode decoding. Avoid allocating entries
+			// for unsupported entry instructions on the interpreter fallback path.
+			if (!Arm64EE::CodeGenerator::Supports(source[0]))
+			{
+				*lookup = {pc, source[0], nullptr, source};
+				return nullptr;
+			}
+			// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
+			// separate *physical* (pmap) mapping, not the vmap lookup that produced
+			// source above; they normally agree for real PS2 RAM, but nothing
+			// guarantees it (e.g. a vmap override onto host memory pmap knows nothing
+			// about -- exactly what the recompiler unit tests do to inject synthetic
+			// code buffers). Only use write-protection tracking when the two
+			// mappings actually resolve to the same byte.
+			const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
+			const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
+			block = &Compile(pc, source, page_type, tracked);
 			*lookup = {pc, 0, block, nullptr};
 		}
+		if (!block->function)
+			return nullptr;
+		s_last_dispatch_pc = pc;
+		s_last_dispatch_block = block;
+		return block;
 	}
-	// Trusted blocks need no per-entry recheck (see Block::trusted). Others --
-	// compiled on a page that already faulted (ProtMode_Manual), or whose
-	// physical mapping does not match source -- compare every entry.
-	if (!block || block->source != source ||
-		(!block->trusted && std::memcmp(source, block->words.data(), block->word_count * 4) != 0))
+
+	// Runs one block (or, while chaining, a run of linked ones) and adds the
+	// cycles the generated code did not already add.
+	u64 RunBlock(const Block* block, u32& block_cycles)
 	{
-		if (!lookup)
-			lookup = get_lookup();
-		// Validated cache hits need no opcode decoding. Avoid allocating entries
-		// for unsupported entry instructions on the interpreter fallback path.
-		if (!CodeGenerator::Supports(source[0]))
+		const u64 result = block->function(&cpuRegs);
+		if (!(result & Arm64EE::CodeGenerator::CyclesCommitted))
 		{
-			*lookup = {pc, source[0], nullptr, source};
-			return {};
+			const u32 completed = static_cast<u32>(result) & Arm64EE::CodeGenerator::CompletedMask;
+			block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
 		}
-		// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
-		// separate *physical* (pmap) mapping, not the vmap lookup that produced
-		// source above; they normally agree for real PS2 RAM, but nothing
-		// guarantees it (e.g. a vmap override onto host memory pmap knows nothing
-		// about -- exactly what the recompiler unit tests do to inject synthetic
-		// code buffers). Only use write-protection tracking when the two
-		// mappings actually resolve to the same byte.
-		const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
-		const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
-		block = &Compile(pc, source, page_type, tracked);
-		*lookup = {pc, 0, block, nullptr};
+		return result;
 	}
-	if (!block->function)
-		return {};
-	s_last_dispatch_pc = pc;
-	s_last_dispatch_block = block;
-	const u64 result = block->function(&cpuRegs);
-	const u32 completed = static_cast<u32>(result) & CodeGenerator::CompletedMask;
-	block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
-	return {static_cast<EEBlockExit>((result >> CodeGenerator::ExitShift) & CodeGenerator::ExitMask),
-		static_cast<u32>(result >> 32)};
+
+	EEBlockResult DecodeResult(u64 result)
+	{
+		using namespace Arm64EE::CodeGenerator;
+		return {static_cast<EEBlockExit>((result >> ExitShift) & ExitMask), static_cast<u32>(result >> 32)};
+	}
+} // namespace
+
+EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
+{
+	CodeGenerator::g_link_state.chaining = 0;
+	const Block* block = LookupBlock();
+	return block ? DecodeResult(RunBlock(block, block_cycles)) : EEBlockResult{};
 }
 
 EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 {
 	// Keeps running blocks here instead of returning to intExecuteWithBackend
-	// after each one. Returning cost a full round trip per block -- the
-	// driver's switch, an indirect call back into TryExecute and its
-	// prologue -- which sampled at a large share of the EE thread in
-	// Burnout 3, where most blocks are a few instructions ending in a branch.
-	// A Continue exit needs nothing from the driver. A taken branch needs
-	// intFinishBranch's pc commit, the cycle commit and the event-deadline
-	// check, done below exactly as the driver does them. Anything else goes
-	// back to the driver. The cap bounds how long a pending exit request can
-	// wait, since exit_requested is not visible here.
+	// after each one, and lets linkable blocks jump straight to each other
+	// (see CodeGenerator::LinkState). In Burnout 3 most blocks are about three
+	// instructions ending in a branch, and a C++ round trip per block took
+	// about a third of the EE thread.
+	// A Continue exit needs nothing from the driver, and an EventTest exit only
+	// the event-deadline check. A taken branch needs intFinishBranch's pc
+	// commit, the cycle commit and the event-deadline check, done below (or by
+	// the generated code) exactly as the driver does them. Anything else goes
+	// back to the driver. Native links only return at an event deadline, so a
+	// pending exit request waits for the next event, as with the x86 recompiler.
 	// needs proper testing across a wider range of games.
+	using namespace CodeGenerator;
+	g_link_state.chaining = 1;
+	g_link_state.block_cycles = &block_cycles;
 	constexpr u32 kMaxChainedBlocks = 4096;
+	u8* pending_slot = nullptr;
+	u32 pending_generation = 0;
 	for (u32 blocks = 1;; blocks++)
 	{
-		const EEBlockResult result = TryExecute(block_cycles);
+		const Block* block = LookupBlock();
+		if (!block)
+			return {};
+		// Link the exit that asked for it, unless blocks were dropped since (a
+		// write fault in the block, or a Reset() while looking this one up,
+		// which also rewinds the code buffer the slot lives in).
+		if (pending_slot && pending_generation == g_link_state.generation && block->trusted)
+			PatchLink(pending_slot, reinterpret_cast<const void*>(block->function), pending_generation);
+		pending_slot = nullptr;
+		const u32 generation = g_link_state.generation;
+		const u64 raw = RunBlock(block, block_cycles);
+		if (raw & LinkRequest)
+		{
+			pending_slot = SysMemory::GetEERec() + (raw >> 32);
+			pending_generation = generation;
+			if (blocks >= kMaxChainedBlocks)
+				return {EEBlockExit::Continue, 0};
+			continue;
+		}
+		if (raw & EventDue)
+		{
+			// pc/cycles are already committed, so returning TakenBranch would make
+			// the driver commit them a second time.
+			intEventTest(); // may fastjmp out of this function entirely
+			return {EEBlockExit::Continue, 0};
+		}
+		const EEBlockResult result = DecodeResult(raw);
 		if (blocks >= kMaxChainedBlocks)
 			return result;
 		if (result.exit == EEBlockExit::Continue)
 			continue;
+		if (result.exit == EEBlockExit::EventTest)
+		{
+			// The driver's intBranchEventTest(): no cycle commit, only the deadline.
+			if (EEBranchEventDue(/*backend_active=*/true, /*exit_requested=*/false, cpuRegs.cycle, cpuRegs.nextEventCycle))
+			{
+				intEventTest(); // may fastjmp out of this function entirely
+				return {EEBlockExit::Continue, 0};
+			}
+			continue;
+		}
 		if (result.exit != EEBlockExit::TakenBranch)
 			return result;
 		// Replicates intFinishBranch()'s effect on this (non-interpreter-
@@ -336,13 +413,18 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 		cpuRegs.branch = 1;
 		cpuRegs.pc = result.target;
 		cpuRegs.branch = 0;
-		intUpdateCPUCycles();
+		if (Linkable())
+		{
+			// intUpdateCPUCycles() at the default cycle rate, applied to the
+			// counter this call was given -- the same one in production -- so it
+			// matches what linked exits do.
+			cpuRegs.cycle += std::max(block_cycles >> 3, 1u);
+			block_cycles &= 7;
+		}
+		else
+			intUpdateCPUCycles();
 		if (EEBranchEventDue(/*backend_active=*/true, /*exit_requested=*/false, cpuRegs.cycle, cpuRegs.nextEventCycle))
 		{
-			// pc/cycles are already committed above, so returning TakenBranch
-			// would make the driver commit them a second time
-			// (intUpdateCPUCycles() always adds at least 1 cycle). Run the
-			// event test here and report a plain Continue instead.
 			intEventTest(); // may fastjmp out of this function entirely
 			return {EEBlockExit::Continue, 0};
 		}

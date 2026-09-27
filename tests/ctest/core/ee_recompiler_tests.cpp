@@ -652,6 +652,7 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 		program[0] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // ADDIU $t0(r1), $t0, -1
 		program[1] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfffeu; // BNE $t0, $zero, Base (back to word 0)
 		program[2] = (9u << 26) | (2 << 21) | (2 << 16) | 1u;      // delay slot: ADDIU $t1(r2), $t1, 1
+		program[3] = Stop; // ExecuteChained runs on past the loop until an unsupported instruction
 		cpuRegs.GPR.r[1].UD[0] = initial_t0;
 		// Keep the event deadline far away so the internal loop never takes its
 		// intEventTest() exit: that path calls into counters/IOP/VMManager state
@@ -670,8 +671,14 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 
 		// Manual, one-instruction-at-a-time ground truth: every decrement but the
 		// last is taken (loops back to Base); the one that brings $t0 to 0 is not.
+		// Each taken branch also commits the driver's way (intUpdateCPUCycles() at
+		// the default cycle rate): cycle += max(acc >> 3, 1), acc &= 7.
 		cpuRegs = initial;
 		u32 expected_cycles = 0;
+		auto commit = [&expected_cycles]() {
+			cpuRegs.cycle += std::max(expected_cycles >> 3, 1u);
+			expected_cycles &= 7;
+		};
 		for (u32 t0 = initial_t0;;)
 		{
 			cpuRegs.code = program[0];
@@ -684,14 +691,17 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 				cpuRegs.code = program[2];
 				R5900::GetCurrentInstruction().interpret(); // delay slot
 				expected_cycles += delay_cycles * scale;
+				commit();
 			}
 			else
 			{
-				// Untaken: native's EmitPosition() (EECodeGenerator.cpp) leaves cpuRegs
-				// at the delay slot's address/code, without executing it -- whoever runs
-				// next (this test's own driver, or the real dispatcher) does that.
-				cpuRegs.pc = Base + 8;
-				cpuRegs.code = program[1];
+				// Untaken: the branch leaves the delay slot's word for the next
+				// block, which ExecuteChained runs as an ordinary instruction before
+				// stopping at the SYSCALL.
+				cpuRegs.code = program[2];
+				R5900::GetCurrentInstruction().interpret();
+				expected_cycles += delay_cycles * scale;
+				cpuRegs.pc = Base + 12;
 				break;
 			}
 		}
@@ -705,7 +715,6 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 		do
 		{
 			result = Arm64EE::ExecuteChained(native_cycles);
-			ASSERT_TRUE(result);
 			if (result.exit == EEBlockExit::TakenBranch)
 			{
 				cpuRegs.branch = 1;
@@ -713,20 +722,14 @@ TEST_F(EERecompilerTest, SelfLoopingBranchMatchesManualReplay)
 				cpuRegs.branch = 0;
 			}
 			ASSERT_LT(++outer_calls, 10u);
-		} while (result.exit == EEBlockExit::TakenBranch || result.exit == EEBlockExit::Continue);
+		} while (result);
 
+		// ExecuteChained commits cycles into the counter it was given (in
+		// production the driver's cpuBlockCycles), both in C++ and in linked
+		// native exits, so cpuRegs.cycle is comparable here too.
 		EXPECT_EQ(native_cycles, expected_cycles);
-		// cpuRegs.cycle itself isn't compared: intUpdateCPUCycles() (Interpreter.cpp)
-		// updates it from its own file-static cpuBlockCycles, not from the
-		// block_cycles reference TryExecute() was actually called with here -- only
-		// correct when the caller aliases the two, which only intExecuteWithBackend's
-		// real registration (intExecuteWithBackend(&Arm64EE::TryExecute), Interpreter.h)
-		// guarantees. native_cycles above (this call's own block_cycles accumulator)
-		// is the accounting this test can actually verify.
-		cpuRegisters actual_no_cycle = cpuRegs;
-		cpuRegisters expected_no_cycle = expected;
-		actual_no_cycle.cycle = expected_no_cycle.cycle = 0;
-		EXPECT_EQ(std::memcmp(&actual_no_cycle, &expected_no_cycle, sizeof(cpuRegisters)), 0);
+		EXPECT_EQ(cpuRegs.cycle, expected.cycle);
+		EXPECT_EQ(std::memcmp(&cpuRegs, &expected, sizeof(cpuRegisters)), 0);
 		if (HasFailure())
 			return;
 	}
@@ -747,6 +750,8 @@ TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
 		program[8] = (9u << 26) | (3 << 21) | (3 << 16) | 2u; // ADDIU $3, $3, 2
 		program[9] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfff6u; // BNE $1, $0, Base
 		program[10] = (9u << 26) | (4 << 21) | (4 << 16) | 1u; // delay: ADDIU $4, $4, 1
+		program[3] = Stop;
+		program[11] = Stop; // both runs end here, after the untaken BNE's next word
 		cpuRegs.GPR.r[1].UD[0] = initial_t0;
 		// Keep the event deadline away, as in SelfLoopingBranchMatchesManualReplay.
 		cpuRegs.nextEventCycle = u64(1) << 40;
@@ -760,15 +765,17 @@ TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
 			do
 			{
 				result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
-				ASSERT_TRUE(result);
 				if (result.exit == EEBlockExit::TakenBranch)
 				{
 					cpuRegs.branch = 1;
 					cpuRegs.pc = result.target;
 					cpuRegs.branch = 0;
+					// The driver's intUpdateCPUCycles() at the default cycle rate.
+					cpuRegs.cycle += std::max(cycles >> 3, 1u);
+					cycles &= 7;
 				}
 				ASSERT_LT(++calls, 10000u);
-			} while (result.exit == EEBlockExit::TakenBranch || result.exit == EEBlockExit::Continue);
+			} while (result);
 			if (!chained)
 				ASSERT_GT(calls, 2 * initial_t0 - 1);
 		};
@@ -782,11 +789,9 @@ TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
 			return;
 		EXPECT_EQ(chained_cycles, stepped_cycles);
 		EXPECT_EQ(cpuRegs.GPR.r[3].UL[0], initial.GPR.r[3].UL[0] + 2 * initial_t0); // ran every round trip
-		// cpuRegs.cycle is advanced by intUpdateCPUCycles() only on the chained
-		// path; see SelfLoopingBranchMatchesManualReplay.
-		cpuRegisters chained_no_cycle = cpuRegs;
-		stepped.cycle = chained_no_cycle.cycle = 0;
-		EXPECT_EQ(std::memcmp(&chained_no_cycle, &stepped, sizeof(cpuRegisters)), 0);
+		EXPECT_EQ(cpuRegs.pc, Base + 44); // stopped at the SYSCALL
+		EXPECT_EQ(cpuRegs.cycle, stepped.cycle);
+		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
 	}
 }
 

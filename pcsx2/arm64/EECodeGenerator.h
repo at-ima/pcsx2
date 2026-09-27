@@ -45,8 +45,33 @@ namespace Arm64EE::CodeGenerator
 	constexpr u32 ExitShift = 8;
 	constexpr u32 ExitMask = 3;
 	constexpr u32 EncodeExit(EEBlockExit exit) { return static_cast<u32>(exit) << ExitShift; }
+
+	// Block linking. While `chaining` is set (only by Arm64EE::ExecuteChained),
+	// every exit of a linkable block adds its own completed-prefix cycles to
+	// *block_cycles, and exits with a compile-time-known next pc (a static
+	// taken branch, an untaken branch, the end of the block) also do the
+	// driver's work for that exit themselves -- pc commit, cycle commit, event
+	// deadline -- and then jump straight to the next block through a patchable
+	// B, provided the generation recorded next to it is still current.
+	// Otherwise they return to C++ with the flags below.
+	struct LinkState
+	{
+		u32 chaining = 0;
+		u32 generation = 0; // bumped whenever compiled blocks are dropped
+		u32* block_cycles = nullptr;
+	};
+	extern LinkState g_link_state;
+	constexpr u64 CyclesCommitted = 1u << 10; // the exit already added its cycles
+	constexpr u64 EventDue = 1u << 11; // pc and cycles committed; the event deadline passed
+	constexpr u64 LinkRequest = 1u << 12; // pc and cycles committed; bits 32-63 = slot offset from the code base
+	// A link slot is a B instruction followed by the generation it was linked in.
+	void PatchLink(u8* slot, const void* target, u32 generation);
+
 	// Generated functions return the completed prefix and exit action. On an
 	// unsupported memory access they leave PC at that instruction for fallback.
 	// Stores overlapping this block's source exit immediately for revalidation.
-	size_t Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words);
+	// `cycles[n]` is the fixed-point cost of the first n instructions; a
+	// linkable block needs it to commit cycles itself while chaining.
+	size_t Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
+		std::span<const u32> cycles, bool linkable);
 } // namespace Arm64EE::CodeGenerator
