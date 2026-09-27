@@ -54,32 +54,86 @@ namespace
 		bool fdiv_pending = false;
 	};
 
+	// Pipeline state a block was entered with, captured by Execute() so that
+	// the retirement analysis can start from known producer ages instead of
+	// leaving the first seven pairs to the generic preparation. Most blocks
+	// are entered a few cycles after the previous one exited, with two or
+	// three FMAC results still in flight and often a divide.
+	struct IncomingFmac
+	{
+		u32 regupper = 0, reglower = 0, xyzwupper = 0, xyzwlower = 0;
+		bool flags = false; // writes the status or clip flag, which scheduling must not retire
+		u32 age = 0; // cycles since issue, 3 meaning ready before the first pair
+	};
+	// Packed, since Execute() captures and compares one on every dispatch:
+	// the entry count (3 bits) and the divide (6 bits), then 22 bits for each
+	// FMAC entry, oldest first, two in each word.
+	struct IncomingProfile
+	{
+		u64 words[2] = {};
+		bool operator==(const IncomingProfile&) const = default;
+		u32 Count() const { return words[0] & 7; }
+		// Pairs the incoming FDIV entry may still be pending; 0 if none.
+		u32 Fdiv() const { return (words[0] >> 3) & 63; }
+		static u32 Shift(u32 k) { return k < 2 ? 9 + 22 * k : 22 * (k - 2); }
+		void Set(u32 count, u32 fdiv) { words[0] |= count | (fdiv << 3); }
+		void SetFmac(u32 k, const IncomingFmac& e)
+		{
+			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) | (e.xyzwlower << 17);
+			words[k / 2] |= bits << Shift(k);
+		}
+		IncomingFmac Fmac(u32 k) const
+		{
+			const u64 bits = words[k / 2] >> Shift(k);
+			IncomingFmac e;
+			e.age = bits & 3;
+			e.flags = (bits >> 2) & 1;
+			e.regupper = (bits >> 3) & 31;
+			e.reglower = (bits >> 8) & 31;
+			e.xyzwupper = (bits >> 13) & 15;
+			e.xyzwlower = (bits >> 17) & 15;
+			return e;
+		}
+	};
+
 	struct Block
 	{
 		using Function = void (*)(u64 start, u64 cycles, u32 packet_pending);
-		std::array<Instruction, MaxInstructions> instructions{};
-		std::array<RetirementSchedule, MaxInstructions> schedule{};
-		std::array<u32, MaxInstructions * 2> words{};
+		// What Execute() reads to choose a variant comes first; the arrays
+		// below are tens of kilobytes.
+		Function function = nullptr;
+		u32 count = 0;
+		bool has_branches = false;
+		bool loops_to_entry = false;
+		// Compiled for exactly this incoming state; Execute() only enters it
+		// when the state matches. Never set on a block that loops to its entry,
+		// since the loop edge arrives with a different state.
+		bool profiled = false;
+		IncomingProfile incoming;
 		struct SourceRange
 		{
 			u32 pc, first, count;
 		};
 		std::vector<SourceRange> ranges;
+		std::array<Instruction, MaxInstructions> instructions{};
+		std::array<RetirementSchedule, MaxInstructions> schedule{};
+		std::array<u32, MaxInstructions * 2> words{};
 		std::array<u32, MaxInstructions> next_pc{};
 		std::array<bool, MaxInstructions> delay{};
-		bool has_branches = false;
-		bool loops_to_entry = false;
-		u32 count = 0;
 		VectorCache cache;
-		Function function = nullptr;
 	};
 
 	// Games often upload several microprograms to the same micro memory in turn
 	// (Burnout 3 swaps them within every frame). One block per entry PC made each
 	// swap back fail source validation and recompile, which took most of the VU1
 	// thread's time. Keep a few variants per PC, most recently used first.
-	constexpr size_t MaxVariants = 8;
+	// Profiled blocks add variants for the incoming states an entry PC sees,
+	// usually one or two per program. Stop profiling a PC that keeps asking
+	// for new ones rather than recompiling it indefinitely.
+	constexpr size_t MaxVariants = 16;
+	constexpr u8 MaxProfiledCompiles = 24;
 	std::array<std::vector<std::unique_ptr<Block>>, VU1_PROGSIZE / 8> s_blocks;
+	std::array<u8, VU1_PROGSIZE / 8> s_profiled_compiles;
 	u8* s_base = nullptr;
 	u8* s_write = nullptr;
 	u8* s_end = nullptr;
@@ -102,6 +156,7 @@ namespace
 	{
 		for (auto& variants : s_blocks)
 			variants.clear();
+		s_profiled_compiles.fill(0);
 		s_write = s_base;
 		s_pipeline = {};
 		s_options = Options();
@@ -1736,7 +1791,18 @@ namespace
 		// still depends on incoming timing. Every pair advances at least one cycle.
 		std::array<int, MaxInstructions> ages{};
 		ages.fill(-1);
-		u32 integer_ready = 0, fdiv_ready = 0, efu_ready = 0;
+		// A profiled block also knows the FMAC entries it was entered with. They
+		// are older than every producer in the block, oldest first like the queue.
+		const u32 phantoms = block.profiled ? block.incoming.Count() : 0;
+		std::array<IncomingFmac, 4> incoming;
+		std::array<int, 4> phantom_ages{};
+		for (u32 k = 0; k < phantoms; k++)
+		{
+			incoming[k] = block.incoming.Fmac(k);
+			phantom_ages[k] = incoming[k].age;
+		}
+		u32 integer_ready = 0, efu_ready = 0;
+		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
 		for (u32 i = 0; i < block.count; i++)
 		{
 			const auto& ins = block.instructions[i];
@@ -1752,6 +1818,37 @@ namespace
 			// cases that stall on something other than the FMAC pipe.
 			if (!ins.readsVF)
 				cycles = 1;
+			else if (block.profiled && i < 3)
+			{
+				// The newest conflicting producer decides the stall: every FMAC result
+				// has the same latency, so older ones are ready no later. From the
+				// fourth pair on the incoming entries are ready anyway and the
+				// in-block dependency below applies unchanged.
+				int age = 4;
+				bool found = false;
+				for (u32 j = i; j-- > 0;)
+				{
+					const auto& producer = block.instructions[j];
+					if ((producer.uregs.pipe == VUPIPE_FMAC && (ins.readMasks[producer.uregs.VFwrite] & producer.uregs.VFwxyzw)) ||
+						(producer.lregs.pipe == VUPIPE_FMAC && (ins.readMasks[producer.lregs.VFwrite] & producer.lregs.VFwxyzw)))
+					{
+						age = ages[j];
+						found = true;
+						break;
+					}
+				}
+				for (u32 k = phantoms; !found && k-- > 0;)
+				{
+					const auto& entry = incoming[k];
+					if ((ins.readMasks[entry.regupper] & entry.xyzwupper) || (ins.readMasks[entry.reglower] & entry.xyzwlower))
+					{
+						age = phantom_ages[k];
+						found = true;
+					}
+				}
+				if (age >= 0)
+					cycles = std::max(1, 4 - age);
+			}
 			else if (i >= 3)
 			{
 				if (ins.dependency == 0)
@@ -1773,8 +1870,14 @@ namespace
 			}
 			// VI waits and kick/transfer callbacks can change timing. Forget exact
 			// producer ages until enough new pairs establish a known schedule.
-			if ((ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread) ||
-				ins.lregs.pipe == VUPIPE_XGKICK || (i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
+			// An integer branch waits only for ILW/ILWR results in the IALU pipe.
+			// A profiled block was entered with that pipe empty, so once its own
+			// loads have matured the branch advances like any other pair (it
+			// still takes the branch preparation, which does the same wait).
+			const bool integer_wait = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread &&
+			                          !(block.profiled && i >= integer_ready);
+			if (integer_wait || ins.lregs.pipe == VUPIPE_XGKICK ||
+				(i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
 			// Touching Q or P while an entry issued earlier is still in the FDIV/EFU
 			// pipe stalls the pair until that entry retires (_vuTestFDIVStalls), so
@@ -1793,20 +1896,37 @@ namespace
 			// Divides are frequent enough in transform code that excluding their whole
 			// latency from scheduling costs far more than retiring the pipe's single
 			// slot inline: those pairs carry fdiv_pending instead and do it themselves
-			// (see EmitScheduledPrepare). Deferred regions still cannot cover them,
-			// since they hold the status flag in a host register.
+			// (see EmitScheduledPrepare and EmitDeferredRegion).
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
 				fdiv_ready = i + ins.lregs.cycles + 1;
 			// The EFU pipe's single slot (ESADD..EEXP, retiring into P) is rare enough
 			// that it keeps the simpler treatment: stay generic for its full latency.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
 				efu_ready = i + ins.lregs.cycles + 1;
-			if (i >= 7 && cycles > 0 && i >= integer_ready && i >= efu_ready &&
+			// Without a profile the first seven pairs stay generic: three whose
+			// stalls depend on the unknown incoming entries, then four for the
+			// ages of their producers to become known.
+			if ((block.profiled || i >= 7) && cycles > 0 && i >= integer_ready && i >= efu_ready &&
 				!(ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread))
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
-				for (u32 j = i - 4; j < i; j++)
+				for (u32 k = 0; k < phantoms && plan.cycles; k++)
+				{
+					if (phantom_ages[k] < 0)
+						plan.cycles = 0;
+					else if (phantom_ages[k] >= 4)
+						continue;
+					else if (phantom_ages[k] + cycles < 4)
+						plan.remaining++;
+					else
+					{
+						if (incoming[k].flags)
+							plan.cycles = 0;
+						plan.retired++;
+					}
+				}
+				for (u32 j = i >= 4 ? i - 4 : 0; j < i; j++)
 				{
 					const auto& producer = block.instructions[j];
 					if (!HasFmac(producer))
@@ -1839,6 +1959,16 @@ namespace
 					(ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))))
 					plan.cycles = 0;
 				block.schedule[i] = plan;
+			}
+			for (u32 k = 0; k < phantoms; k++)
+			{
+				int& age = phantom_ages[k];
+				if (cycles > 0 && age >= 0)
+					age = std::min(4, age + cycles);
+				else if (static_cast<int>(incoming[k].age + i) + std::max(1, cycles) >= 4 || (age >= 0 && age + std::max(1, cycles) >= 4))
+					age = 4;
+				else
+					age = -1;
 			}
 			for (u32 j = 0; j < i; j++)
 			{
@@ -1939,6 +2069,35 @@ namespace
 		a.Strb(w9, Field(offsetof(VURegs, VIBackupCycles)));
 	}
 
+	// Retire the FDIV slot at cycle x26 if it is due. Cheap when nothing is
+	// due, which is the common case even inside a divide's latency. `status`
+	// holds the status flag; it is loaded and stored around the merge unless
+	// the caller keeps it in that register (deferred regions keep it in w25).
+	void EmitFDIVSlotRetire(MacroAssembler& a, const Register& status, bool in_memory)
+	{
+		Label end;
+		constexpr size_t offset = offsetof(VURegs, fdiv);
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, enable)));
+		a.Cbz(w11, &end);
+		a.Ldr(x11, Field(offset + offsetof(fdivPipe, sCycle)));
+		a.Ldr(w12, Field(offset + offsetof(fdivPipe, Cycle)));
+		a.Sub(x11, x26, x11);
+		a.Cmp(x11, x12);
+		a.B(lo, &end);
+		a.Str(wzr, Field(offset + offsetof(fdivPipe, enable)));
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, reg)));
+		a.Str(w11, Field(VI(REG_Q)));
+		if (in_memory)
+			a.Ldr(status, Field(VI(REG_STATUS_FLAG)));
+		a.And(status, status, 0xfcf);
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, statusflag)));
+		a.And(w11, w11, 0xc30);
+		a.Orr(status, status, w11);
+		if (in_memory)
+			a.Str(status, Field(VI(REG_STATUS_FLAG)));
+		a.Bind(&end);
+	}
+
 	void EmitScheduledPrepare(MacroAssembler& a, const Block& block, u32 index)
 	{
 		const auto& plan = block.schedule[index];
@@ -1972,32 +2131,11 @@ namespace
 			a.Str(w10, Field(offsetof(VURegs, fmacreadpos)));
 			StoreWord(a, plan.remaining, offsetof(VURegs, fmaccount));
 		}
+		// The FDIV slot the generic preparation would have drained, in
+		// VUPipeline::Retire's order: after the FMAC writeback above, because
+		// both merge into VI[REG_STATUS_FLAG].
 		if (plan.fdiv_pending)
-		{
-			// The FDIV slot the generic preparation would have drained, in
-			// VUPipeline::Retire's order: after the FMAC writeback above, because
-			// both merge into VI[REG_STATUS_FLAG]. Cheap when nothing is due, which
-			// is the common case even inside a divide's latency.
-			Label end;
-			constexpr size_t offset = offsetof(VURegs, fdiv);
-			a.Ldr(w10, Field(offset + offsetof(fdivPipe, enable)));
-			a.Cbz(w10, &end);
-			a.Ldr(x10, Field(offset + offsetof(fdivPipe, sCycle)));
-			a.Ldr(w11, Field(offset + offsetof(fdivPipe, Cycle)));
-			a.Sub(x10, x26, x10);
-			a.Cmp(x10, x11);
-			a.B(lo, &end);
-			a.Str(wzr, Field(offset + offsetof(fdivPipe, enable)));
-			a.Ldr(w10, Field(offset + offsetof(fdivPipe, reg)));
-			a.Str(w10, Field(VI(REG_Q)));
-			a.Ldr(w10, Field(VI(REG_STATUS_FLAG)));
-			a.And(w10, w10, 0xfcf);
-			a.Ldr(w11, Field(offset + offsetof(fdivPipe, statusflag)));
-			a.And(w11, w11, 0xc30);
-			a.Orr(w10, w10, w11);
-			a.Str(w10, Field(VI(REG_STATUS_FLAG)));
-			a.Bind(&end);
-		}
+			EmitFDIVSlotRetire(a, w10, true);
 		// Special work has drained at scheduled pairs. ILW clears readiness and
 		// keeps retirement generic until its queue drains; broader games need proper testing.
 		EmitBackupCountdown(a, plan.cycles);
@@ -2052,6 +2190,8 @@ namespace
 				if (j + 1 == plan.retired)
 					a.Umov(w28, flags.V4S(), 0);
 			}
+			if (plan.fdiv_pending)
+				EmitFDIVSlotRetire(a, w25, false);
 			// Only an integer write can inspect/reset the backup countdown in a
 			// supported pair. Accumulate time until that observer or the block exit.
 			backup_cycles += plan.cycles;
@@ -2114,7 +2254,7 @@ namespace
 		StoreWord(a, upper_code ? last.upper : last.lower, offsetof(VURegs, code));
 	}
 
-	Block& Compile(u32 pc)
+	Block& Compile(u32 pc, const IncomingProfile* profile)
 	{
 		if (static_cast<size_t>(s_end - s_write) < MaxBlockBytes)
 			InvalidateAll();
@@ -2263,6 +2403,11 @@ namespace
 				break; // JR/JALR/BAL's delay slot is native; the runtime target is not.
 		}
 		VU1.code = saved_code;
+		if (profile && block->count && !block->loops_to_entry)
+		{
+			block->profiled = true;
+			block->incoming = *profile;
+		}
 		if (block->count)
 		{
 			AnalyzeRetirement(*block);
@@ -2285,12 +2430,12 @@ namespace
 				u32 first, end, cycles;
 			};
 			std::vector<DeferredRegion> regions;
-			// A deferred region keeps the status flag in a host register, so it cannot
-			// contain a pair that retires the FDIV pipe into the architectural one.
-			const auto deferrable = [&](u32 i) {
-				return block->schedule[i].cycles && !block->schedule[i].fdiv_pending;
-			};
-			for (u32 i = 7; i < block->count;)
+			// A pair inside a divide's latency retires the FDIV slot into the
+			// status flag a deferred region keeps in w25.
+			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0; };
+			// Unprofiled blocks never schedule their first seven pairs.
+			const u32 first_scheduled = block->profiled ? 0 : 7;
+			for (u32 i = first_scheduled; i < block->count;)
 			{
 				if (!deferrable(i))
 				{
@@ -2301,7 +2446,9 @@ namespace
 				u32 cycles = 0;
 				while (i < block->count && deferrable(i))
 					cycles += block->schedule[i++].cycles;
-				if (i - first >= 8)
+				// Entering and leaving a region costs about as much as two pairs
+				// of queue maintenance save.
+				if (i - first >= 4)
 					regions.push_back({first, i, cycles});
 			}
 			const bool deferred = !regions.empty();
@@ -2325,11 +2472,16 @@ namespace
 					a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
 			u32 scheduled_pairs = 0;
-			for (u32 i = 7; i < block->count; i++)
+			for (u32 i = first_scheduled; i < block->count; i++)
 				scheduled_pairs += block->schedule[i].cycles != 0;
-			// Amortize the entry guard over several scheduled pairs.
-			const bool scheduled = scheduled_pairs >= 4;
-			if (scheduled)
+			// Amortize the entry guard over several scheduled pairs. A profiled
+			// block needs none: Execute() checked the same conditions, and its
+			// schedule already accounts for the one special entry it admits, a
+			// pending divide.
+			const bool scheduled = block->profiled ? scheduled_pairs != 0 : scheduled_pairs >= 4;
+			if (block->profiled && scheduled)
+				a.Mov(w25, 3);
+			else if (scheduled)
 				EmitScheduleGuard(a);
 			// Keep queue insertion and budget checks off the cycle store/load chain.
 			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
@@ -2528,6 +2680,56 @@ namespace
 		       VU1.xgkickenable == VURegs::XgkickPacket && VU1.xgkicksizeremaining == 0;
 	}
 
+	// The conditions EmitScheduleGuard checks at runtime, except that a pending
+	// divide is admitted and described instead. Anything else stays unprofiled.
+	bool CaptureProfile(IncomingProfile& profile)
+	{
+		if (VU1.xgkickenable || VU1.efu.enable || VU1.ialucount)
+			return false;
+		const u64 cycle = VU1.cycle;
+		if (cycle >= ~u64(0) - (MaxInstructions * 4 + 4))
+			return false;
+		u32 fdiv = 0;
+		if (VU1.fdiv.enable)
+		{
+			if (VU1.fdiv.sCycle > cycle || VU1.fdiv.Cycle > 32)
+				return false;
+			const u64 ready = VU1.fdiv.sCycle + VU1.fdiv.Cycle;
+			// Every pair advances at least one cycle, so the entry has retired
+			// by the pair after this many.
+			fdiv = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
+		}
+		const u32 count = VU1.fmaccount;
+		if (count > 4 || VU1.fmacreadpos > 3 || VU1.fmacwritepos != ((VU1.fmacreadpos + count) & 3))
+			return false;
+		profile.Set(count, fdiv);
+		u64 previous = 0;
+		for (u32 k = 0; k < count; k++)
+		{
+			const fmacPipe& entry = VU1.fmac[(VU1.fmacreadpos + k) & 3];
+			// At most one entry per cycle, in issue order, as the queue fills.
+			if (entry.Cycle != 4 || entry.sCycle > cycle || (k && entry.sCycle <= previous))
+				return false;
+			previous = entry.sCycle;
+			IncomingFmac fmac;
+			fmac.flags = (entry.flagreg & ((1 << REG_STATUS_FLAG) | (1 << REG_CLIP_FLAG))) != 0;
+			// Three cycles old is ready at the first pair's cycle and cannot stall
+			// it; the registers of such an entry no longer matter.
+			fmac.age = static_cast<u32>(std::min<u64>(cycle - entry.sCycle, 3));
+			if (fmac.age < 3)
+			{
+				if ((entry.regupper | entry.reglower) > 31 || (entry.xyzwupper | entry.xyzwlower) > 15)
+					return false;
+				fmac.regupper = entry.regupper;
+				fmac.reglower = entry.reglower;
+				fmac.xyzwupper = entry.xyzwupper;
+				fmac.xyzwlower = entry.xyzwlower;
+			}
+			profile.SetFmac(k, fmac);
+		}
+		return true;
+	}
+
 	bool Matches(const Block& block, u32 pc, u64 max_pairs)
 	{
 		if (!block.count)
@@ -2635,17 +2837,45 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		const bool pending = PacketXgkickPending();
 		const u64 remaining = cycles - (VU1.cycle - start);
 		auto& variants = s_blocks[pc / 8];
-		Block* block = nullptr;
+		IncomingProfile profile;
+		const bool profilable = !pending && s_profiled_compiles[pc / 8] < MaxProfiledCompiles && CaptureProfile(profile);
+		// Prefer a variant compiled for this incoming state. An unprofiled one
+		// with the same source serves when the state cannot be profiled, and
+		// always for a block that loops to its entry, which is never profiled.
+		size_t found = variants.size(), unprofiled = variants.size();
 		for (size_t i = 0; i < variants.size(); i++)
 		{
-			if (!Matches(*variants[i], pc, remaining))
+			const Block& candidate = *variants[i];
+			if (candidate.profiled && (!profilable || !(candidate.incoming == profile)))
 				continue;
-			std::rotate(variants.begin(), variants.begin() + i, variants.begin() + i + 1);
-			block = variants.front().get();
+			const bool usable = candidate.profiled || !profilable || candidate.loops_to_entry || !candidate.count;
+			if (!usable && unprofiled != variants.size())
+				continue;
+			if (!Matches(candidate, pc, remaining))
+				continue;
+			if (!usable)
+			{
+				unprofiled = i;
+				continue;
+			}
+			found = i;
 			break;
 		}
-		if (!block)
-			block = &Compile(pc);
+		if (found == variants.size() && !profilable)
+			found = unprofiled;
+		Block* block;
+		if (found != variants.size())
+		{
+			std::rotate(variants.begin(), variants.begin() + found, variants.begin() + found + 1);
+			block = variants.front().get();
+		}
+		else if (profilable)
+		{
+			s_profiled_compiles[pc / 8]++;
+			block = &Compile(pc, &profile);
+		}
+		else
+			block = &Compile(pc, nullptr);
 		// A restored chained-delay state still requires interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU1.takedelaybranch))
 		{

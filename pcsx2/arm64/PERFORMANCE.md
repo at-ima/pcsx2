@@ -13,6 +13,7 @@ sections unless a section says so.
 | 09-20..21 | Saru! Get You! 3 | "Saru! Get You! 3: VU0, IOP and EE dispatch" |
 | 09-21..22 | Ridge Racer V | "Ridge Racer V: VU0 correctness" |
 | 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
+| 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2421,6 +2422,79 @@ show it is not vacuous.
 Further VU1 work in this scene only buys headroom. When computing idle time
 from `sample`, count `semaphore_timedwait_trap`. Leaving it out once made
 the GS thread look 92% busy.
+
+## Burnout 3: VU1 entry profiles and deferred coverage
+
+2026-09-27, `BURN_OUT_3_002` save state (a busy race section), MTVU on.
+Uncapped, the section runs at 58-60 fps with the MTVU thread at 96-98%;
+elsewhere the EE thread is the limit at 66-69 fps. VU1 is the bottleneck here.
+
+**Profile.** 80% of the MTVU thread is generated code, and 40% is the shared
+per-pair preparation stub. Temporary counters in the generated code showed:
+
+- Blocks run 17 pairs per entry on average, then exit at an untaken integer
+  branch. Budget exits never happen under MTVU.
+- 75% of executed pairs took the generic preparation. 39% did so only
+  because they were among a block's first seven pairs.
+- At entry, 37% of blocks had three FMAC results in flight, 43% a pending
+  divide, and 14% an IALU entry.
+
+**Changes.**
+
+- Execute() captures the incoming FMAC queue (ages and write masks) and a
+  pending divide as a packed `IncomingProfile`. It compiles a variant for
+  that state, which schedules from the first pair. Blocks that loop to their
+  entry stay unprofiled. A PC stops being profiled after 24 profiled
+  compiles. MaxVariants is now 16. No compiles happened in steady state.
+- In profiled blocks, an integer branch's timing is known once the block's
+  own ILW/ILWR results have matured.
+- Deferred regions retire a pending divide inline (`EmitFDIVSlotRetire` on
+  w25). The minimum region length is 4 instead of 8.
+
+Deferred pairs went from 4.6M to 8.4M per 2M block entries (14% to 25%), and
+generic pairs from 24.9M to 21M.
+
+**Measurement.** Per-thread hardware counters (`thread_selfcounts`) inside
+Execute(), per emulated VU1 cycle:
+
+- Host instructions: 176-177 before, 170-171 after (-3.5%). This is stable
+  across runs.
+- Host cycles: 28.8 before, 27.8 after, within noise. Instructions fell without
+  cycles following.
+
+The first attempt was slower. The profile capture and the variant search
+tripled Execute()'s own time (4.6% to 12.3% of the thread), until the profile
+was packed into two words and Block's dispatch fields moved to its front.
+
+**Measurement pitfalls, new this time.**
+
+- `thread_selfcounts(1, ...)` returns {instructions, cycles}, in that order.
+- The macOS screensaver started during an unattended run. From then on every
+  run was slower than the one before (56 -> 46 -> 36 -> 23 fps, for old and new
+  binaries alike). Check `pgrep -lf ScreenSaver|Flurry` and the HID idle time
+  before trusting a series.
+- In ns-per-VU1-cycle A/B runs, always running the old build first biased the
+  comparison against the new one. Use ABBA order with a cooldown.
+
+**What is left.** A pair costs about 170 host instructions on average: about
+55 in a deferred region, and 140-200 on the generic path. The largest
+remaining generic reasons, per 2M block entries:
+
+| Pairs | Reason |
+| --- | --- |
+| 4.8M | Prologue of unprofiled blocks: loops to entry, pending IALU/EFU |
+| 3.8M | Unknown producer ages, or a retiring entry that writes the status/clip flag |
+| 2.3M | Integer-branch pairs, which always take the branch preparation |
+| 1.9M | Inside the EFU latency |
+| 1.9M | Q/P timing unknown |
+| 1.8M | Flag reads |
+| 1.2M | Q/P reads or writes |
+| 1.1M | ILW latency |
+
+Per-pair MAC/status flag computation is about 25 instructions of a deferred
+FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
+but it conflicts with this design's exact interpreter state at every pair
+boundary. Needs proper testing across more games.
 
 ## Known gaps (2026-09-26)
 

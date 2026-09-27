@@ -2812,6 +2812,159 @@ TEST_F(VU1RecompilerTest, SwappedProgramsAtTheSamePcReuseTheirCompiledBlocks)
 	EXPECT_EQ(CpuArm64VU1.GetCommittedCache(), committed);
 }
 
+TEST_F(VU1RecompilerTest, ProfiledEntriesScheduleFromTheFirstPair)
+{
+	// Most VU1 blocks in Burnout 3 are entered with two or three FMAC results
+	// still in flight, often with a divide too, and their first seven pairs
+	// used to take the generic preparation for that reason alone. A block is
+	// now compiled for the incoming state it is entered with, and schedules
+	// from its first pair. Random incoming queues and divides, and programs
+	// whose first pairs read what those entries write, against the
+	// interpreter at every budget.
+	const VURegs initial = VU1, initial0 = VU0;
+	u32 random = 0x2468ace1;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 96; seed++)
+	{
+		// Integer branches too: a profiled block is entered with the IALU pipe
+		// empty, so their timing is known once its own loads have matured.
+		// Start each program from an empty cache so the per-PC limit on
+		// profiled compiles never turns profiling off here.
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = seed & 1 ? 1000 : ~u64(0) - 4000;
+		const u64 cycle = VU1.cycle;
+		VU1.VI[REG_STATUS_FLAG].UL = next() & 0xfff;
+		VU1.VI[REG_Q].UL = 0x40000000;
+		for (u32 r = 1; r < 4; r++)
+			VU1.VI[r].UL = next() % 3;
+		VU1.fmaccount = seed % 5;
+		VU1.fmacreadpos = next() % 4;
+		VU1.fmacwritepos = (VU1.fmacreadpos + VU1.fmaccount) & 3;
+		u64 age = VU1.fmaccount + next() % 3;
+		for (u32 n = 0; n < VU1.fmaccount; n++)
+		{
+			auto& fmac = VU1.fmac[(VU1.fmacreadpos + n) & 3];
+			age -= 1 + (next() % 4 == 0);
+			fmac.sCycle = cycle - std::max<u64>(age, 0);
+			if (n && fmac.sCycle <= VU1.fmac[(VU1.fmacreadpos + n - 1) & 3].sCycle)
+				fmac.sCycle = VU1.fmac[(VU1.fmacreadpos + n - 1) & 3].sCycle + 1;
+			if (fmac.sCycle > cycle)
+			{
+				VU1.fmaccount = n;
+				VU1.fmacwritepos = (VU1.fmacreadpos + n) & 3;
+				break;
+			}
+			fmac.Cycle = 4;
+			fmac.regupper = 1 + next() % 4;
+			fmac.xyzwupper = next() & 15;
+			fmac.reglower = next() % 2 ? 1 + next() % 4 : 0;
+			fmac.xyzwlower = fmac.reglower ? next() & 15 : 0;
+			const u32 flags = next() % 16;
+			fmac.flagreg = 0;
+			if (flags < 2)
+				fmac.flagreg = 1 << (flags ? REG_CLIP_FLAG : REG_STATUS_FLAG);
+			fmac.statusflag = next() & 0xfff;
+			fmac.macflag = next() & 0xffff;
+			fmac.clipflag = next() & 0xffffff;
+		}
+		if (seed % 3 == 0)
+		{
+			VU1.fdiv.enable = 1;
+			VU1.fdiv.sCycle = cycle - next() % 8;
+			VU1.fdiv.Cycle = next() % 2 ? 7 : 13;
+			VU1.fdiv.reg.UL = 0x3fc00000;
+			VU1.fdiv.statusflag = next() & 0xc30;
+		}
+		for (u32 i = 0; i < 24; i++)
+		{
+			const u32 fs = 1 + next() % 4, ft = 1 + next() % 4, fd = 1 + next() % 4;
+			u32 upper = ((next() & 15) << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; // ADD
+			u32 lower = 0x8000033c; // MOVE with no destination lanes
+			switch (next() % 10)
+			{
+				case 0:
+					lower = 0x800003bc | (1 << 23) | (fs << 16) | (ft << 11); // DIV Q, VFft.x / VFfs.y
+					break;
+				case 1:
+					lower = 0x800003bf; // WAITQ
+					break;
+				case 2:
+					upper = (15 << 21) | (fs << 11) | (fd << 6) | 0x1c; // MULq
+					break;
+				case 3:
+					lower = 0x8000033c | ((next() & 15) << 21) | (fd << 16) | (fs << 11); // MOVE
+					break;
+				case 4:
+					lower = 0x08000000 | (1 << 21) | ((1 + next() % 3) << 16) | (next() % 8); // ILW.x VIn, imm(VI0)
+					break;
+				case 5:
+					// IBNE/IBEQ one pair ahead: taken or not, the block continues
+					// or exits on a pair whose timing the schedule has to know.
+					lower = (next() % 2 ? 0x52000000 : 0x50000000) | ((1 + next() % 3) << 16) | ((1 + next() % 3) << 11) | 1;
+					break;
+			}
+			Put(i * 8, upper, lower);
+		}
+		for (u32 pc = 24 * 8; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		const VURegs state = VU1;
+		for (u32 budget = 1; budget <= 40; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = state;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+
+	// An integer branch that stalls on an ILW makes the producers before it
+	// older than one cycle per pair would. Those are the ones the first
+	// scheduled pairs after the load retire, so its timing must not be
+	// treated as known until the load has matured.
+	for (u32 budget = 1; budget <= 30; budget++)
+	{
+		SCOPED_TRACE(testing::Message() << "ilw budget=" << budget);
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+		Put(0, add(3, 1, 2), 0x08000000 | (1 << 21) | (1 << 16)); // ILW.x VI1, 0(VI0)
+		Put(8, add(4, 1, 2), 0x8000033c);
+		Put(16, add(5, 1, 2), 0x52000000 | (1 << 11) | 1); // IBNE VI1, VI0: waits for the load
+		Put(24, add(6, 1, 2), 0x8000033c);
+		for (u32 pc = 32; pc < 128; pc += 8)
+			Put(pc, add(7 + (pc / 8) % 4, 3 + (pc / 8) % 4, 2), 0x8000033c);
+		for (u32 pc = 128; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		Compare(budget);
+		if (HasFatalFailure())
+			return;
+	}
+
+	// The same program entered with a different incoming state gets a block
+	// of its own.
+	CpuArm64VU1.Reset();
+	VU0 = initial0;
+	VU1 = initial;
+	for (u32 pc = 0; pc < VU1_PROGSIZE; pc += 8)
+		Put(pc, (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28, 0x8000033c);
+	const VURegs empty = VU1;
+	Compare(16);
+	const size_t committed = CpuArm64VU1.GetCommittedCache();
+	VU0 = initial0;
+	VU1 = empty;
+	VU1.cycle = 100;
+	VU1.fmaccount = 1;
+	VU1.fmacwritepos = 1;
+	VU1.fmac[0] = {1, 0, 0, 15, 0, 99, 4};
+	Compare(16);
+	EXPECT_GT(CpuArm64VU1.GetCommittedCache(), committed);
+}
+
 TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
 {
 	const VURegs initial = VU1, initial0 = VU0;
