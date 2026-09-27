@@ -14,7 +14,7 @@ sections unless a section says so.
 | 09-21..22 | Ridge Racer V | "Ridge Racer V: VU0 correctness" |
 | 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
 | 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" (includes block linking) |
-| 09-27 | Burnout 3 | "Burnout 3: EE interpreter fallbacks" |
+| 09-27 | Burnout 3 | "Burnout 3: EE interpreter fallbacks", "Burnout 3: EE register jumps and the remaining fallbacks" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2564,6 +2564,57 @@ per million EE cycles. The section now runs at 59.9 fps, with the EE thread
 at 70-90%. There are still short spikes to 99%. Remaining fallbacks: BC0F
 14%, DIV.S 12%, QFSRV/MTSAB 13%, PCPYH 6%, MADD.S 6%, PSRAW 5%, MFC0 5%,
 MAX.S/MIN.S 9%. Needs proper testing across more games.
+
+## Burnout 3: EE register jumps and the remaining fallbacks
+
+2026-09-27, same `BURN_OUT_3_003` state, after the previous section.
+
+**More native instructions.**
+
+- COP1: DIV.S, SQRT.S, ADDA/SUBA/MULA.S, MADD/MSUB.S, MADDA/MSUBA.S, MAX/MIN.S.
+  The interpreter's `ACC += fs * ft` (MADDA.S) and `ACC -= fs * ft`
+  (MSUBA.S) compile to fused `fmadd`/`fmsub` with clang on ARM64. The native
+  code uses the same fused instructions so the tests can compare bit for
+  bit. MADD.S/MSUB.S round and clamp the product first, as the interpreter
+  does.
+- MMI: PSLLH/PSRLH/PSRAH, PSLLW/PSRLW/PSRAW, PCPYH, PMULTH, and QFSRV. QFSRV
+  reads SA at run time and falls back when SA is above 15.
+- MTSA/MFSA/MTSAB/MTSAH, and MFC0 of any register except 25 (the
+  performance counters). An MFC0 of Count sees the same committed
+  `cpuRegs.cycle` as in the interpreter.
+- BC0F/BC0T/BC0FL/BC0TL, which read CPCOND0 from the DMAC's STAT and PCR.
+
+Interpreted instructions fell from 5.1K to 0.65K per million EE cycles.
+
+**Register jumps.** C++ dispatches were still 50K per million EE cycles.
+Almost all of them came from JR/JALR, which returned to C++ for every
+function return and indirect call. (A first count blamed static branches:
+with links, the block that returns is not the block that was looked up.)
+
+- `ExecuteChained()` records every trusted block it dispatches in
+  `CodeGenerator::g_indirect`, a 4096-entry table indexed by pc bits 2-13,
+  with the link generation.
+- While chaining, a JR/JALR does the taken-branch bookkeeping of a linked
+  exit (pc, cycle commit, event deadline). It then jumps to the target block
+  when the table entry matches the pc and the current generation. Otherwise
+  it returns `NextBlock`.
+
+Dispatches fell to 4.3K per million EE cycles.
+
+**Tests.** Unit-test code is never trusted (its pages are not tracked), so no
+test had taken a native link before. `SetTrustUntrackedForTesting()` trusts
+such blocks; the test then drops blocks itself with `Reset()`.
+`LinkedAndRegisterJumpsMatchSteppedExecution` runs a JAL/JR/JALR loop
+3000 times and compares it with one block per call. It also requires fewer
+than 16 C++ dispatches, and compiles an extra block after `Reset()` so that
+stale table entries would point to different code.
+
+**Result.** Later runs of the same state no longer reached the busy section:
+the player's car slowed to a stop within seconds, with the previous commit's
+build as well, so the controller input had changed. In that scene, with
+both builds captured the same way, the EE thread averaged about 65% before
+and 58% after. Ridge Racer V and Saru! Get You! 3 still render correctly.
+Needs proper testing across more games.
 
 ## Known gaps (2026-09-26)
 

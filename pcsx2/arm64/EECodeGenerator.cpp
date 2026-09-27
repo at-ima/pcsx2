@@ -102,9 +102,73 @@ namespace
 		return (code >> 26) == 51 || ((code >> 26) == 0 && (code & 63) == 15);
 	}
 
+	enum class MiscOp
+	{
+		None,
+		MoveFromSA, // MFSA
+		MoveToSA, // MTSA
+		MoveToSAByte, // MTSAB
+		MoveToSAHalf, // MTSAH
+		ShiftLeftHalf, // PSLLH
+		ShiftRightHalf, // PSRLH
+		ShiftArithmeticHalf, // PSRAH
+		ShiftLeftWord, // PSLLW
+		ShiftRightWord, // PSRLW
+		ShiftArithmeticWord, // PSRAW
+		CopyHalf, // PCPYH
+		MultiplyHalf, // PMULTH
+		MoveFromCOP0, // MFC0
+	};
+
+	// Other instructions that cannot fault, so they may also sit in delay slots.
+	MiscOp DecodeMisc(u32 code)
+	{
+		const u32 op = code >> 26, function = code & 63, selector = (code >> 6) & 31;
+		if (op == 0 && function == 40)
+			return MiscOp::MoveFromSA;
+		if (op == 0 && function == 41)
+			return MiscOp::MoveToSA;
+		if (op == 1 && ((code >> 16) & 31) == 24)
+			return MiscOp::MoveToSAByte;
+		if (op == 1 && ((code >> 16) & 31) == 25)
+			return MiscOp::MoveToSAHalf;
+		if (op == 28)
+		{
+			switch (function)
+			{
+				case 52:
+					return MiscOp::ShiftLeftHalf;
+				case 54:
+					return MiscOp::ShiftRightHalf;
+				case 55:
+					return MiscOp::ShiftArithmeticHalf;
+				case 60:
+					return MiscOp::ShiftLeftWord;
+				case 62:
+					return MiscOp::ShiftRightWord;
+				case 63:
+					return MiscOp::ShiftArithmeticWord;
+				case 9:
+					return selector == 28 ? MiscOp::MultiplyHalf : MiscOp::None;
+				case 41:
+					return selector == 27 ? MiscOp::CopyHalf : MiscOp::None;
+			}
+		}
+		// MFC0 of PCCR/PCR0/PCR1 (register 25) updates performance counters.
+		if (op == 16 && ((code >> 21) & 31) == 0 && ((code >> 11) & 31) != 25)
+			return MiscOp::MoveFromCOP0;
+		return MiscOp::None;
+	}
+
+	// QFSRV reads SA at run time; SA above 15 is left to the interpreter.
+	bool IsQuadFunnelShift(u32 code)
+	{
+		return (code >> 26) == 28 && (code & 63) == 40 && ((code >> 6) & 31) == 27;
+	}
+
 	bool SupportsInteger(u32 code)
 	{
-		if (IsHiLo(code) || DecodePacked(code).op != PackedOp::None || IsNop(code))
+		if (IsHiLo(code) || DecodePacked(code).op != PackedOp::None || IsNop(code) || DecodeMisc(code) != MiscOp::None)
 			return true;
 		switch (code >> 26)
 		{
@@ -167,12 +231,19 @@ namespace
 		return MemOperand(x0, offsetof(cpuRegistersPack, fpuRegs) + offsetof(fpuRegisters, fpr) + reg * sizeof(FPRreg));
 	}
 
+	MemOperand FACC()
+	{
+		return MemOperand(x0, offsetof(cpuRegistersPack, fpuRegs) + offsetof(fpuRegisters, ACC));
+	}
+
 	MemOperand FCR31()
 	{
 		return MemOperand(x0, offsetof(cpuRegistersPack, fpuRegs) + offsetof(fpuRegisters, fprc) + 31 * sizeof(u32));
 	}
 
 	constexpr u32 FPUflagC = 0x00800000;
+	constexpr u32 FPUflagI = 0x00020000, FPUflagSI = 0x00000040;
+	constexpr u32 FPUflagD = 0x00010000, FPUflagSD = 0x00000020;
 	constexpr u32 FPUflagO = 0x00008000, FPUflagSO = 0x00000010;
 	constexpr u32 FPUflagU = 0x00004000, FPUflagSU = 0x00000008;
 
@@ -230,6 +301,24 @@ namespace
 		a.Orr(w12, w12, FPUflagO | FPUflagSO);
 		a.Bind(&done);
 		a.Str(w12, FCR31());
+	}
+
+	// checkOverflow()+checkUnderflow() with no flags (DIV.S): +/-Inf saturates
+	// to +/-Fmax and a denormal flushes to signed zero. w9 in/out, w11 scratch.
+	void EmitFpuSaturate(MacroAssembler& a)
+	{
+		Label overflow, done;
+		a.And(w11, w9, 0x7fffffff);
+		a.Cmp(w11, 0x7f800000);
+		a.B(eq, &overflow);
+		a.Tst(w9, 0x7f800000);
+		a.B(ne, &done);
+		a.And(w9, w9, 0x80000000);
+		a.B(&done);
+		a.Bind(&overflow);
+		a.And(w9, w9, 0x80000000);
+		a.Orr(w9, w9, 0x7f7fffff);
+		a.Bind(&done);
 	}
 
 	void EmitPacked(MacroAssembler& a, u32 code, PackedInstruction instruction)
@@ -414,10 +503,165 @@ namespace
 			a.Str(x9, GPR(dest));
 	}
 
+	MemOperand SA()
+	{
+		return MemOperand(x0, offsetof(cpuRegisters, sa));
+	}
+
+	MemOperand COP0(u32 reg)
+	{
+		return MemOperand(x0, offsetof(cpuRegisters, CP0) + reg * sizeof(u32));
+	}
+
+	void EmitMisc(MacroAssembler& a, u32 code, MiscOp op)
+	{
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31, sa = (code >> 6) & 31;
+		switch (op)
+		{
+			case MiscOp::MoveFromSA:
+				if (rd)
+				{
+					a.Ldr(w9, SA());
+					a.Str(x9, GPR(rd));
+				}
+				return;
+			case MiscOp::MoveToSA:
+				a.Ldr(w9, GPR(rs));
+				a.Str(w9, SA());
+				return;
+			case MiscOp::MoveToSAByte:
+			case MiscOp::MoveToSAHalf:
+			{
+				const u32 mask = op == MiscOp::MoveToSAByte ? 0xf : 0x7;
+				a.Ldr(w9, GPR(rs));
+				a.And(w9, w9, mask);
+				if (code & mask)
+					a.Eor(w9, w9, code & mask);
+				if (op == MiscOp::MoveToSAHalf)
+					a.Lsl(w9, w9, 1);
+				a.Str(w9, SA());
+				return;
+			}
+			case MiscOp::MoveFromCOP0:
+				if (rd == 9)
+				{
+					// Count catches up with the cycles committed so far, at least by one.
+					a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+					a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, lastCOP0Cycle)));
+					a.Subs(x10, x9, x10);
+					a.Cinc(x10, x10, eq);
+					a.Ldr(w11, COP0(9));
+					a.Add(w11, w11, w10);
+					a.Str(w11, COP0(9));
+					a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, lastCOP0Cycle)));
+				}
+				else if (rt && rd != 24) // register 24 only logs
+				{
+					a.Ldr(w11, COP0(rd));
+					if (rd == 12)
+						a.And(w11, w11, 0xf0c79c1f);
+				}
+				if (rt && rd != 24)
+				{
+					a.Sxtw(x11, w11);
+					a.Str(x11, GPR(rt));
+				}
+				return;
+			default:
+				break;
+		}
+		if (!rd)
+			return;
+		a.Ldr(q1, GPR(rt));
+		switch (op)
+		{
+			case MiscOp::ShiftLeftHalf:
+				a.Shl(v0.V8H(), v1.V8H(), sa & 15);
+				break;
+			case MiscOp::ShiftRightHalf:
+			case MiscOp::ShiftArithmeticHalf:
+				if (!(sa & 15))
+					a.Mov(v0.V16B(), v1.V16B());
+				else if (op == MiscOp::ShiftRightHalf)
+					a.Ushr(v0.V8H(), v1.V8H(), sa & 15);
+				else
+					a.Sshr(v0.V8H(), v1.V8H(), sa & 15);
+				break;
+			case MiscOp::ShiftLeftWord:
+				a.Shl(v0.V4S(), v1.V4S(), sa);
+				break;
+			case MiscOp::ShiftRightWord:
+			case MiscOp::ShiftArithmeticWord:
+				if (!sa)
+					a.Mov(v0.V16B(), v1.V16B());
+				else if (op == MiscOp::ShiftRightWord)
+					a.Ushr(v0.V4S(), v1.V4S(), sa);
+				else
+					a.Sshr(v0.V4S(), v1.V4S(), sa);
+				break;
+			case MiscOp::CopyHalf:
+				a.Dup(v0.V8H(), v1.V8H(), 0);
+				a.Dup(v2.V8H(), v1.V8H(), 4);
+				a.Mov(v0.V2D(), 1, v2.V2D(), 1);
+				break;
+			default:
+				pxFailRel("Invalid EE instruction");
+				break;
+		}
+		a.Str(q0, GPR(rd));
+	}
+
+	// PMULTH: eight signed halfword products. LO gets products 0, 1, 4, 5,
+	// HI gets 2, 3, 6, 7 and rd the even ones.
+	void EmitMultiplyHalf(MacroAssembler& a, u32 code)
+	{
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31;
+		a.Ldr(q1, GPR(rs));
+		a.Ldr(q2, GPR(rt));
+		a.Smull(v3.V4S(), v1.V4H(), v2.V4H());
+		a.Smull2(v4.V4S(), v1.V8H(), v2.V8H());
+		a.Zip1(v5.V2D(), v3.V2D(), v4.V2D());
+		a.Zip2(v6.V2D(), v3.V2D(), v4.V2D());
+		a.Str(q5, MemOperand(x0, offsetof(cpuRegisters, LO)));
+		a.Str(q6, MemOperand(x0, offsetof(cpuRegisters, HI)));
+		if (rd)
+		{
+			a.Uzp1(v7.V4S(), v3.V4S(), v4.V4S());
+			a.Str(q7, GPR(rd));
+		}
+	}
+
+	// QFSRV: bytes SA..SA+15 of rs:rt. Leaves the block first when SA > 15.
+	void EmitQuadFunnelShift(MacroAssembler& a, u32 code, Label* before)
+	{
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31;
+		a.Ldr(w9, SA());
+		a.Cmp(w9, 15);
+		a.B(hi, before);
+		if (!rd)
+			return;
+		a.Ldr(q1, GPR(rt));
+		a.Ldr(q2, GPR(rs));
+		a.Sub(sp, sp, 32);
+		a.Str(q1, MemOperand(sp));
+		a.Str(q2, MemOperand(sp, 16));
+		a.Ldr(q0, MemOperand(sp, x9));
+		a.Add(sp, sp, 32);
+		a.Str(q0, GPR(rd));
+	}
+
 	void Emit(MacroAssembler& a, u32 code)
 	{
 		if (IsNop(code))
 			return;
+		if (const MiscOp misc = DecodeMisc(code); misc != MiscOp::None)
+		{
+			if (misc == MiscOp::MultiplyHalf)
+				EmitMultiplyHalf(a, code);
+			else
+				EmitMisc(a, code, misc);
+			return;
+		}
 		const PackedInstruction packed = DecodePacked(code);
 		if (packed.op != PackedOp::None)
 		{
@@ -571,12 +815,9 @@ namespace
 		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, code)));
 	}
 
-	// Phase 1 coverage: register transfer (MFC1/CFC1/MTC1/CTC1), CVT_S,
-	// ADD_S/SUB_S/MUL_S/ABS_S/MOV_S/NEG_S, CVT_W, and the C.cond.S compare
-	// family. DIV_S/SQRT_S/RSQRT_S and the ACC-based MADD/MSUB/MULA/etc.
-	// family are deliberately left unsupported for now (see PERFORMANCE
-	// notes/plan) -- they fall back to the interpreter like any other
-	// unsupported instruction. needs proper testing across games.
+	// Register transfer (MFC1/CFC1/MTC1/CTC1), CVT_S, the S-format arithmetic
+	// except RSQRT_S, CVT_W and the C.cond.S compare family. Anything else
+	// falls back to the interpreter. needs proper testing across games.
 	bool SupportsCOP1(u32 code)
 	{
 		const u32 rs = (code >> 21) & 31;
@@ -591,6 +832,17 @@ namespace
 				case 0: // ADD_S
 				case 1: // SUB_S
 				case 2: // MUL_S
+				case 3: // DIV_S
+				case 4: // SQRT_S
+				case 24: // ADDA_S
+				case 25: // SUBA_S
+				case 26: // MULA_S
+				case 28: // MADD_S
+				case 29: // MSUB_S
+				case 30: // MADDA_S
+				case 31: // MSUBA_S
+				case 40: // MAX_S
+				case 41: // MIN_S
 				case 5: // ABS_S
 				case 6: // MOV_S
 				case 7: // NEG_S
@@ -776,22 +1028,135 @@ namespace
 				a.Str(w9, FPR(fd));
 				return;
 			}
-			default: // ADD_S(0)/SUB_S(1)/MUL_S(2)
+			case 3: // DIV_S
+			{
+				Label zero, done;
+				a.Ldr(w10, FPR(ft));
+				a.Tst(w10, 0x7f800000);
+				a.B(eq, &zero); // checkDivideByZero(): denormal divisors count as zero
+				EmitFpuClampOperand(a, w9);
+				EmitFpuClampOperand(a, w10);
+				a.Fmov(s0, w9);
+				a.Fmov(s1, w10);
+				a.Fdiv(s0, s0, s1);
+				a.Fmov(w9, s0);
+				EmitFpuSaturate(a);
+				a.B(&done);
+				a.Bind(&zero);
+				a.Ldr(w12, FCR31());
+				a.Mov(w13, FPUflagD | FPUflagSD);
+				a.Mov(w11, FPUflagI | FPUflagSI);
+				a.Tst(w9, 0x7f800000);
+				a.Csel(w13, w11, w13, eq); // 0/0 is invalid rather than a division by zero
+				a.Orr(w12, w12, w13);
+				a.Str(w12, FCR31());
+				a.Eor(w9, w9, w10);
+				a.And(w9, w9, 0x80000000);
+				a.Orr(w9, w9, 0x7f7fffff);
+				a.Bind(&done);
+				a.Str(w9, FPR(fd));
+				return;
+			}
+			case 4: // SQRT_S: of ft, not fs
+			{
+				Label zero, positive, done;
+				a.Ldr(w10, FPR(ft));
+				a.Ldr(w12, FCR31());
+				a.Bic(w12, w12, FPUflagI | FPUflagD);
+				a.Tst(w10, 0x7f800000);
+				a.B(eq, &zero);
+				a.Tbz(w10, 31, &positive);
+				a.Orr(w12, w12, FPUflagI | FPUflagSI);
+				a.Bind(&positive);
+				a.Str(w12, FCR31());
+				a.And(w10, w10, 0x7fffffff);
+				EmitFpuClampOperand(a, w10);
+				a.Fmov(s0, w10);
+				a.Fsqrt(s0, s0);
+				a.Fmov(w9, s0);
+				a.B(&done);
+				a.Bind(&zero);
+				a.Str(w12, FCR31());
+				a.And(w9, w10, 0x80000000);
+				a.Bind(&done);
+				a.Str(w9, FPR(fd));
+				return;
+			}
+			case 40: // MAX_S
+			case 41: // MIN_S
+				// fp_max()/fp_min(): signed integer order, reversed when both are negative.
+				a.Ldr(w10, FPR(ft));
+				a.Cmp(w9, w10);
+				a.Csel(w12, w9, w10, gt);
+				a.Csel(w13, w9, w10, lt);
+				a.And(w11, w9, w10);
+				a.Cmp(w11, 0);
+				if (function == 40)
+					a.Csel(w9, w13, w12, lt);
+				else
+					a.Csel(w9, w12, w13, lt);
+				a.Str(w9, FPR(fd));
+				a.Ldr(w12, FCR31());
+				a.Bic(w12, w12, FPUflagO | FPUflagU);
+				a.Str(w12, FCR31());
+				return;
+			case 28: // MADD_S
+			case 29: // MSUB_S
+				// The product is rounded and clamped before the accumulator is added.
+				a.Ldr(w10, FPR(ft));
+				EmitFpuClampOperand(a, w9);
+				EmitFpuClampOperand(a, w10);
+				a.Fmov(s0, w9);
+				a.Fmov(s1, w10);
+				a.Fmul(s0, s0, s1);
+				a.Fmov(w10, s0);
+				EmitFpuClampOperand(a, w10);
+				a.Ldr(w9, FACC());
+				EmitFpuClampOperand(a, w9);
+				a.Fmov(s0, w9);
+				a.Fmov(s1, w10);
+				if (function == 28)
+					a.Fadd(s0, s0, s1);
+				else
+					a.Fsub(s0, s0, s1);
+				a.Fmov(w9, s0);
+				EmitFpuOutputFlags(a);
+				a.Str(w9, FPR(fd));
+				return;
+			case 30: // MADDA_S
+			case 31: // MSUBA_S
+				// The interpreter's `ACC += fs * ft` compiles to a fused multiply-add
+				// on ARM64, with the accumulator unclamped; match it.
+				a.Ldr(w10, FPR(ft));
+				EmitFpuClampOperand(a, w9);
+				EmitFpuClampOperand(a, w10);
+				a.Fmov(s0, w9);
+				a.Fmov(s1, w10);
+				a.Ldr(s2, FACC());
+				if (function == 30)
+					a.Fmadd(s0, s0, s1, s2);
+				else
+					a.Fmsub(s0, s0, s1, s2);
+				a.Fmov(w9, s0);
+				EmitFpuOutputFlags(a);
+				a.Str(w9, FACC());
+				return;
+			default: // ADD_S(0)/SUB_S(1)/MUL_S(2), and ADDA_S(24)/SUBA_S(25)/MULA_S(26) into ACC
 			{
 				a.Ldr(w10, FPR(ft));
 				EmitFpuClampOperand(a, w9);
 				EmitFpuClampOperand(a, w10);
 				a.Fmov(s0, w9);
 				a.Fmov(s1, w10);
-				if (function == 0)
+				if ((function & 7) == 0)
 					a.Fadd(s0, s0, s1);
-				else if (function == 1)
+				else if ((function & 7) == 1)
 					a.Fsub(s0, s0, s1);
 				else
 					a.Fmul(s0, s0, s1);
 				a.Fmov(w9, s0);
 				EmitFpuOutputFlags(a);
-				a.Str(w9, FPR(fd));
+				a.Str(w9, function >= 24 ? FACC() : FPR(fd));
 				return;
 			}
 		}
@@ -1108,6 +1473,46 @@ namespace
 		}
 	}
 
+	// The chaining path of a JR/JALR, whose target is in w15: the driver's
+	// work for a taken branch, then a jump through g_indirect when the target
+	// block is there, or a return asking ExecuteChained() to look it up.
+	void EmitIndirectExit(MacroAssembler& a, u32 completed, Label* classic)
+	{
+		using namespace Arm64EE::CodeGenerator;
+		static_assert(sizeof(IndirectEntry) == 16);
+		Label due, miss;
+		EmitAddCycles(a, completed, classic);
+		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
+		a.Lsr(w10, w11, 3);
+		a.Cmp(w10, 1);
+		a.Csinc(w10, w10, wzr, hs);
+		a.And(w11, w11, 7);
+		a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+		a.Add(x9, x9, x10);
+		a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+		a.Str(w11, MemOperand(x13));
+		a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
+		a.Sub(x9, x9, x10);
+		a.Tbz(x9, 63, &due);
+		a.Mov(x10, reinterpret_cast<uintptr_t>(g_indirect.data()));
+		a.Ubfx(w9, w15, 2, IndirectBits);
+		a.Add(x10, x10, Operand(x9, LSL, 4));
+		a.Ldp(w9, w11, MemOperand(x10));
+		a.Cmp(w9, w15);
+		a.B(ne, &miss);
+		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, generation)));
+		a.Cmp(w11, w9);
+		a.B(ne, &miss);
+		a.Ldr(x16, MemOperand(x10, 8));
+		a.Br(x16);
+		a.Bind(&miss);
+		a.Mov(x0, NextBlock | CyclesCommitted);
+		a.Ret();
+		a.Bind(&due);
+		a.Mov(x0, EventDue | CyclesCommitted);
+		a.Ret();
+	}
+
 	u32 BranchLink(u32 code)
 	{
 		const u32 op = code >> 26, rt = (code >> 16) & 31;
@@ -1125,7 +1530,7 @@ namespace
 		using namespace Arm64EE::CodeGenerator;
 		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
 		const bool conditional = op != 0 && op != 2 && op != 3;
-		const bool likely = (op >= 20 && op <= 23) || (op == 1 && (rt & 2)) || (op == 17 && (rt & 2));
+		const bool likely = (op >= 20 && op <= 23) || (op == 1 && (rt & 2)) || ((op == 16 || op == 17) && (rt & 2));
 		const u32 link = BranchLink(code);
 		const bool memory_delay = MemorySize(delay) != 0;
 		if (memory_delay)
@@ -1147,7 +1552,18 @@ namespace
 		if (conditional)
 		{
 			Condition taken;
-			if (op == 17) // BC1F/BC1T/BC1FL/BC1TL: branch on FCR31's C bit, not a GPR.
+			if (op == 16) // BC0F/BC0T/BC0FL/BC0TL: CPCOND0, from the DMAC's STAT and PCR.
+			{
+				a.Mov(x9, reinterpret_cast<uintptr_t>(&psHu32(DMAC_PCR)));
+				a.Ldr(w9, MemOperand(x9));
+				a.Mov(x10, reinterpret_cast<uintptr_t>(&psHu32(DMAC_STAT)));
+				a.Ldr(w10, MemOperand(x10));
+				a.Orn(w9, w10, w9);
+				a.And(w9, w9, 0x3ff);
+				a.Cmp(w9, 0x3ff);
+				taken = (rt & 1) ? eq : ne;
+			}
+			else if (op == 17) // BC1F/BC1T/BC1FL/BC1TL: branch on FCR31's C bit, not a GPR.
 			{
 				a.Ldr(w9, FCR31());
 				a.Tst(w9, FPUflagC);
@@ -1182,13 +1598,19 @@ namespace
 		else
 			Emit(a, delay);
 		EmitPosition(a, pc + 8, delay);
-		// JR/JALR targets are only known at run time; those still return.
 		if (s_exit.linkable && op != 0)
 		{
 			const u32 target = (op == 2 || op == 3) ? (((pc + 4) & 0xf0000000u) | ((code & 0x03ffffffu) << 2)) :
 			                                          pc + 4 + static_cast<int16_t>(code) * 4;
 			Label classic;
 			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, &classic);
+			a.Bind(&classic);
+		}
+		else if (s_exit.linkable)
+		{
+			// JR/JALR targets are only known at run time.
+			Label classic;
+			EmitIndirectExit(a, preceding + 2, &classic);
 			a.Bind(&classic);
 		}
 		a.Lsl(x15, x15, 32);
@@ -1214,7 +1636,7 @@ namespace
 
 bool Arm64EE::CodeGenerator::Supports(u32 code)
 {
-	return SupportsInteger(code) || IsTrapping(code) || MemorySize(code) != 0 || IsBranch(code) ||
+	return SupportsInteger(code) || IsTrapping(code) || IsQuadFunnelShift(code) || MemorySize(code) != 0 || IsBranch(code) ||
 	       ((code >> 26) == 18 && SupportsCOP2(code)) || ((code >> 26) == 17 && SupportsCOP1(code));
 }
 
@@ -1230,6 +1652,7 @@ bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 branch, u32 code)
 }
 
 Arm64EE::CodeGenerator::LinkState Arm64EE::CodeGenerator::g_link_state;
+std::array<Arm64EE::CodeGenerator::IndirectEntry, 1u << Arm64EE::CodeGenerator::IndirectBits> Arm64EE::CodeGenerator::g_indirect;
 
 void Arm64EE::CodeGenerator::PatchLink(u8* slot, const void* target, u32 generation)
 {
@@ -1262,6 +1685,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
 		else if (IsTrapping(words[i]))
 			EmitTrapping(a, words[i], &exits[i]);
+		else if (IsQuadFunnelShift(words[i]))
+			EmitQuadFunnelShift(a, words[i], &exits[i]);
 		else if ((words[i] >> 26) == 18)
 			EmitCOP2(a, words[i], pc + i * 4);
 		else if ((words[i] >> 26) == 17)

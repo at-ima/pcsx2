@@ -20,4 +20,10 @@ namespace Arm64EE
 	void Reset();
 	void Shutdown();
 	size_t GetCommittedCache();
+	// C++ block lookups made by ExecuteChained(), for tests.
+	u64 GetDispatchCount();
+	// Tests run code from buffers the page tracking does not know about, so
+	// their blocks are never trusted and never linked. This trusts them anyway;
+	// the test then owns invalidation (Reset()) after changing code.
+	void SetTrustUntrackedForTesting(bool trust);
 } // namespace Arm64EE

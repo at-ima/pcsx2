@@ -602,7 +602,7 @@ TEST_F(EERecompilerTest, MemoryExitsPreserveUnexecutedInstructionAndCycleCharge)
 
 TEST_F(EERecompilerTest, UnsupportedAndUnsafeEntriesDoNotChangeState)
 {
-	for (u32 code : {Stop, 0x88220000u, 0x10220000u, 0x46020003u, 0x40026000u})
+	for (u32 code : {Stop, 0x88220000u, 0x10220000u, 0x46020016u, 0x4002c800u}) // ..., RSQRT.S, MFC0 $25
 	{
 		program[0] = code;
 		const cpuRegisters before = cpuRegs;
@@ -1220,7 +1220,8 @@ TEST_F(EERecompilerTest, UnsupportedPackedSelectorsRemainInterpreted)
 		for (u32 selector = 0; selector < 32; selector++)
 		{
 			const u32 code = PackedCode(function, selector);
-			if (std::find(std::begin(PackedInstructions), std::end(PackedInstructions), code) != std::end(PackedInstructions))
+			if (std::find(std::begin(PackedInstructions), std::end(PackedInstructions), code) != std::end(PackedInstructions) ||
+				code == PackedCode(40, 27) || code == PackedCode(9, 28) || code == PackedCode(41, 27)) // QFSRV, PMULTH, PCPYH
 				continue;
 			SCOPED_TRACE(testing::Message() << "function=" << function << " selector=" << selector);
 			InitPacked(0);
@@ -1494,12 +1495,12 @@ TEST_F(EERecompilerTest, COP1SurroundingIntegerCodeStaysNative)
 
 TEST_F(EERecompilerTest, COP1UnsupportedRemainsInterpreted)
 {
-	// DIV_S (function 3) is not in SupportsCOP1's Phase-1 whitelist; it must
-	// keep falling back to the interpreter rather than being mis-decoded by
+	// RSQRT_S (function 22) is not in SupportsCOP1's whitelist; it must keep
+	// falling back to the interpreter rather than being mis-decoded by
 	// EmitCOP1's arithmetic default case.
 	Init(0);
 	InitFPU(0);
-	program[0] = (17u << 26) | (16u << 21) | (2u << 16) | (1u << 11) | (3u << 6) | 3; // DIV.S f3, f1, f2
+	program[0] = (17u << 26) | (16u << 21) | (2u << 16) | (1u << 11) | (3u << 6) | 22; // RSQRT.S f3, f1, f2
 	const cpuRegisters before = cpuRegs;
 	const fpuRegisters before_fpu = fpuRegs;
 	u32 cycles = 123;
@@ -1508,7 +1509,6 @@ TEST_F(EERecompilerTest, COP1UnsupportedRemainsInterpreted)
 	EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
 	EXPECT_EQ(std::memcmp(&before_fpu, &fpuRegs, sizeof(fpuRegs)), 0);
 }
-#endif
 
 TEST_F(EERecompilerTest, TrappingArithmeticLeavesOverflowToInterpreter)
 {
@@ -1692,3 +1692,216 @@ TEST_F(EERecompilerTest, MemoryAndFpuDelaySlotsMatchInterpreter)
 	CompareBranch(0, true, false, false, Base + 64);
 	EXPECT_EQ(cpuRegs.GPR.r[3].UD[0], 7u);
 }
+
+TEST_F(EERecompilerTest, COP1DivideAccumulateAndMinMaxMatchInterpreter)
+{
+	// DIV_S, SQRT_S, ADDA/SUBA/MULA, MADD/MSUB, MADDA/MSUBA, MAX/MIN. Seeds
+	// below 64 take InitFPU's edge values, the rest random bit patterns.
+	constexpr u32 functions[] = {3, 4, 24, 25, 26, 28, 29, 30, 31, 40, 41};
+	constexpr u32 accumulators[] = {0x00000000, 0x80000000, 0x3f800000, 0xff7fffff, 0x7f800000, 0x00400000, 0xc2c80000};
+	for (u32 seed = 0; seed < 160; seed++)
+	{
+		const u32 fd = seed % 5, fs = 1 + (seed / 5) % 4, ft = 1 + (seed / 20) % 4; // fd may alias
+		for (u32 function : functions)
+		{
+			SCOPED_TRACE(testing::Message() << "function=" << function << " seed=" << seed);
+			Init(seed);
+			InitFPU(seed);
+			fpuRegs.ACC.UL = seed < 64 ? accumulators[seed % std::size(accumulators)] : fpuRegs.fpr[(seed + 7) % 32].UL;
+			fpuRegs.fprc[31] = 0x0003c078 ^ (seed << 3);
+			program[0] = (17u << 26) | (16u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | function;
+			CompareWithFPU(1);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, ShiftAmountAndMiscMultimediaMatchInterpreter)
+{
+	for (u32 seed = 0; seed < 96; seed++)
+	{
+		const u32 rs = 1 + seed % 4, rt = 1 + (seed / 4) % 4, rd = (seed / 16) % 4, sa = (seed * 7) % 32;
+		const u32 codes[] = {
+			PackedCode(52, sa) | (rt << 16) | (rd << 11), // PSLLH
+			PackedCode(54, sa) | (rt << 16) | (rd << 11), // PSRLH
+			PackedCode(55, sa) | (rt << 16) | (rd << 11), // PSRAH
+			PackedCode(60, sa) | (rt << 16) | (rd << 11), // PSLLW
+			PackedCode(62, sa) | (rt << 16) | (rd << 11), // PSRLW
+			PackedCode(63, sa) | (rt << 16) | (rd << 11), // PSRAW
+			PackedCode(41, 27) | (rt << 16) | (rd << 11), // PCPYH
+			PackedCode(9, 28) | (rs << 21) | (rt << 16) | (rd << 11), // PMULTH
+			(1u << 26) | (rs << 21) | (24 << 16) | ((seed * 40503) & 0xffff), // MTSAB
+			(1u << 26) | (rs << 21) | (25 << 16) | ((seed * 40503) & 0xffff), // MTSAH
+			(rs << 21) | 41, // MTSA
+			(rd << 11) | 40, // MFSA
+		};
+		for (u32 code : codes)
+		{
+			SCOPED_TRACE(testing::Message() << std::hex << "code=" << code << " seed=" << seed);
+			InitPacked(seed);
+			cpuRegs.sa = seed * 0x9e3779b9u;
+			program[0] = code;
+			program[1] = Stop;
+			Compare(1);
+			if (HasFailure())
+				return;
+		}
+		// QFSRV after MTSAB, which leaves SA in 0..15.
+		SCOPED_TRACE(testing::Message() << "QFSRV seed=" << seed);
+		InitPacked(seed);
+		program[0] = (1u << 26) | (rs << 21) | (24 << 16) | seed; // MTSAB
+		program[1] = PackedCode(40, 27) | (rs << 21) | (rt << 16) | (rd << 11); // QFSRV
+		Compare(2);
+		if (HasFailure())
+			return;
+	}
+	// A larger SA (only MTSA can set one) leaves QFSRV to the interpreter.
+	InitPacked(0);
+	cpuRegs.sa = 16;
+	program[0] = (9u << 26) | (4 << 16) | 5; // ADDIU r4, r0, 5
+	program[1] = PackedCode(40, 27) | (1 << 21) | (2 << 16) | (3 << 11);
+	Compare(1);
+	ExpectRejected();
+}
+
+TEST_F(EERecompilerTest, MoveFromCOP0MatchesInterpreter)
+{
+	for (u32 rd = 0; rd < 32; rd++)
+	{
+		if (rd == 25)
+			continue; // performance counters stay interpreted
+		for (u32 seed = 0; seed < 6; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "rd=" << rd << " seed=" << seed);
+			Init(seed);
+			for (u32 reg = 0; reg < 32; reg++)
+				cpuRegs.CP0.r[reg] = 0x89abcdefu * (reg + seed + 1);
+			cpuRegs.CP0.n.Config = (seed & 1) << 18;
+			cpuRegs.cycle = 0x123456789ULL * (seed + 1);
+			cpuRegs.lastCOP0Cycle = seed == 0 ? cpuRegs.cycle : cpuRegs.cycle - seed * 1000;
+			const u32 rt = seed % 3; // rt 0 still updates Count
+			program[0] = (16u << 26) | (rt << 16) | (rd << 11) | (seed & 7);
+			program[1] = (16u << 26) | (1 << 16) | (9 << 11); // a second Count read
+			Compare(2);
+			if (HasFailure())
+				return;
+		}
+	}
+	Init(0);
+	program[0] = 0x4002c800u; // MFC0 r2, $25
+	ExpectRejected();
+}
+
+TEST_F(EERecompilerTest, COP0BranchesFollowDmacCondition)
+{
+	const u32 stat = psHu32(DMAC_STAT), pcr = psHu32(DMAC_PCR);
+	constexpr u32 values[][2] = {{0x3ff, 0x3ff}, {0x000, 0x000}, {0x3fe, 0x3ff}, {0x001, 0x3fe}, {0x3ff0000, 0x0}, {0x155, 0x2aa}};
+	for (const auto& [s, p] : values)
+	{
+		for (u32 rt = 0; rt < 4; rt++)
+		{
+			for (u32 delay : {0u, (35u << 26) | (1 << 21) | (2 << 16) | 4})
+			{
+				SCOPED_TRACE(testing::Message() << std::hex << "stat=" << s << " pcr=" << p << " rt=" << rt << " delay=" << delay);
+				Init(0);
+				cpuRegs.GPR.r[1].UD[0] = Data;
+				psHu32(DMAC_STAT) = s;
+				psHu32(DMAC_PCR) = p;
+				program[0] = (16u << 26) | (8u << 21) | (rt << 16) | 3; // BC0x +3
+				program[1] = delay;
+				const bool condition = ((s | ~p) & 0x3ff) == 0x3ff;
+				const bool taken = condition == ((rt & 1) != 0), likely = (rt & 2) != 0;
+				CompareBranch(0, taken, likely, likely, Base + 16);
+			}
+		}
+	}
+	psHu32(DMAC_STAT) = stat;
+	psHu32(DMAC_PCR) = pcr;
+}
+
+TEST_F(EERecompilerTest, LinkedAndRegisterJumpsMatchSteppedExecution)
+{
+	// A loop that calls a function with JAL, returns with JR ra, and calls a
+	// second one through JALR. With untracked blocks trusted, static exits link
+	// and register jumps go through the indirect table, so the whole loop runs
+	// with a handful of C++ lookups.
+	struct TrustGuard
+	{
+		TrustGuard() { Arm64EE::SetTrustUntrackedForTesting(true); }
+		~TrustGuard() { Arm64EE::SetTrustUntrackedForTesting(false); }
+	} guard;
+	constexpr u32 iterations = 3000; // crosses kMaxChainedBlocks
+	auto build = [&](u32 increment) {
+		program.fill(Stop);
+		program[0] = (3u << 26) | ((Base + 64) >> 2); // JAL f
+		program[1] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // delay: ADDIU $1, $1, -1
+		program[2] = (5 << 21) | (31 << 11) | 9; // JALR $5 (g)
+		program[3] = 0; // delay: NOP
+		program[4] = (5u << 26) | (1 << 21) | 0xfffbu; // BNE $1, $0, Base
+		program[5] = (9u << 26) | (4 << 21) | (4 << 16) | 1u; // delay: ADDIU $4, $4, 1
+		program[16] = (9u << 26) | (2 << 21) | (2 << 16) | increment; // f: ADDIU $2, $2, increment
+		program[17] = (31 << 21) | 8; // JR ra
+		program[18] = (9u << 26) | (3 << 21) | (3 << 16) | 3u; // delay: ADDIU $3, $3, 3
+		program[32] = (31 << 21) | 8; // g: JR ra
+		program[33] = (0x19u << 26) | (6 << 21) | (6 << 16) | 5u; // delay: DADDIU $6, $6, 5
+		for (u32 i = 0; i < 8; i++)
+			program[48 + i] = (9u << 26) | (7 << 21) | (7 << 16) | (increment + i); // filler: ADDIU $7, $7, n
+	};
+	auto prepare = [&]() {
+		Init(0);
+		cpuRegs.GPR.r[1].UD[0] = iterations;
+		cpuRegs.GPR.r[5].UD[0] = Base + 128;
+		cpuRegs.nextEventCycle = u64(1) << 40; // keep events away, as in ChainedBlocksMatchOneBlockPerCall
+	};
+	auto run = [&](bool chained, u32& cycles) {
+		cycles = 0;
+		EEBlockResult result;
+		u32 calls = 0;
+		do
+		{
+			result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
+			if (result.exit == EEBlockExit::TakenBranch)
+			{
+				cpuRegs.branch = 1;
+				cpuRegs.pc = result.target;
+				cpuRegs.branch = 0;
+				cpuRegs.cycle += std::max(cycles >> 3, 1u);
+				cycles &= 7;
+			}
+			ASSERT_LT(++calls, 100000u);
+		} while (result);
+	};
+	for (u32 increment : {7u, 11u})
+	{
+		SCOPED_TRACE(testing::Message() << "increment=" << increment);
+		build(increment);
+		Arm64EE::Reset(); // the code changed; trusted blocks need an explicit drop
+		if (increment != 7)
+		{
+			// Compile something else first, so the loop's blocks land elsewhere
+			// in the code buffer than in the previous round.
+			prepare();
+			cpuRegs.pc = Base + 192;
+			u32 filler_cycles = 0;
+			ASSERT_TRUE(Arm64EE::TryExecute(filler_cycles));
+		}
+		prepare();
+		const u32 initial_r2 = cpuRegs.GPR.r[2].UL[0];
+		u32 stepped_cycles, chained_cycles;
+		run(false, stepped_cycles);
+		if (HasFatalFailure())
+			return;
+		const cpuRegisters stepped = cpuRegs;
+		EXPECT_EQ(stepped.GPR.r[2].UL[0], initial_r2 + increment * iterations); // ran every call
+		prepare();
+		const u64 dispatches = Arm64EE::GetDispatchCount();
+		run(true, chained_cycles);
+		if (HasFatalFailure())
+			return;
+		EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
+		EXPECT_EQ(chained_cycles, stepped_cycles);
+		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+	}
+}
+#endif

@@ -141,6 +141,8 @@ namespace
 	// directly (e.g. differential tests) see no change in behavior.
 	u32 s_last_dispatch_pc = 0;
 	const Block* s_last_dispatch_block = nullptr;
+	u64 s_dispatches = 0;
+	bool s_trust_untracked_for_testing = false;
 
 
 	u32 GetSupportedInstructionCount(const u32* source, u32 remaining)
@@ -200,7 +202,7 @@ namespace
 		// source, so mmap_MarkCountedRamPage() would protect an unrelated page.
 		if (tracked && (page_type == ProtMode_None || page_type == ProtMode_Write))
 			mmap_MarkCountedRamPage(pc);
-		block.trusted = tracked && page_type != ProtMode_Manual;
+		block.trusted = tracked ? page_type != ProtMode_Manual : s_trust_untracked_for_testing;
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
 			pc, source, std::span(block.words.data(), block.word_count),
@@ -353,6 +355,9 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 	// the generated code) exactly as the driver does them. Anything else goes
 	// back to the driver. Native links only return at an event deadline, so a
 	// pending exit request waits for the next event, as with the x86 recompiler.
+	// A JR/JALR does the same bookkeeping in generated code and enters its target
+	// through CodeGenerator::g_indirect, which this loop fills with every trusted
+	// block it dispatches; on a miss it returns NextBlock.
 	// needs proper testing across a wider range of games.
 	using namespace CodeGenerator;
 	g_link_state.chaining = 1;
@@ -362,9 +367,13 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 	u32 pending_generation = 0;
 	for (u32 blocks = 1;; blocks++)
 	{
+		s_dispatches++;
+		const u32 pc = cpuRegs.pc;
 		const Block* block = LookupBlock();
 		if (!block)
 			return {};
+		if (block->trusted)
+			g_indirect[IndirectIndex(pc)] = {pc, g_link_state.generation, reinterpret_cast<const void*>(block->function)};
 		// Link the exit that asked for it, unless blocks were dropped since (a
 		// write fault in the block, or a Reset() while looking this one up,
 		// which also rewinds the code buffer the slot lives in).
@@ -377,6 +386,12 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 		{
 			pending_slot = SysMemory::GetEERec() + (raw >> 32);
 			pending_generation = generation;
+			if (blocks >= kMaxChainedBlocks)
+				return {EEBlockExit::Continue, 0};
+			continue;
+		}
+		if (raw & NextBlock)
+		{
 			if (blocks >= kMaxChainedBlocks)
 				return {EEBlockExit::Continue, 0};
 			continue;
@@ -434,6 +449,17 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 size_t Arm64EE::GetCommittedCache()
 {
 	return s_write ? s_write - SysMemory::GetEERec() : 0;
+}
+
+u64 Arm64EE::GetDispatchCount()
+{
+	return s_dispatches;
+}
+
+void Arm64EE::SetTrustUntrackedForTesting(bool trust)
+{
+	s_trust_untracked_for_testing = trust;
+	Reset();
 }
 
 namespace

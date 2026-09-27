@@ -4,6 +4,7 @@
 #pragma once
 
 #include "Interpreter.h"
+#include <array>
 #include <span>
 
 namespace Arm64EE::CodeGenerator
@@ -36,6 +37,9 @@ namespace Arm64EE::CodeGenerator
 		// values (register transfer, S/W-format arithmetic) are not branches.
 		if (op == 17)
 			return ((code >> 21) & 31) == 8;
+		// COP0's BC0F/BC0T/BC0FL/BC0TL.
+		if (op == 16)
+			return ((code >> 21) & 31) == 8 && ((code >> 16) & 31) < 4;
 		return (op >= 2 && op <= 7) || (op >= 20 && op <= 23);
 	}
 	bool SupportsDelaySlot(u32 branch, u32 code);
@@ -64,6 +68,20 @@ namespace Arm64EE::CodeGenerator
 	constexpr u64 CyclesCommitted = 1u << 10; // the exit already added its cycles
 	constexpr u64 EventDue = 1u << 11; // pc and cycles committed; the event deadline passed
 	constexpr u64 LinkRequest = 1u << 12; // pc and cycles committed; bits 32-63 = slot offset from the code base
+	constexpr u64 NextBlock = 1u << 13; // pc and cycles committed, nothing due; look up the next block
+
+	// JR/JALR targets while chaining. ExecuteChained() records every trusted
+	// block it dispatches here by pc; a register jump whose target matches an
+	// entry of the current generation enters that block directly.
+	struct IndirectEntry
+	{
+		u32 pc;
+		u32 generation;
+		const void* code;
+	};
+	constexpr u32 IndirectBits = 12;
+	constexpr u32 IndirectIndex(u32 pc) { return (pc >> 2) & ((1u << IndirectBits) - 1); }
+	extern std::array<IndirectEntry, 1u << IndirectBits> g_indirect;
 	// A link slot is a B instruction followed by the generation it was linked in.
 	void PatchLink(u8* slot, const void* target, u32 generation);
 
