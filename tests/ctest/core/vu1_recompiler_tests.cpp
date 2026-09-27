@@ -2587,6 +2587,42 @@ TEST_F(VU1RecompilerTest, WaitqRetiresQBeforePairedUpperBroadcastRead)
 	}
 }
 
+TEST_F(VU1RecompilerTest, DivideRetiresPreviousQBeforePairedUpperBroadcastRead)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Same ordering as the WAITQ test above, through DIV/SQRT/RSQRT: their own
+	// pending-divide stall retires the previous divide's Q before the paired
+	// upper runs, so a same-pair MULq sees that value, not the one before it.
+	// VU0 had this bug first (139068d34); VU1 hoisted only WAITQ.
+	const u32 second_ops[] = {
+		0x800003bc | (1 << 23) | (3 << 16) | (3 << 11), // DIV VF3x, VF3y
+		0x800003bd | (1 << 23) | (3 << 16), // SQRT VF3y
+		0x800003be | (1 << 23) | (3 << 16) | (3 << 11), // RSQRT VF3x, VF3y
+	};
+	for (u32 second : second_ops)
+	{
+		for (u32 budget : {1u, 2u, 3u, 8u, 16u})
+		{
+			SCOPED_TRACE(testing::Message() << std::hex << "op=" << second << std::dec << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.VI[REG_Q].UL = 0x3f800000; // stale Q == 1.0
+			VU1.VF[1].F[0] = 5.0f;
+			VU1.VF[1].F[1] = 2.0f; // first divide: Q = 2.5
+			VU1.VF[3].F[0] = 9.0f;
+			VU1.VF[3].F[1] = 4.0f;
+			Put(0, 0x2ff, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y
+			// upper: VF2.xyzw = VF1 * Q (broadcast); lower: a second FDIV-pipe op.
+			Put(8, (15 << 21) | (1 << 11) | (2 << 6) | 0x1c, second);
+			for (u32 pc = 16; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, EsaddErsaddElengErlengComputeSumOfSquares)
 {
 	const VURegs initial = VU1, initial0 = VU0;

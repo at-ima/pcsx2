@@ -391,6 +391,13 @@ namespace
 	}
 
 
+	// The lower ops routed through the FDIV pipe, i.e. the ones the interpreter
+	// sends into _vuTestFDIVStalls before executing the pair.
+	bool IsFDIVPipe(Lower op)
+	{
+		return op == Lower::Div || op == Lower::Sqrt || op == Lower::Rsqrt || op == Lower::Waitq;
+	}
+
 	bool IsIntegerBranch(Lower op)
 	{
 		return op == Lower::Ibeq || op == Lower::Ibne || op == Lower::Ibgtz ||
@@ -1454,13 +1461,15 @@ namespace
 		                       0;
 		if (backup)
 			LoadVector(a, cache, q27, backup);
-		// WAITQ's stall-and-retire must land before the paired upper instruction
-		// runs: VU1microInterp.cpp calls _vuTestLowerStalls/_vuTestPipes ahead of
-		// _vu1ExecUpper, precisely so an upper op broadcasting Q in the same pair
-		// observes the freshly retired value instead of whatever was pending
-		// beforehand. EmitLower's own Waitq case still runs afterward but is then
-		// a no-op (fdiv.enable is already clear by the time it gets there).
-		if (!immediate && DecodeLower(ins.lower) == Lower::Waitq)
+		// Every FDIV-pipe op's stall-and-retire must land before the paired upper
+		// instruction runs: VU1microInterp.cpp calls _vuTestLowerStalls/
+		// _vuTestPipes ahead of _vu1ExecUpper, precisely so an upper op
+		// broadcasting Q in the same pair observes the freshly retired value
+		// instead of whatever was pending beforehand. This covers WAITQ and
+		// DIV/SQRT/RSQRT alike -- a "MULq + DIV" pair reads the *previous*
+		// divide's Q. EmitLower's own cases still call EmitFDIVStall afterwards,
+		// but it is then a no-op (fdiv.enable is already clear by then).
+		if (!immediate && IsFDIVPipe(DecodeLower(ins.lower)))
 			EmitFDIVStall(a);
 		if (publish_code)
 			StoreWord(a, ins.upper, offsetof(VURegs, code));
