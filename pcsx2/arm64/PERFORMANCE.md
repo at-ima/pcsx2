@@ -2555,6 +2555,39 @@ schedules more of the generic pairs instead.
   - Cycles per VU1 cycle: 25.46 -> 23.23 (-8.8%).
   - Each pair moved the same way.
 
+**Readiness with a divide in flight.** Per-pair counters on the same state,
+after the change above, split executed pairs into 30.4% deferred, 32.6%
+scheduled outside a region and 37.0% generic. The largest generic groups:
+
+| Share of all pairs | Reason |
+| --- | --- |
+| 8.0% | Inside an EFU op's latency |
+| 7.5% | Scheduled at compile time, but the readiness bit was off |
+| 7.5% + 1.8% | After an ILW (`integer_ready`, integer wait) |
+| 3.4% | Q writers (DIV/SQRT/RSQRT/WAITQ) |
+| 2.5% | First seven pairs of unprofiled blocks |
+
+Of the readiness misses, 89% found the FDIV slot busy. Examples are an ILW
+inside a divide's latency, or a guard entered with a divide pending. The
+recheck then failed, and nothing rechecks until the next generic pair.
+Those pairs carry `fdiv_pending` and retire the slot themselves at runtime,
+so readiness now skips the FDIV check for them. The divide in flight there
+is either the block's own or the profiled incoming one, and later pairs are
+past its latency. `ReadinessPassesOnlyDividesThePairRetires` covers an
+unknown incoming divide. Skipping the check for every pair passes all the
+older tests, but fails this one.
+
+- Readiness misses: 7.5% -> 0%. Deferred pairs: 30.4% -> 32.5%. Scheduled
+  pairs outside a region: 32.6% -> 38.1%.
+- ABBA, three pairs:
+  - Instructions per VU1 cycle: 135.4 -> 130.1 (-4.0%), stable in every pair.
+  - Cycles: the first pair gave 23.83 -> 23.52. Two HEAD runs in the middle
+    jumped to 29.5-29.8 cycles, with unchanged instructions and fewer
+    samples. That was host interference, so this measurement has no reliable
+    cycle figure.
+- Next candidates: handle EFU latency like FDIV (retire into P inline), and
+  retire the IALU entry inline after an ILW.
+
 Per-pair MAC/status flag computation is about 25 instructions of a deferred
 FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
 but it conflicts with this design's exact interpreter state at every pair

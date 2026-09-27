@@ -3381,4 +3381,59 @@ TEST_F(VU1RecompilerTest, UnprofiledEntryWaitsForIncomingDivideOrEfu)
 			}
 }
 
+TEST_F(VU1RecompilerTest, ReadinessPassesOnlyDividesThePairRetires)
+{
+	// A readiness check that finds the FDIV slot busy may enable the schedule
+	// only for a pair that retires the slot itself. Case 0: an unknown incoming
+	// divide (the short EFU op keeps the entry unprofiled), which no scheduled
+	// pair retires; the ADDq must still see it land. Case 1: the block's own
+	// DIV, then an ILW whose readiness recheck runs inside the divide's latency.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 variant = 0; variant < 2; variant++)
+		for (bool unprofiled : {false, true})
+			for (u32 latency : {9u, 13u})
+				for (u32 reader : {12u, 18u, 24u})
+				{
+					// The block's own DIV has a fixed latency.
+					if ((variant == 0 && !unprofiled) || (variant == 1 && latency != 9))
+						continue;
+					for (u32 i = 0; i < 40; i++)
+						Put(i * 8, (15 << 21) | (6 << 16) | (5 << 11) | ((1 + i % 4) << 6) | 0x28, 0x8000033c); // ADD VFn, VF5, VF6
+					if (variant == 1)
+					{
+						Put(8 * 8, 0x2ff, 0x800003bc | (1 << 23) | (6 << 16) | (5 << 11)); // DIV Q, VF5x, VF6y
+						Put(9 * 8, 0x2ff, 0x08000000 | (8 << 21) | (3 << 16)); // ILW.x VI3, 0(VI0)
+					}
+					Put(reader * 8, (15 << 21) | (5 << 11) | (8 << 6) | 0x20, 0x8000033c); // ADDq VF8, VF5, Q
+					for (u32 pc = 40 * 8; pc < VU1_PROGSIZE; pc += 8)
+						Put(pc, 0x800002ff, 0x3f800000);
+					for (u32 budget : {12u, 20u, 32u, 48u})
+					{
+						SCOPED_TRACE(testing::Message() << "variant=" << variant << " unprofiled=" << unprofiled
+						                                << " latency=" << latency << " reader=" << reader << " budget=" << budget);
+						CpuArm64VU1.Reset();
+						VU0 = initial0;
+						VU1 = initial;
+						VU1.cycle = 1000;
+						if (unprofiled)
+						{
+							VU1.efu.enable = 1;
+							VU1.efu.sCycle = VU1.cycle;
+							VU1.efu.Cycle = 5;
+							VU1.efu.reg.UL = 0x3e800000;
+						}
+						if (variant == 0)
+						{
+							VU1.fdiv.enable = 1;
+							VU1.fdiv.sCycle = VU1.cycle;
+							VU1.fdiv.Cycle = latency;
+							VU1.fdiv.reg.UL = 0x3fc00000;
+						}
+						Compare(budget);
+						if (HasFatalFailure())
+							return;
+					}
+				}
+}
+
 #endif

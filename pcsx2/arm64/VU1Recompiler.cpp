@@ -2036,7 +2036,12 @@ namespace
 		}
 	}
 
-	void EmitScheduleReadiness(MacroAssembler& a)
+	// `fdiv_pending`: the pair retires the FDIV slot itself (EmitFDIVSlotRetire
+	// checks it at runtime), so a busy divide does not block it. The divide in
+	// flight there is the block's own or the profiled incoming one: an in-block
+	// divide stalls until any earlier one retires, and every later pair that
+	// does not retire the slot is past that divide's latency.
+	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false)
 	{
 		// Bit 0 validates incoming FMAC timing and excludes callbacks. Bit 1
 		// additionally permits scheduled execution once special queues drain.
@@ -2046,6 +2051,8 @@ namespace
 		for (size_t offset : {offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable),
 				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount)})
 		{
+			if (fdiv_pending && offset == offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable))
+				continue;
 			a.Ldr(w9, Field(offset));
 			a.Cbnz(w9, &done);
 		}
@@ -2601,7 +2608,7 @@ namespace
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || region_start))
 				{
-					EmitScheduleReadiness(a);
+					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending);
 					readiness_checked = true;
 				}
 				if (region_start)
