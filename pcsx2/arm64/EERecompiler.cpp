@@ -24,6 +24,12 @@ namespace
 		std::array<u32, MaxInstructions + 1> cycles{};
 		const u32* source = nullptr;
 		Function function = nullptr;
+		// Source bytes are guaranteed unchanged while this block exists: its
+		// page was write-protected (or is not RAM) when it was compiled, and
+		// every way out of that state -- a write fault, a TLB remap, a
+		// tracking reset -- drops all blocks. Decided once in Compile() so
+		// the dispatcher does not query page protection on every entry.
+		bool trusted = false;
 	};
 	// std::deque never invalidates references to existing elements when more
 	// are appended (unlike std::vector), so pointers handed out into this
@@ -189,6 +195,7 @@ namespace
 		// source, so mmap_MarkCountedRamPage() would protect an unrelated page.
 		if (tracked && (page_type == ProtMode_None || page_type == ProtMode_Write))
 			mmap_MarkCountedRamPage(pc);
+		block.trusted = tracked && page_type != ProtMode_Manual;
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
 			pc, source, std::span(block.words.data(), block.word_count));
@@ -239,50 +246,53 @@ EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 		Reset();
 	// Checked before s_lookup: see the comment on its declaration. Reset() /
 	// ClearProvider() invalidate it alongside s_lookup and the block table.
+	// s_lookup is only touched on a miss here; it is large enough that reading
+	// it unconditionally cost a cache miss on most dispatches.
 	const Block* block = s_last_dispatch_pc == pc ? s_last_dispatch_block : nullptr;
+	LookupEntry* lookup = nullptr;
 	// Mix page and instruction bits to avoid concentrating same-offset blocks
 	// in one slot. The full PC tag keeps virtual aliases distinct.
-	LookupEntry& lookup = s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)];
-	if (!block)
-		block = lookup.pc == pc ? lookup.block : nullptr;
+	const auto get_lookup = [pc]() { return &s_lookup[((pc >> 2) ^ (pc >> 12)) & (s_lookup.size() - 1)]; };
 	if (!block)
 	{
-		// Only opcode-level rejection is cached here. Branch/delay rejection
-		// still uses a Block and validates both instruction words below.
-		if (lookup.pc == pc && lookup.rejected_source == source && lookup.rejected_word == source[0])
-			return {};
-		block = FindBlock(pc);
-		lookup = {pc, 0, block, nullptr};
+		lookup = get_lookup();
+		block = lookup->pc == pc ? lookup->block : nullptr;
+		if (!block)
+		{
+			// Only opcode-level rejection is cached here. Branch/delay rejection
+			// still uses a Block and validates both instruction words below.
+			if (lookup->pc == pc && lookup->rejected_source == source && lookup->rejected_word == source[0])
+				return {};
+			block = FindBlock(pc);
+			*lookup = {pc, 0, block, nullptr};
+		}
 	}
-	// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
-	// separate *physical* (pmap) mapping, not the vmap lookup that produced
-	// source above; they normally agree for real PS2 RAM, but nothing
-	// guarantees it (e.g. a vmap override onto host memory pmap knows nothing
-	// about -- exactly what the recompiler unit tests do to inject synthetic
-	// code buffers). Only trust write-protection tracking when the two
-	// mappings actually resolve to the same byte, so a mismatch just falls
-	// back to the always-safe per-entry memcmp below instead of silently
-	// tracking -- or protecting -- the wrong page.
-	const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
-	const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
-	// Write-protected (unchanged since compile) and non-RAM pages need no
-	// per-entry recheck; ClearProvider() drops any block a protection fault
-	// invalidates. None (never protected, or untracked) and Manual (faulted
-	// at least once, vtlb.cpp's permanent brute-force fallback) still need
-	// it every entry.
-	const bool trust_cache = page_type == ProtMode_Write || page_type == ProtMode_NotRequired;
+	// Trusted blocks need no per-entry recheck (see Block::trusted). Others --
+	// compiled on a page that already faulted (ProtMode_Manual), or whose
+	// physical mapping does not match source -- compare every entry.
 	if (!block || block->source != source ||
-		(!trust_cache && std::memcmp(source, block->words.data(), block->word_count * 4) != 0))
+		(!block->trusted && std::memcmp(source, block->words.data(), block->word_count * 4) != 0))
 	{
+		if (!lookup)
+			lookup = get_lookup();
 		// Validated cache hits need no opcode decoding. Avoid allocating entries
 		// for unsupported entry instructions on the interpreter fallback path.
 		if (!CodeGenerator::Supports(source[0]))
 		{
-			lookup = {pc, source[0], nullptr, source};
+			*lookup = {pc, source[0], nullptr, source};
 			return {};
 		}
+		// mmap_GetRamPageInfo()/mmap_MarkCountedRamPage() key off pc through the
+		// separate *physical* (pmap) mapping, not the vmap lookup that produced
+		// source above; they normally agree for real PS2 RAM, but nothing
+		// guarantees it (e.g. a vmap override onto host memory pmap knows nothing
+		// about -- exactly what the recompiler unit tests do to inject synthetic
+		// code buffers). Only use write-protection tracking when the two
+		// mappings actually resolve to the same byte.
+		const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
+		const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
 		block = &Compile(pc, source, page_type, tracked);
-		lookup = {pc, 0, block, nullptr};
+		*lookup = {pc, 0, block, nullptr};
 	}
 	if (!block->function)
 		return {};
