@@ -14,6 +14,7 @@ sections unless a section says so.
 | 09-21..22 | Ridge Racer V | "Ridge Racer V: VU0 correctness" |
 | 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
 | 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" (includes block linking) |
+| 09-27 | Burnout 3 | "Burnout 3: EE interpreter fallbacks" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2515,6 +2516,54 @@ Per-pair MAC/status flag computation is about 25 instructions of a deferred
 FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
 but it conflicts with this design's exact interpreter state at every pair
 boundary. Needs proper testing across more games.
+
+## Burnout 3: EE interpreter fallbacks
+
+2026-09-27, `BURN_OUT_3_003` save state. About 15 s after loading, the race
+drops to 44-57 fps with the EE thread at 99.8% and VU1 at 72-87%. The EE is
+the limit here, not VU1.
+
+**Profile.** On the EE thread, generated EE code is about 44% of samples,
+IOP about 10% and the VU0 microprogram about 5%. A temporary counter on the
+driver's `NotHandled` path showed, per million EE cycles, about 19.9K
+interpreted instructions and 80.9K C++ dispatches. Each interpreted
+instruction also ends the native block before it and needs a lookup after it.
+The interpreted instructions were:
+
+| Share | Instructions |
+| --- | --- |
+| 27% | LQC2, SQC2 |
+| 15% | ADD, ADDI, SUB (overflow-trapping forms) |
+| 13% | branches with a load or store in the delay slot |
+| 8% | COP1 DIV.S, MADD.S, ADDA.S, MAX.S, MIN.S |
+| 6% | MMI QFSRV, MTSAB, PCPYH, PSRAW |
+| 4% | BC0F (with a NOP delay slot) |
+| 3% | SYNC, PREF, CACHE |
+
+**Changes.**
+
+- LQC2/SQC2 go through the RAM fast path. If a VU0 microprogram is running
+  (`vu0Sync()` would have work) or the address is unaligned, they leave the
+  block first and the interpreter runs them.
+- ADD/ADDI/SUB/DADD/DADDI/DSUB are native. On overflow they leave the block
+  before the instruction, so the interpreter raises the exception. SUB
+  follows the interpreter's check (negate rt, then check the addition). That
+  differs from a real subtraction only for the most negative rt. These stay
+  out of delay slots.
+- SYNC and PREF compile to nothing.
+- A branch's delay slot can hold a load or store (including LQC2/SQC2 and
+  LWC1/SWC1) or a supported COP1 operation. The delay slot's address checks
+  run before the branch writes its link register. When the interpreter has
+  to perform the access, the block leaves before the branch. A delay-slot
+  store needs no self-modification exit: nothing of the block runs after it,
+  and a write fault drops every block and link. A delay-slot base register
+  equal to the link register is not compiled.
+
+**Result.** Interpreted instructions dropped to 5.1K and dispatches to 56.8K
+per million EE cycles. The section now runs at 59.9 fps, with the EE thread
+at 70-90%. There are still short spikes to 99%. Remaining fallbacks: BC0F
+14%, DIV.S 12%, QFSRV/MTSAB 13%, PCPYH 6%, MADD.S 6%, PSRAW 5%, MFC0 5%,
+MAX.S/MIN.S 9%. Needs proper testing across more games.
 
 ## Known gaps (2026-09-26)
 

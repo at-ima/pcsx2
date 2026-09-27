@@ -4,6 +4,7 @@
 #include "Common.h"
 #include "arm64/EECodeGenerator.h"
 #include "R5900OpcodeTables.h"
+#include "VU.h"
 #include "vtlb.h"
 #include "common/HostSys.h"
 #include "vixl/aarch64/macro-assembler-aarch64.h"
@@ -86,9 +87,24 @@ namespace
 		return {};
 	}
 
+	// ADD/ADDI/SUB and their doubleword forms raise an overflow exception. The
+	// native code leaves the block before one of them when it would overflow,
+	// so the interpreter raises it; they are therefore not allowed in delay slots.
+	bool IsTrapping(u32 code)
+	{
+		const u32 op = code >> 26, function = code & 63;
+		return op == 8 || op == 24 || (op == 0 && (function == 32 || function == 34 || function == 44 || function == 46));
+	}
+
+	// SYNC and PREF do nothing in the interpreter.
+	bool IsNop(u32 code)
+	{
+		return (code >> 26) == 51 || ((code >> 26) == 0 && (code & 63) == 15);
+	}
+
 	bool SupportsInteger(u32 code)
 	{
-		if (IsHiLo(code) || DecodePacked(code).op != PackedOp::None)
+		if (IsHiLo(code) || DecodePacked(code).op != PackedOp::None || IsNop(code))
 			return true;
 		switch (code >> 26)
 		{
@@ -366,8 +382,42 @@ namespace
 			a.Str(x11, GPR(rd));
 	}
 
+	void EmitTrapping(MacroAssembler& a, u32 code, Label* before)
+	{
+		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
+		const u32 dest = op ? rt : (code >> 11) & 31;
+		const bool doubleword = op == 24 || (!op && (code & 63) >= 44);
+		// The interpreter negates rt and then checks the addition, which differs
+		// from a subtraction's overflow only for the most negative rt.
+		const bool subtract = !op && ((code & 63) == 34 || (code & 63) == 46);
+		a.Ldr(x9, GPR(rs));
+		if (op)
+			a.Mov(x10, static_cast<u64>(static_cast<s64>(static_cast<int16_t>(code))));
+		else
+			a.Ldr(x10, GPR(rt));
+		if (doubleword)
+		{
+			if (subtract)
+				a.Neg(x10, x10);
+			a.Adds(x9, x9, x10);
+			a.B(vs, before);
+		}
+		else
+		{
+			if (subtract)
+				a.Neg(w10, w10);
+			a.Adds(w9, w9, w10);
+			a.B(vs, before);
+			a.Sxtw(x9, w9);
+		}
+		if (dest)
+			a.Str(x9, GPR(dest));
+	}
+
 	void Emit(MacroAssembler& a, u32 code)
 	{
+		if (IsNop(code))
+			return;
 		const PackedInstruction packed = DecodePacked(code);
 		if (packed.op != PackedOp::None)
 		{
@@ -747,6 +797,193 @@ namespace
 		}
 	}
 
+	u32 MemorySize(u32 code)
+	{
+		switch (code >> 26)
+		{
+			case 30:
+			case 31:
+			case 54:
+			case 62:
+				return 16; // LQ, SQ, LQC2, SQC2
+			case 55:
+			case 63:
+				return 8; // LD, SD
+			case 35:
+			case 39:
+			case 43:
+			case 49:
+			case 57:
+				return 4; // LW, LWU, SW, LWC1, SWC1
+			case 33:
+			case 37:
+			case 41:
+				return 2; // LH, LHU, SH
+			case 32:
+			case 36:
+			case 40:
+				return 1; // LB, LBU, SB
+			default:
+				return 0;
+		}
+	}
+
+	bool IsVU0Transfer(u32 code)
+	{
+		return (code >> 26) == 54 || (code >> 26) == 62; // LQC2, SQC2
+	}
+
+	// Leaves the host address of a RAM access in x12, or branches to `before`
+	// when the interpreter has to perform it. Clobbers x9-x12 only.
+	void EmitAddress(MacroAssembler& a, u32 code, Label* before)
+	{
+		const u32 op = code >> 26, rs = (code >> 21) & 31;
+		const u32 size = MemorySize(code);
+		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63 || op == 57 || op == 62;
+		if (IsVU0Transfer(code))
+		{
+			// vu0Sync(): let the interpreter catch a running microprogram up first.
+			a.Mov(x10, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+			a.Ldr(w10, MemOperand(x10));
+			a.Tbnz(w10, 0, before);
+		}
+		a.Ldr(w9, GPR(rs));
+		a.Add(w9, w9, static_cast<int16_t>(code));
+		// LQ/SQ ignore the low address bits. LQC2/SQC2 pass them on to the
+		// memory handlers, so the interpreter keeps the unaligned ones.
+		if (size == 16 && !IsVU0Transfer(code))
+			a.And(w9, w9, 0xfffffff0);
+		else if (size > 1)
+		{
+			a.Tst(w9, size - 1);
+			a.B(ne, before); // interpreter raises the original address error
+		}
+		if (!store && size <= 4)
+		{
+			// Counter reads can run event tests even when mapped directly.
+			a.Lsr(w11, w9, 13);
+			a.Cmp(w11, 0x8000);
+			a.B(eq, before);
+		}
+		a.Lsr(w11, w9, vtlb_private::VTLB_PAGE_BITS);
+		a.Ldr(x12, MemOperand(x14, x11, LSL, 3));
+		a.Add(x12, x12, x9);
+		a.Tbnz(x12, 63, before); // MMIO and unmapped accesses stay in the interpreter
+	}
+
+	// Performs the access at x12. A store overlapping this block's source
+	// branches to `after` when one is given.
+	void EmitAccess(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes, Label* after)
+	{
+		const u32 op = code >> 26, rt = (code >> 16) & 31;
+		const u32 size = MemorySize(code);
+		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63 || op == 57 || op == 62;
+		const bool fpu = op == 49 || op == 57; // LWC1/SWC1 target fpuRegs.fpr, not a GPR
+		// Match the architectural PC/code at the access, including host write faults.
+		a.Mov(w13, pc + 4);
+		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, pc)));
+		a.Mov(w13, code);
+		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, code)));
+		if (store)
+		{
+			if (IsVU0Transfer(code))
+			{
+				a.Mov(x10, reinterpret_cast<uintptr_t>(&VU0.VF[rt]));
+				a.Ldr(q0, MemOperand(x10));
+				a.Str(q0, MemOperand(x12));
+			}
+			else if (size == 16)
+			{
+				a.Ldr(q0, GPR(rt));
+				a.Str(q0, MemOperand(x12));
+			}
+			else if (fpu)
+			{
+				a.Ldr(w10, FPR(rt));
+				a.Str(w10, MemOperand(x12));
+			}
+			else
+			{
+				a.Ldr(x10, GPR(rt));
+				if (size == 8)
+					a.Str(x10, MemOperand(x12));
+				else if (size == 4)
+					a.Str(w10, MemOperand(x12));
+				else if (size == 2)
+					a.Strh(w10, MemOperand(x12));
+				else
+					a.Strb(w10, MemOperand(x12));
+			}
+			if (after)
+			{
+				// Compare host addresses so virtual aliases also detect self-modifying code.
+				a.Mov(x13, reinterpret_cast<uintptr_t>(source) - (size - 1));
+				a.Sub(x13, x12, x13);
+				a.Cmp(x13, source_bytes + size - 1);
+				a.B(lo, after);
+			}
+		}
+		else
+		{
+			switch (op)
+			{
+				case 30:
+				case 54:
+					a.Ldr(q0, MemOperand(x12));
+					break;
+				case 32:
+					a.Ldrsb(x10, MemOperand(x12));
+					break;
+				case 33:
+					a.Ldrsh(x10, MemOperand(x12));
+					break;
+				case 35:
+					a.Ldrsw(x10, MemOperand(x12));
+					break;
+				case 36:
+					a.Ldrb(w10, MemOperand(x12));
+					break;
+				case 37:
+					a.Ldrh(w10, MemOperand(x12));
+					break;
+				case 39:
+				case 49:
+					a.Ldr(w10, MemOperand(x12));
+					break;
+				case 55:
+					a.Ldr(x10, MemOperand(x12));
+					break;
+			}
+			if (IsVU0Transfer(code))
+			{
+				// LQC2 into vf0 reads and discards, like the interpreter.
+				if (rt)
+				{
+					a.Mov(x10, reinterpret_cast<uintptr_t>(&VU0.VF[rt]));
+					a.Str(q0, MemOperand(x10));
+				}
+			}
+			else if (fpu)
+			{
+				// Unlike GPR r0, fpr[0] is a real writable register.
+				a.Str(w10, FPR(rt));
+			}
+			else if (rt)
+			{
+				if (size == 16)
+					a.Str(q0, GPR(rt));
+				else
+					a.Str(x10, GPR(rt));
+			}
+		}
+	}
+
+	void EmitMemory(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes,
+		Label* before, Label* after)
+	{
+		EmitAddress(a, code, before);
+		EmitAccess(a, code, pc, source, source_bytes, after);
+	}
 	// Set by Compile() for the block being emitted.
 	struct ExitInfo
 	{
@@ -871,14 +1108,28 @@ namespace
 		}
 	}
 
-	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding)
+	u32 BranchLink(u32 code)
+	{
+		const u32 op = code >> 26, rt = (code >> 16) & 31;
+		return op == 3 || (op == 1 && (rt & 16)) ? 31 : op == 0 && (code & 63) == 9 ? (code >> 11) & 31 :
+		                                                                              0;
+	}
+
+	// `before` exits ahead of the branch. A memory delay slot resolves its
+	// address first, so an access the interpreter has to perform leaves before
+	// the link register or anything else is written, and the interpreter then
+	// runs the branch and its delay slot.
+	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding, const u32* source,
+		u32 source_bytes, Label* before)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
 		const bool conditional = op != 0 && op != 2 && op != 3;
 		const bool likely = (op >= 20 && op <= 23) || (op == 1 && (rt & 2)) || (op == 17 && (rt & 2));
-		const u32 link = op == 3 || (op == 1 && (rt & 16)) ? 31 : op == 0 && (code & 63) == 9 ? (code >> 11) & 31 :
-		                                                                                        0;
+		const u32 link = BranchLink(code);
+		const bool memory_delay = MemorySize(delay) != 0;
+		if (memory_delay)
+			EmitAddress(a, delay, before); // x12 stays live until EmitAccess below
 		// Capture register targets before either the link or delay slot overwrites
 		// their source. x15 is preserved by the nontrapping integer emitter.
 		if (op == 0)
@@ -922,7 +1173,14 @@ namespace
 			}
 			a.B(InvertCondition(taken), &untaken);
 		}
-		Emit(a, delay);
+		// Nothing of this block runs after its delay slot, so a store there needs
+		// no self-modification exit: a write fault drops every block and link.
+		if (memory_delay)
+			EmitAccess(a, delay, pc + 4, source, source_bytes, nullptr);
+		else if ((delay >> 26) == 17)
+			EmitCOP1(a, delay);
+		else
+			Emit(a, delay);
 		EmitPosition(a, pc + 8, delay);
 		// JR/JALR targets are only known at run time; those still return.
 		if (s_exit.linkable && op != 0)
@@ -952,152 +1210,23 @@ namespace
 		}
 	}
 
-	u32 MemorySize(u32 code)
-	{
-		switch (code >> 26)
-		{
-			case 30:
-			case 31:
-				return 16; // LQ, SQ
-			case 55:
-			case 63:
-				return 8; // LD, SD
-			case 35:
-			case 39:
-			case 43:
-			case 49:
-			case 57:
-				return 4; // LW, LWU, SW, LWC1, SWC1
-			case 33:
-			case 37:
-			case 41:
-				return 2; // LH, LHU, SH
-			case 32:
-			case 36:
-			case 40:
-				return 1; // LB, LBU, SB
-			default:
-				return 0;
-		}
-	}
-
-	void EmitMemory(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes,
-		Label* before, Label* after)
-	{
-		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
-		const u32 size = MemorySize(code);
-		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63 || op == 57;
-		const bool fpu = op == 49 || op == 57; // LWC1/SWC1 target fpuRegs.fpr, not a GPR
-		a.Ldr(w9, GPR(rs));
-		a.Add(w9, w9, static_cast<int16_t>(code));
-		if (size == 16)
-			a.And(w9, w9, 0xfffffff0);
-		else if (size > 1)
-		{
-			a.Tst(w9, size - 1);
-			a.B(ne, before); // interpreter raises the original address error
-		}
-		if (!store && size <= 4)
-		{
-			// Counter reads can run event tests even when mapped directly.
-			a.Lsr(w11, w9, 13);
-			a.Cmp(w11, 0x8000);
-			a.B(eq, before);
-		}
-		a.Lsr(w11, w9, vtlb_private::VTLB_PAGE_BITS);
-		a.Ldr(x12, MemOperand(x14, x11, LSL, 3));
-		a.Add(x12, x12, x9);
-		a.Tbnz(x12, 63, before); // MMIO and unmapped accesses stay in the interpreter
-		// Match the architectural PC/code at the access, including host write faults.
-		a.Mov(w13, pc + 4);
-		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, pc)));
-		a.Mov(w13, code);
-		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, code)));
-		if (store)
-		{
-			if (size == 16)
-			{
-				a.Ldr(q0, GPR(rt));
-				a.Str(q0, MemOperand(x12));
-			}
-			else if (fpu)
-			{
-				a.Ldr(w10, FPR(rt));
-				a.Str(w10, MemOperand(x12));
-			}
-			else
-			{
-				a.Ldr(x10, GPR(rt));
-				if (size == 8)
-					a.Str(x10, MemOperand(x12));
-				else if (size == 4)
-					a.Str(w10, MemOperand(x12));
-				else if (size == 2)
-					a.Strh(w10, MemOperand(x12));
-				else
-					a.Strb(w10, MemOperand(x12));
-			}
-			// Compare host addresses so virtual aliases also detect self-modifying code.
-			a.Mov(x13, reinterpret_cast<uintptr_t>(source) - (size - 1));
-			a.Sub(x13, x12, x13);
-			a.Cmp(x13, source_bytes + size - 1);
-			a.B(lo, after);
-		}
-		else
-		{
-			switch (op)
-			{
-				case 30:
-					a.Ldr(q0, MemOperand(x12));
-					break;
-				case 32:
-					a.Ldrsb(x10, MemOperand(x12));
-					break;
-				case 33:
-					a.Ldrsh(x10, MemOperand(x12));
-					break;
-				case 35:
-					a.Ldrsw(x10, MemOperand(x12));
-					break;
-				case 36:
-					a.Ldrb(w10, MemOperand(x12));
-					break;
-				case 37:
-					a.Ldrh(w10, MemOperand(x12));
-					break;
-				case 39:
-				case 49:
-					a.Ldr(w10, MemOperand(x12));
-					break;
-				case 55:
-					a.Ldr(x10, MemOperand(x12));
-					break;
-			}
-			if (fpu)
-			{
-				// Unlike GPR r0, fpr[0] is a real writable register.
-				a.Str(w10, FPR(rt));
-			}
-			else if (rt)
-			{
-				if (size == 16)
-					a.Str(q0, GPR(rt));
-				else
-					a.Str(x10, GPR(rt));
-			}
-		}
-	}
 } // namespace
 
 bool Arm64EE::CodeGenerator::Supports(u32 code)
 {
-	return SupportsInteger(code) || MemorySize(code) != 0 || IsBranch(code) ||
+	return SupportsInteger(code) || IsTrapping(code) || MemorySize(code) != 0 || IsBranch(code) ||
 	       ((code >> 26) == 18 && SupportsCOP2(code)) || ((code >> 26) == 17 && SupportsCOP1(code));
 }
 
-bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 code)
+bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 branch, u32 code)
 {
-	return SupportsInteger(code);
+	if (MemorySize(code))
+	{
+		// The address is computed before the branch writes its link register.
+		const u32 link = BranchLink(branch);
+		return !link || link != ((code >> 21) & 31);
+	}
+	return SupportsInteger(code) || ((code >> 26) == 17 && SupportsCOP1(code));
 }
 
 Arm64EE::CodeGenerator::LinkState Arm64EE::CodeGenerator::g_link_state;
@@ -1126,11 +1255,13 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	{
 		if (IsBranch(words[i]))
 		{
-			EmitBranch(a, words[i], words[i + 1], pc + i * 4, i);
+			EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]);
 			break;
 		}
 		if (MemorySize(words[i]))
 			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
+		else if (IsTrapping(words[i]))
+			EmitTrapping(a, words[i], &exits[i]);
 		else if ((words[i] >> 26) == 18)
 			EmitCOP2(a, words[i], pc + i * 4);
 		else if ((words[i] >> 26) == 17)

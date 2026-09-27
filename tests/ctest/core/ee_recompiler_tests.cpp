@@ -42,9 +42,9 @@ namespace
 	constexpr u32 Data = 0x20000;
 	constexpr u32 Alias = Base + 0x4000;
 	constexpr u32 Stop = 0x0000000c; // SYSCALL ends the block before its side effects.
-	constexpr u32 Immediate[] = {9, 10, 11, 12, 13, 14, 15, 25};
-	constexpr u32 Special[] = {0, 2, 3, 4, 6, 7, 10, 11, 20, 22, 23, 33, 35, 36,
-		37, 38, 39, 42, 43, 45, 47, 56, 58, 59, 60, 62, 63};
+	constexpr u32 Immediate[] = {9, 10, 11, 12, 13, 14, 15, 25, 51}; // 51 = PREF
+	constexpr u32 Special[] = {0, 2, 3, 4, 6, 7, 10, 11, 15, 20, 22, 23, 33, 35, 36,
+		37, 38, 39, 42, 43, 45, 47, 56, 58, 59, 60, 62, 63}; // 15 = SYNC
 	constexpr u32 HiLoInstructions[] = {
 		16, 17, 18, 19, 24, 25, 26, 27,
 		(28u << 26) | 16, (28u << 26) | 17, (28u << 26) | 18, (28u << 26) | 19,
@@ -184,11 +184,20 @@ namespace
 		void CompareBranch(u32 prefix, bool taken, bool likely, bool event, u32 target, u32 link = 0)
 		{
 			const cpuRegisters initial = cpuRegs;
+			const VURegs initial_vu0 = VU0;
+			const fpuRegisters initial_fpu = fpuRegs;
+			const auto initial_memory = memory;
 			u32 native_cycles = 0xfffffff0;
 			const EEBlockResult result = Arm64EE::TryExecute(native_cycles);
 			ASSERT_TRUE(result);
 			const cpuRegisters actual = cpuRegs;
+			const VURegs actual_vu0 = VU0;
+			const fpuRegisters actual_fpu = fpuRegs;
+			const auto actual_memory = memory;
 			cpuRegs = initial;
+			VU0 = initial_vu0;
+			fpuRegs = initial_fpu;
+			memory = initial_memory;
 			u32 expected_cycles = 0xfffffff0;
 			auto step = [&](bool interpret) {
 				const auto mapping = vtlb_private::vtlbdata.vmap[cpuRegs.pc >> 12];
@@ -214,6 +223,22 @@ namespace
 			EXPECT_EQ(native_cycles, expected_cycles);
 			EXPECT_EQ(actual.pc, cpuRegs.pc);
 			EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
+			EXPECT_EQ(std::memcmp(&actual_vu0, &VU0, sizeof(VU0)), 0);
+			EXPECT_EQ(std::memcmp(&actual_fpu, &fpuRegs, sizeof(fpuRegs)), 0);
+			EXPECT_EQ(actual_memory, memory);
+		}
+		// The block at pc must fall back to the interpreter without side effects.
+		void ExpectRejected()
+		{
+			const cpuRegisters before = cpuRegs;
+			const VURegs before_vu0 = VU0;
+			const auto before_memory = memory;
+			u32 cycles = 123;
+			EXPECT_FALSE(Arm64EE::TryExecute(cycles));
+			EXPECT_EQ(cycles, 123u);
+			EXPECT_EQ(std::memcmp(&before, &cpuRegs, sizeof(cpuRegs)), 0);
+			EXPECT_EQ(std::memcmp(&before_vu0, &VU0, sizeof(VU0)), 0);
+			EXPECT_EQ(before_memory, memory);
 		}
 
 		// VU0 macro-mode (COP2) ops execute via a direct interpreter call from the
@@ -239,12 +264,15 @@ namespace
 		{
 			const cpuRegisters initial = cpuRegs;
 			const VURegs initial_vu0 = VU0;
+			const auto initial_memory = memory;
 			u32 native_cycles = 0xfffffff0;
 			ASSERT_TRUE(Arm64EE::TryExecute(native_cycles));
 			const cpuRegisters actual = cpuRegs;
 			const VURegs actual_vu0 = VU0;
+			const auto actual_memory = memory;
 			cpuRegs = initial;
 			VU0 = initial_vu0;
+			memory = initial_memory;
 			u32 expected_cycles = 0xfffffff0;
 			for (u32 i = 0; i < count; i++)
 			{
@@ -259,6 +287,7 @@ namespace
 			EXPECT_EQ(actual.pc, cpuRegs.pc);
 			EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
 			EXPECT_EQ(std::memcmp(&actual_vu0, &VU0, sizeof(VU0)), 0);
+			EXPECT_EQ(actual_memory, memory);
 		}
 
 		// COP1 (FPU) native codegen (see EmitCOP1 in arm64/EECodeGenerator.cpp)
@@ -573,7 +602,7 @@ TEST_F(EERecompilerTest, MemoryExitsPreserveUnexecutedInstructionAndCycleCharge)
 
 TEST_F(EERecompilerTest, UnsupportedAndUnsafeEntriesDoNotChangeState)
 {
-	for (u32 code : {Stop, 0x88220000u, 0x10220000u, 0x00221820u, 0x40026000u})
+	for (u32 code : {Stop, 0x88220000u, 0x10220000u, 0x46020003u, 0x40026000u})
 	{
 		program[0] = code;
 		const cpuRegisters before = cpuRegs;
@@ -1480,3 +1509,186 @@ TEST_F(EERecompilerTest, COP1UnsupportedRemainsInterpreted)
 	EXPECT_EQ(std::memcmp(&before_fpu, &fpuRegs, sizeof(fpuRegs)), 0);
 }
 #endif
+
+TEST_F(EERecompilerTest, TrappingArithmeticLeavesOverflowToInterpreter)
+{
+	// ADDI, DADDI, then ADD, SUB, DADD, DSUB. An overflowing instruction must
+	// stop the block before any of its effects so the interpreter raises it.
+	constexpr u32 ops[] = {8u << 26, 24u << 26, 32, 34, 44, 46};
+	constexpr u64 values[] = {0, 1, ~u64(0), 0x7fffffff, 0x80000000, 0xffffffff80000000ULL,
+		0x7fffffffffffffffULL, 0x8000000000000000ULL, 0x40000000, 0x123456789abcdefULL};
+	constexpr s16 immediates[] = {0, 1, -1, 0x7fff, -0x8000};
+	for (u32 op : ops)
+	{
+		for (u32 i = 0; i < std::size(values); i++)
+		{
+			for (u32 j = 0; j < std::size(values); j++)
+			{
+				for (u32 rd : {0u, 3u, 1u})
+				{
+					SCOPED_TRACE(testing::Message() << "op=" << op << " i=" << i << " j=" << j << " rd=" << rd);
+					Init(i + j);
+					cpuRegs.GPR.r[1].UD[0] = values[i];
+					cpuRegs.GPR.r[2].UD[0] = values[j];
+					const bool immediate = op > 63;
+					const s16 imm = immediates[j % std::size(immediates)];
+					program[0] = (9u << 26) | (4 << 16) | 5; // ADDIU r4, r0, 5 keeps a prefix
+					program[1] = immediate ? op | (1 << 21) | (rd << 16) | static_cast<u16>(imm) :
+					                         op | (1 << 21) | (2 << 16) | (rd << 11);
+					const bool doubleword = op == (24u << 26) || op == 44 || op == 46;
+					const s64 lhs = doubleword ? static_cast<s64>(values[i]) : static_cast<s32>(values[i]);
+					s64 rhs = doubleword ? static_cast<s64>(values[j]) : static_cast<s32>(values[j]);
+					if (immediate)
+						rhs = imm;
+					else if (op == 34)
+						rhs = static_cast<s32>(-static_cast<s64>(values[j])); // the interpreter's truncated negation
+					else if (op == 46)
+						rhs = static_cast<s64>(0 - values[j]);
+					bool overflow;
+					if (doubleword)
+					{
+						s64 sum;
+						overflow = __builtin_add_overflow(lhs, rhs, &sum);
+					}
+					else
+						overflow = (lhs + rhs) != static_cast<s32>(lhs + rhs);
+					Compare(overflow ? 1 : 2);
+					if (overflow)
+						ExpectRejected();
+					if (HasFailure())
+						return;
+				}
+			}
+		}
+	}
+	// Trapping instructions stay out of delay slots.
+	Init(0);
+	program[0] = (2u << 26) | ((Base + 64) >> 2); // J
+	program[1] = 0x00221820u; // ADD r3, r1, r2
+	ExpectRejected();
+}
+
+TEST_F(EERecompilerTest, VU0QuadwordTransfersMatchInterpreter)
+{
+	for (u32 op : {54u, 62u}) // LQC2, SQC2
+	{
+		for (u32 seed = 0; seed < 32; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "op=" << op << " seed=" << seed);
+			Init(seed);
+			InitVU0(seed);
+			const u32 ft = seed % 4; // includes vf0
+			const s16 displacement = (seed & 1) ? -32768 : 32752;
+			cpuRegs.GPR.r[1].UD[0] = 0xffffffff00000000ULL | u32(Data + (seed % 8) * 16 - displacement);
+			program[0] = (op << 26) | (1 << 21) | (ft << 16) | static_cast<u16>(displacement);
+			program[1] = (9u << 26) | (1 << 21) | (5 << 16) | 3; // ADDIU after the transfer
+			CompareWithVU0(2);
+			if (HasFailure())
+				return;
+		}
+		// Unaligned addresses and a running microprogram belong to the interpreter.
+		for (u32 scenario = 0; scenario < 2; scenario++)
+		{
+			Init(0);
+			InitVU0(1);
+			cpuRegs.GPR.r[1].UD[0] = Data + (scenario == 0 ? 4 : 0);
+			if (scenario == 1)
+				VU0.VI[REG_VPU_STAT].UL = 1;
+			program[0] = (op << 26) | (1 << 21) | (2 << 16);
+			ExpectRejected();
+		}
+	}
+}
+
+TEST_F(EERecompilerTest, MemoryAndFpuDelaySlotsMatchInterpreter)
+{
+	struct Case
+	{
+		u32 branch;
+		bool taken, likely, event;
+		u32 link, target;
+	};
+	// r5 == r5 and r5 != r6 hold for every seed below; r7 holds Base + 256.
+	const Case cases[] = {
+		{(2u << 26) | ((Base + 64) >> 2), true, false, false, 0, Base + 64}, // J
+		{(3u << 26) | ((Base + 64) >> 2), true, false, false, 31, Base + 64}, // JAL
+		{(4u << 26) | (5 << 21) | (5 << 16) | 15, true, false, false, 0, Base + 64}, // BEQ taken
+		{(4u << 26) | (5 << 21) | (6 << 16) | 15, false, false, true, 0, 0}, // BEQ untaken
+		{(21u << 26) | (5 << 21) | (6 << 16) | 15, true, true, false, 0, Base + 64}, // BNEL taken
+		{(21u << 26) | (5 << 21) | (5 << 16) | 15, false, true, true, 0, 0}, // BNEL annulled
+		{(7 << 21) | (31 << 11) | 9, true, false, false, 31, Base + 256}, // JALR r7
+	};
+	const u32 delays[] = {
+		(35u << 26) | (1 << 21) | (2 << 16) | 8, // LW r2, 8(r1)
+		(35u << 26) | (1 << 21) | (31 << 16) | 8, // LW ra, 8(r1)
+		(43u << 26) | (1 << 21) | (31 << 16) | 4, // SW ra, 4(r1)
+		(30u << 26) | (1 << 21) | (7 << 16) | 16, // LQ r7, 16(r1)
+		(31u << 26) | (1 << 21) | (5 << 16) | 32, // SQ r5, 32(r1)
+		(54u << 26) | (1 << 21) | (3 << 16) | 48, // LQC2 vf3, 48(r1)
+		(62u << 26) | (1 << 21) | (4 << 16) | 64, // SQC2 vf4, 64(r1)
+		(57u << 26) | (1 << 21) | (6 << 16) | 12, // SWC1 f6, 12(r1)
+		(49u << 26) | (1 << 21) | (6 << 16) | 12, // LWC1 f6, 12(r1)
+		(17u << 26) | (16u << 21) | (2 << 16) | (1 << 11) | (3 << 6), // ADD.S f3, f1, f2
+	};
+	for (u32 seed = 0; seed < 4; seed++)
+	{
+		for (const Case& c : cases)
+		{
+			for (u32 delay : delays)
+			{
+				SCOPED_TRACE(testing::Message() << std::hex << "branch=" << c.branch << " delay=" << delay << " seed=" << seed);
+				Init(seed);
+				InitVU0(seed);
+				InitFPU(seed);
+				for (u32 i = 0; i < memory.size(); i++)
+					memory[i] = i * 0x9e3779b9u + seed;
+				cpuRegs.GPR.r[1].UD[0] = Data + seed * 16;
+				cpuRegs.GPR.r[5].UD[0] = 0x1234;
+				cpuRegs.GPR.r[6].UD[0] = 0x5678;
+				cpuRegs.GPR.r[7].UD[0] = Base + 256;
+				program[0] = c.branch;
+				program[1] = delay;
+				CompareBranch(0, c.taken, c.likely, c.event, c.target, c.link);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+	// A delay-slot access the interpreter must perform leaves before the
+	// branch writes its link register.
+	// Misaligned, counter register, and handler-mapped addresses.
+	constexpr u32 rejected[] = {Data + 2, 0x10000000, Data};
+	for (u32 scenario = 0; scenario < 3; scenario++)
+	{
+		Init(0);
+		InitVU0(0);
+		cpuRegs.GPR.r[1].UD[0] = rejected[scenario];
+		if (scenario == 2)
+			vtlb_private::vtlbdata.vmap[Data >> 12] = vtlb_private::VTLBVirtual(vtlb_private::VTLBPhysical::fromHandler(0), Data, Data);
+		program[0] = (3u << 26) | ((Base + 64) >> 2); // JAL
+		program[1] = (35u << 26) | (1 << 21) | (2 << 16); // LW r2, 0(r1)
+		ExpectRejected();
+		Map(Data, memory.data());
+	}
+	// The address is computed before the link write, so a base of the link
+	// register cannot be compiled.
+	Init(0);
+	cpuRegs.GPR.r[31].UD[0] = Data;
+	program[0] = (3u << 26) | ((Base + 64) >> 2); // JAL
+	program[1] = (35u << 26) | (31 << 21) | (2 << 16); // LW r2, 0(ra)
+	ExpectRejected();
+	// A delay-slot store into the block's own code still takes effect.
+	Init(0);
+	Map(Data, program.data());
+	program[0] = (2u << 26) | ((Base + 64) >> 2); // J
+	program[1] = (43u << 26) | (1 << 21) | (2 << 16) | 4; // SW r2, 4(r1): overwrites itself
+	cpuRegs.GPR.r[1].UD[0] = Data;
+	cpuRegs.GPR.r[2].UD[0] = 0x24030007; // ADDIU r3, r0, 7
+	u32 cycles = 0;
+	EXPECT_EQ(Arm64EE::TryExecute(cycles).exit, EEBlockExit::TakenBranch);
+	EXPECT_EQ(program[1], 0x24030007u);
+	cpuRegs.pc = Base;
+	program[1] = 0x24030007;
+	CompareBranch(0, true, false, false, Base + 64);
+	EXPECT_EQ(cpuRegs.GPR.r[3].UD[0], 7u);
+}

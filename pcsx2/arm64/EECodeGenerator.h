@@ -38,7 +38,7 @@ namespace Arm64EE::CodeGenerator
 			return ((code >> 21) & 31) == 8;
 		return (op >= 2 && op <= 7) || (op >= 20 && op <= 23);
 	}
-	bool SupportsDelaySlot(u32 code);
+	bool SupportsDelaySlot(u32 branch, u32 code);
 	// Packed native return value: completed prefix in bits 0-7, exit action in
 	// bits 8-9 and the taken target in bits 32-63. No events run in generated code.
 	constexpr u32 CompletedMask = 0xff;

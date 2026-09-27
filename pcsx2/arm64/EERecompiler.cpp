@@ -153,7 +153,7 @@ namespace
 		// Preserve the interpreter's TLB callbacks when the Goemon fix is enabled.
 		if (EmuConfig.Gamefixes.GoemonTlbHack && ((code >> 26) == 3 || ((code >> 26) == 0 && (code & 63) == 8)))
 			return 0;
-		return remaining >= 2 && Arm64EE::CodeGenerator::SupportsDelaySlot(source[1]) ? 2 : 0;
+		return remaining >= 2 && Arm64EE::CodeGenerator::SupportsDelaySlot(code, source[1]) ? 2 : 0;
 	}
 
 	// Allocation and compilation are cold. Keep their register/stack requirements
