@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace
@@ -171,7 +173,10 @@ namespace
 	// Bumped whenever a compiled block may be freed or its code reused, which
 	// drops every link. Slots start at generation 0.
 	u32 s_link_generation = 1;
+	// Blocks whose validated_epoch equals this passed source validation since
+	// micro memory last changed. Advanced by the next Execute() after a Clear().
 	u32 s_epoch = 1;
+	std::atomic<bool> s_micro_changed{true};
 	// Set by a linked exit that could not link, for Execute() to fill.
 	LinkSlot* s_pending_link = nullptr;
 	u64 s_dispatches = 0;
@@ -202,6 +207,7 @@ namespace
 		s_write = s_base;
 		s_pipeline = {};
 		s_options = Options();
+		s_micro_changed.store(true, std::memory_order_release);
 	}
 
 
@@ -2962,9 +2968,12 @@ void Arm64VU1Recompiler::Step()
 }
 void Arm64VU1Recompiler::Clear(u32, u32)
 {
-	// Entries validate reachable source bytes before execution, including
-	// wrapped MPG uploads and debugger/state-load writes which omit Clear().
-	// Retaining them avoids recompiling identical program uploads.
+	// Every micro memory write calls this first: MPG uploads (a wrapped one
+	// clears only its first part, so the range is ignored), EE and debugger
+	// writes through the memory map, and MTVU's ring. State loads go through
+	// Reset(). Blocks are kept; the next Execute() revalidates their source
+	// before entry, which avoids recompiling identical program uploads.
+	s_micro_changed.store(true, std::memory_order_release);
 }
 size_t Arm64VU1Recompiler::GetCommittedCache() const { return s_base ? s_write - s_base : 0; }
 u64 Arm64VU1Recompiler::GetDispatchCount() const { return s_dispatches; }
@@ -2975,16 +2984,26 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 		Reserve();
 	if (s_options != Options())
 		InvalidateAll();
-	const FPControlRegisterBackup fpcr(EmuConfig.Cpu.VU1FPCR);
 	// Under MTVU this runs on the VU1 thread, where VU0.VI[REG_VPU_STAT] belongs to
 	// the EE thread. Reading its busy bit here raced with the EE clearing it, and
 	// writing it corrupted the EE's VIF1 stall handling. Use the VU1-local flag the
 	// MTVU dispatcher sets instead; the interpreter clears it at the E-bit.
 	const bool mtvu = THREAD_VU1;
-	// Micro memory only changes between Execute() calls, so a block that
-	// passes source validation once in this call may be linked to for the
-	// rest of it.
-	if (++s_epoch == 0)
+	// Nothing else on the MTVU thread computes in floating point (its ring
+	// carries unpacks, GIF packets and memory writes), so the VU1 mode stays set
+	// between calls there. Writing FPCR waits for in-flight FP work: Shadow of
+	// the Colossus makes ~500k calls a second, and the restore alone took ~9% of
+	// the thread. Needs proper testing across games.
+	std::optional<FPControlRegisterBackup> fpcr;
+	if (!mtvu)
+		fpcr.emplace(EmuConfig.Cpu.VU1FPCR);
+	else if (FPControlRegister::GetCurrent() != EmuConfig.Cpu.VU1FPCR)
+		FPControlRegister::SetCurrent(EmuConfig.Cpu.VU1FPCR);
+	// Micro memory only changes between Execute() calls, through Clear(). A
+	// block that passed source validation since then may be entered and linked
+	// to without comparing its source again. Games that run many short
+	// microprograms paid most of Execute()'s own time for that comparison.
+	if (s_micro_changed.exchange(false, std::memory_order_acquire) && ++s_epoch == 0)
 	{
 		s_epoch = 1;
 		s_link_generation++;
@@ -3030,7 +3049,7 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			const bool usable = candidate.profiled || !profilable || candidate.profile_rejected || !candidate.count;
 			if (!usable && unprofiled != variants.size())
 				continue;
-			if (!Matches(candidate, pc, remaining))
+			if (candidate.validated_epoch != s_epoch && !Matches(candidate, pc, remaining))
 				continue;
 			// A budget shorter than the block validated only a prefix.
 			if (remaining >= candidate.count)

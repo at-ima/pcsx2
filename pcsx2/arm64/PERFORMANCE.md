@@ -2593,6 +2593,51 @@ FMAC pair. Lazy or dead-flag elimination, as in microVU, is the bigger lever,
 but it conflicts with this design's exact interpreter state at every pair
 boundary. Needs proper testing across more games.
 
+## Shadow of the Colossus: per-call VU1 overhead
+
+2026-09-28, `WANDER_TO_KYOZOU_001` save state (the opening eagle cutscene),
+MTVU on, 6x resolution. Uncapped, it runs at 39-43 fps with the MTVU thread at
+99.8%, the GS thread 79% idle and the GPU at 96%.
+
+**Profile.** The generated code runs this game well: 52.7% of pairs are
+deferred, only 16% are generic, and a VU1 cycle costs 94 host instructions
+(Burnout 3: 130). But the game runs about 500k VU1 microprograms a second.
+In `sample` of the MTVU thread, generated code was only 63%:
+
+- 13.7% in `semaphore_signal_trap`: `semaXGkick.Post()` wakes the GS
+  thread, which sleeps waiting for each program's PATH1 packet.
+- 11.9% in Execute() itself. Nearly all of it sat right after the FPCR
+  restore at exit: `msr FPCR` waits for in-flight FP work.
+- 4.2% in `memcmp`. Every call advanced `s_epoch`, which made every block
+  validate its source again and dropped every link.
+
+**Changes.**
+
+- `Clear()` sets `s_micro_changed`, and Execute() advances the epoch only
+  then. A block validated since the last change skips `Matches()`, and links
+  stay usable across calls. All writers call Clear() first: MPG (a wrapped
+  upload clears only its first part, so the range is ignored), EE and
+  debugger writes through the memory map, SPR, and MTVU's ring. State loads
+  go through Reset(). The test fixture's `Put()` calls Clear() too. Dropping
+  the flag set in Clear() fails eight existing source-edit tests.
+- Under MTVU, Execute() sets the VU1 FPCR only when it differs, and does not
+  restore it. Nothing else on that thread computes in floating point. The
+  synchronous (EE thread) path still saves and restores.
+
+MTVU thread in `sample`: generated code 63% -> 71%, Execute() plus `memcmp`
+15.7% -> 7.1%.
+
+**Not kept: spinning before the GS thread sleeps on `semaXGkick`.** The GS
+thread spun for up to `SPIN_TIME_NS` with `ShortSpin()` before sleeping.
+This removed the kernel wakeups (generated code rose to 80.5%), but the GS
+thread went from 79% idle to 97% busy. An A-B-C-C-B-A wall-clock series
+showed no difference between the builds. Every run was slower than the one
+before it, for every build (speed 69% -> 35%, VU1 thread 22.8 -> 47 ms per
+frame): a fanless MacBook Air throttling under sustained CPU+GPU load. On
+such a machine, a spinning core spends the shared thermal budget, so the
+patch is left out. Wall-clock A/B runs are not usable there; compare
+frequency-independent cycle counts instead.
+
 ## Burnout 3: EE interpreter fallbacks
 
 2026-09-27, `BURN_OUT_3_003` save state. About 15 s after loading, the race

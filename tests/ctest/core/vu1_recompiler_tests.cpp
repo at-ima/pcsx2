@@ -88,6 +88,8 @@ namespace
 
 		void Put(u32 pc, u32 upper, u32 lower)
 		{
+			// Like every micro memory writer in the emulator.
+			CpuArm64VU1.Clear(pc, 8);
 			std::memcpy(VU1.Micro + pc, &lower, 4);
 			std::memcpy(VU1.Micro + pc + 4, &upper, 4);
 		}
