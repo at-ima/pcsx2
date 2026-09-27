@@ -3304,6 +3304,76 @@ TEST_F(VU1RecompilerTest, IswWritesEachMaskedLaneIndependently)
 }
 
 
+TEST_F(VU1RecompilerTest, UnobservedFlagResultsKeepStickyBitsAndReaderValues)
+{
+	// Deferred regions skip the MAC/status computation of flag results nothing
+	// observes and fold only their sticky bits. Inputs mix zeros, signs, tiny
+	// and huge values so every flag bit varies; flag readers, MAX (an FMAC op
+	// without flags) and idle pairs change which results are observed.
+	const VURegs initial = VU1, initial0 = VU0;
+	u32 random = 0x2468ace1;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	constexpr u32 pool[] = {0, 0x80000000, 0x3f800000, 0xbf800000, 0x00800001, 0x80800001,
+		0x7f000000, 0xff000000, 0x40200000, 0xc0200000, 0x1f000000, 0x9f000000};
+	constexpr u32 readers[] = {0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b};
+	constexpr u32 count = 40;
+	for (u32 seed = 0; seed < 48; seed++)
+	{
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 1000;
+		VU1.VI[REG_STATUS_FLAG].UL = seed % 3 ? 0 : next() & 0xfff;
+		VU1.VI[REG_MAC_FLAG].UL = next() & 0xffff;
+		VU1.statusflag = 0;
+		VU1.macflag = 0;
+		for (u32 r = 1; r < 8; r++)
+			for (u32 lane = 0; lane < 4; lane++)
+				VU1.VF[r].UL[lane] = pool[next() % std::size(pool)];
+		for (u32 i = 0; i < count; i++)
+		{
+			const u32 fs = 1 + next() % 6, ft = 1 + next() % 6, fd = 1 + next() % 6;
+			constexpr u32 arithmetic[] = {0x28, 0x2c, 0x2a}; // ADD/SUB/MUL
+			u32 upper = ((1 + next() % 15) << 21) | (ft << 16) | (fs << 11) | (fd << 6) | arithmetic[next() % 3];
+			u32 lower = 0x8000033c; // MOVE with no destination lanes
+			switch (next() % 8)
+			{
+				case 0:
+				case 1:
+				{
+					const u32 imm = next() & 0xfff;
+					lower = (readers[next() % std::size(readers)] << 25) | ((imm >> 11) << 21) |
+					        ((1 + next() % 3) << 16) | ((next() % 4) << 11) | (imm & 0x7ff);
+					break;
+				}
+				case 2:
+					upper = (upper & ~0x3fu) | 0x2b; // MAX: FMAC, no flags
+					break;
+				case 3:
+					upper = 0x2ff; // NOP
+					break;
+			}
+			Put(i * 8, upper, lower);
+		}
+		// End the program (E bit, then its delay slot) so the whole body fits
+		// one deferred region that the larger budgets can enter.
+		Put(count * 8, 0x400002ff, 0x8000033c);
+		Put(count * 8 + 8, 0x2ff, 0x8000033c);
+		for (u32 pc = count * 8 + 16; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		const VURegs state = VU1;
+		for (u32 budget : {9u, 14u, 20u, 27u, 33u, 64u, 100u, 200u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = state;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, FlagQAndBranchReadersScheduleOutsideDeferredRegions)
 {
 	// Flag tests, Q readers and integer branches used to take the generic

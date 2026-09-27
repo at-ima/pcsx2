@@ -665,6 +665,17 @@ namespace
 	// exponent mask into v24 unconditionally (StoreMAC's MAC/status flag
 	// classification always needs it). Call once at block entry, and again
 	// after any Blr that might reach the real _vuXGKICKTransfer C++ function.
+	// Z/S/U/O status bits from MAC bits: any lane of each group of four.
+	void EmitMacToStatus(MacroAssembler& a, const Register& status, const Register& mac)
+	{
+		a.Orr(status, mac, Operand(mac, LSR, 1));
+		a.Orr(status, status, Operand(status, LSR, 2));
+		a.And(status, status, 0x1111);
+		a.Orr(status, status, Operand(status, LSR, 3));
+		a.Orr(status, status, Operand(status, LSR, 6));
+		a.And(status, status, 15);
+	}
+
 	void EmitBlockConstants(MacroAssembler& a)
 	{
 		a.Movi(v24.V4S(), 0x7f800000);
@@ -674,8 +685,15 @@ namespace
 		a.Movi(v7.V4S(), 0xff7fffff);
 	}
 
+	// Set by EmitDeferredRegion around a pair whose flags nothing observes: StoreMAC
+	// then leaves the weighted per-lane MAC bits in v(28 + slot) for the region's
+	// sticky accumulator, instead of publishing the MAC/status scratch.
+	int s_raw_flag_slot = -1;
+	u32 s_store_mac_count = 0;
+
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
 	{
+		s_store_mac_count++;
 		// OPMULA/OPMSUB always write xyz regardless of the encoded bits at this
 		// position, which are not a destination mask for those two opcodes.
 		const u32 mask = mask_override >= 0 ? static_cast<u32>(mask_override) : (code >> 21) & 15;
@@ -709,19 +727,19 @@ namespace
 		a.Shl(v22.V4S(), v22.V4S(), 12);
 		a.And(v22.V16B(), v20.V16B(), v22.V16B());
 		a.Orr(v21.V16B(), v21.V16B(), v22.V16B());
-		a.Addv(s22, v21.V4S());
-		a.Fmov(w10, s22);
-		a.Ldr(w9, Field(offsetof(VURegs, macflag)));
-		a.And(w9, w9, 0xffff0000);
-		a.Orr(w9, w9, w10);
-		a.Str(w9, Field(offsetof(VURegs, macflag)));
-		a.Orr(w11, w10, Operand(w10, LSR, 1));
-		a.Orr(w11, w11, Operand(w11, LSR, 2));
-		a.And(w11, w11, 0x1111);
-		a.Orr(w11, w11, Operand(w11, LSR, 3));
-		a.Orr(w11, w11, Operand(w11, LSR, 6));
-		a.And(w11, w11, 15);
-		a.Str(w11, Field(offsetof(VURegs, statusflag)));
+		if (s_raw_flag_slot >= 0)
+			a.Mov(VRegister(28 + s_raw_flag_slot, 128).V16B(), v21.V16B());
+		else
+		{
+			a.Addv(s22, v21.V4S());
+			a.Fmov(w10, s22);
+			a.Ldr(w9, Field(offsetof(VURegs, macflag)));
+			a.And(w9, w9, 0xffff0000);
+			a.Orr(w9, w9, w10);
+			a.Str(w9, Field(offsetof(VURegs, macflag)));
+			EmitMacToStatus(a, w11, w10);
+			a.Str(w11, Field(offsetof(VURegs, statusflag)));
+		}
 		// FZ arithmetic has already produced signed zero for tiny results. The
 		// reference FP comparison consequently reports zero, not underflow.
 		if (!flush)
@@ -1839,6 +1857,24 @@ namespace
 		return ins.uregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_FMAC;
 	}
 
+	// Whether EmitUpper computes MAC/status flags for this upper instruction.
+	bool UpdatesMacFlags(u32 upper)
+	{
+		switch (DecodeUpper(upper).op)
+		{
+			case Op::Add:
+			case Op::Sub:
+			case Op::Mul:
+			case Op::Madd:
+			case Op::Msub:
+			case Op::Opmula:
+			case Op::Opmsub:
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	void AnalyzeRetirement(Block& block)
 	{
 		// Ages saturate at four (already retired). -1 represents an age which
@@ -2265,7 +2301,21 @@ namespace
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+		// Whether v25 may hold sticky status bits not yet in w25.
+		bool raw_retired = false;
 	};
+
+	// Fold the sticky bits of retired unobserved entries (v25) into w25.
+	void EmitStickyFold(MacroAssembler& a, const RegionSlots& state)
+	{
+		if (!state.raw_retired)
+			return;
+		// Each lane's MAC bits are disjoint, so the sum is their OR.
+		a.Addv(vixl::aarch64::s16, v25.V4S());
+		a.Fmov(w10, vixl::aarch64::s16);
+		EmitMacToStatus(a, w11, w10);
+		a.Orr(w25, w25, Operand(w11, LSL, 6));
+	}
 
 	void EmitRegionSlotAddress(MacroAssembler& a, u32 relative)
 	{
@@ -2283,6 +2333,7 @@ namespace
 	{
 		if (state.backup_cycles)
 			EmitBackupCountdown(a, std::min(state.backup_cycles, 255u));
+		EmitStickyFold(a, state);
 		const auto& last = block.instructions[last_index];
 		const u32 live = block.schedule[last_index].remaining + HasFmac(last);
 		// Only live entries are ever read again (queue walks start at fmacreadpos
@@ -2350,6 +2401,69 @@ namespace
 			a.Ldr(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
 			a.Ins(VRegister(28 + slot, 128).V4S(), 2, w9);
 		}
+		// Which FMAC entries issued here can be observed. The status/MAC flags
+		// and the flag scratch only become visible through flag readers and
+		// region exits: the latest retired entry sets w25's low bits and w28,
+		// live entries are written back, and the scratch fields are published.
+		// An entry nothing observes only contributes its sticky status bits.
+		// A flag instruction whose values nothing observes skips the scalar MAC/
+		// status computation; its entry carries the per-lane MAC bits (Raw) and
+		// ORs them into v25 when it retires. Other unobserved entries (Skip)
+		// repeat the scratch of an earlier flag instruction, whose own entry
+		// retires first and already contributed the same sticky bits.
+		enum class Entry : u8
+		{
+			Normal,
+			Raw,
+			Skip,
+		};
+		std::array<Entry, MaxInstructions> kinds{};
+		{
+			std::array<int, MaxInstructions> source{};
+			std::array<bool, MaxInstructions> flag_op{}, needed{}, scratch_full{};
+			int scratch = -1, latest = -1;
+			u32 count = 0;
+			const auto observe_latest = [&]() {
+				if (latest >= 0)
+					needed[latest] = true;
+			};
+			for (u32 i = first; i < end; i++)
+			{
+				const auto& plan = block.schedule[i];
+				const auto& ins = block.instructions[i];
+				for (u32 j = 0; j < plan.retired; j++)
+					latest = static_cast<int>(count - plan.remaining - plan.retired + j);
+				if ((ins.uregs.VIread | ins.lregs.VIread) & ((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG)))
+					observe_latest();
+				if (HasFmac(ins))
+				{
+					flag_op[count] = UpdatesMacFlags(ins.upper);
+					if (flag_op[count])
+						scratch = static_cast<int>(count);
+					source[count] = scratch;
+					// CLIP/FCSET retire the clip flag, FSSET reads the scratch.
+					if ((ins.uregs.VIwrite | ins.lregs.VIwrite) & ((1 << REG_CLIP_FLAG) | (1 << REG_STATUS_FLAG)))
+						needed[count] = true;
+					count++;
+				}
+				const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
+				if ((integer_branch && i + 1 < block.count) || i + 1 == end)
+				{
+					observe_latest();
+					const u32 live = plan.remaining + HasFmac(ins);
+					for (u32 k = count >= live ? count - live : 0; k < count; k++)
+						needed[k] = true;
+					if (scratch >= 0)
+						scratch_full[scratch] = true;
+				}
+			}
+			for (u32 k = 0; k < count; k++)
+				if (needed[k] && source[k] >= 0)
+					scratch_full[source[k]] = true;
+			for (u32 k = 0; k < count; k++)
+				kinds[k] = flag_op[k] ? (scratch_full[k] ? Entry::Normal : Entry::Raw) : (needed[k] ? Entry::Normal : Entry::Skip);
+		}
+		a.Movi(v25.V4S(), 0);
 		RegionSlots state;
 		auto& slots = state.slots;
 		u32& issued = state.issued;
@@ -2362,10 +2476,21 @@ namespace
 			const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 			elapsed += plan.cycles;
 			a.Add(x26, x26, plan.cycles);
+			int mac_from = -1;
 			for (u32 j = 0; j < plan.retired; j++)
 			{
-				const u32 slot = (issued - plan.remaining - plan.retired + j) & 3;
+				const int index = static_cast<int>(issued - plan.remaining - plan.retired + j);
+				const Entry kind = index >= 0 ? kinds[index] : Entry::Normal;
+				const u32 slot = static_cast<u32>(index) & 3;
 				const VRegister flags(28 + slot, 128);
+				if (kind == Entry::Raw)
+				{
+					a.Orr(v25.V16B(), v25.V16B(), flags.V16B());
+					state.raw_retired = true;
+					continue;
+				}
+				if (kind == Entry::Skip)
+					continue;
 				if (plan.clip_retires & (1 << j))
 				{
 					a.Umov(w9, flags.V4S(), 2);
@@ -2376,9 +2501,10 @@ namespace
 				a.And(w25, w25, 0xff0);
 				a.Orr(w25, w25, w9);
 				a.Orr(w25, w25, Operand(w9, LSL, 6));
-				if (j + 1 == plan.retired)
-					a.Umov(w28, flags.V4S(), 0);
+				mac_from = static_cast<int>(slot);
 			}
+			if (mac_from >= 0)
+				a.Umov(w28, VRegister(28 + mac_from, 128).V4S(), 0);
 			if (plan.fdiv_pending)
 				EmitFDIVSlotRetire(a, w25, false);
 			if (plan.ialu_pending)
@@ -2396,16 +2522,26 @@ namespace
 			// live in w25/w28.
 			const u32 reads = ins.uregs.VIread | ins.lregs.VIread;
 			if (reads & (1 << REG_STATUS_FLAG))
+			{
+				EmitStickyFold(a, state);
 				a.Str(w25, Field(VI(REG_STATUS_FLAG)));
+			}
 			if (reads & (1 << REG_MAC_FLAG))
 				a.Str(w28, Field(VI(REG_MAC_FLAG)));
+			const Entry kind = HasFmac(ins) ? kinds[issued] : Entry::Normal;
+			const u32 macs = s_store_mac_count;
+			s_raw_flag_slot = kind == Entry::Raw ? static_cast<int>(issued & 3) : -1;
 			EmitPair(a, block.cache, ins, false);
+			s_raw_flag_slot = -1;
+			pxAssertRel((s_store_mac_count != macs) == (HasFmac(ins) && UpdatesMacFlags(ins.upper)),
+				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);
 			if (HasFmac(ins))
 			{
 				const u32 slot = issued++ & 3;
 				// Only the first three lanes are used; the fourth is ignored.
-				a.Ldr(VRegister(28 + slot, 128), Field(offsetof(VURegs, macflag)));
+				if (kind == Entry::Normal)
+					a.Ldr(VRegister(28 + slot, 128), Field(offsetof(VURegs, macflag)));
 				slots[slot].writer = i;
 				slots[slot].issue_cycle = elapsed;
 				slots[slot].order = issued - 1;
