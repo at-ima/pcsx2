@@ -2691,9 +2691,9 @@ void VMManager::InitializeCPUProviders()
 	arm64IopCpu.Reserve();
 	CpuArm64VU0.Reserve();
 	CpuArm64VU1.Reserve();
-	// The ARM64 VU1 provider does not support MTVU, but
-	// we still need the thread alive. Otherwise the read and write positions
-	// of the ring buffer wont match, and various systems in the emulator end up deadlocked.
+	// Keep the MTVU thread alive even when THREAD_VU1 is off. Otherwise the read
+	// and write positions of the ring buffer wont match, and various systems in
+	// the emulator end up deadlocked.
 	vu1Thread.Open();
 #endif
 
@@ -2749,10 +2749,10 @@ void VMManager::UpdateCPUImplementations()
 
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
-	Console.WriteLn("CPU execution: EE: %s; IOP: %s; VU0: %s; VU1: %s; MTVU unavailable",
+	Console.WriteLn("CPU execution: EE: %s; IOP: %s; VU0: %s; VU1: %s; MTVU: %s",
 		Cpu == &arm64Cpu ? "ARM64 block recompiler (partial)" : "interpreter",
 		psxCpu == &arm64IopCpu ? "ARM64 block recompiler (partial)" : "interpreter",
-		CpuVU0->GetLongName(), CpuVU1->GetLongName());
+		CpuVU0->GetLongName(), CpuVU1->GetLongName(), THREAD_VU1 ? "on" : "off");
 #endif
 }
 

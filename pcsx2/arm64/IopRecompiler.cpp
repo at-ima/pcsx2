@@ -219,13 +219,11 @@ namespace
 					// pays the lookup's LUT/hash/array-access cost once per
 					// instruction for no benefit. That per-instruction repricing is
 					// what made this wrapper ~33% slower than the plain interpreter
-					// even with zero native code ever compiled (see the comment on
-					// psxCpu's assignment in VMManager.cpp for how that was
-					// measured). `taken` is detected precisely by comparing pc to
-					// the fallthrough address, matching doBranch()'s branch2
-					// semantics exactly -- stricter than the IsBranch(code)
-					// heuristic this loop used to exit on for every branch-class
-					// opcode whether or not it actually branched.
+					// even with zero native code ever compiled. `taken` is detected
+					// precisely by comparing pc to the fallthrough address, matching
+					// doBranch()'s branch2 semantics exactly -- stricter than the
+					// IsBranch(code) heuristic this loop used to exit on for every
+					// branch-class opcode whether or not it actually branched.
 					for (;;)
 					{
 						const u32 code = iopMemFetch32(psxRegs.pc);

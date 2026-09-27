@@ -25,11 +25,13 @@
 //    compile-time constant -- as does any other lower op classified
 //    VUPIPE_BRANCH. A repeated PC also ends the trace, so unlike
 //    VU1Recompiler.cpp there is no loop-to-entry back-edge to generate yet.
+//  - DIV/SQRT/RSQRT/WAITQ compile natively (see IsFDIVPipe); their stall is
+//    emitted before the paired upper op, matching the interpreter's order.
 //  - A block never contains an E/M/D/T-bit pair (VU0's M-bit -- unlike
 //    VU1 -- ends interpreter execution after the pair; see VU0microInterp.cpp's
-//    VUFLAG_MFLAGSET check), or a DIV/SQRT/RSQRT/WAITQ/EFU-pipe (ESADD..WAITP)
-//    lower op. All of these fall back to the interpreter for now; the FMAC
-//    pipe (the profiled hot path, see PERFORMANCE.md) is fully covered.
+//    VUFLAG_MFLAGSET check), or an EFU-pipe (ESADD..WAITP) lower op. These
+//    fall back to the interpreter for now; the FMAC pipe (the profiled hot
+//    path, see PERFORMANCE.md) is fully covered.
 // needs proper testing across the supported opcode set and its interaction
 // with pairs still falling back to the interpreter mid-program.
 namespace
@@ -206,10 +208,10 @@ namespace
 		return {};
 	}
 
-	// Reduced from VU1Recompiler.cpp's Lower: no Xgkick (VU0 has no GIF path),
-	// no Div/Sqrt/Rsqrt/Waitq (FDIV pipe) or Esadd..Waitp (EFU pipe) -- those
-	// opcodes fall straight through to Unsupported below, same as any other
-	// not-yet-natively-compiled instruction. JR/JALR/BAL have no entry either:
+	// Reduced from VU1Recompiler.cpp's Lower: no Xgkick (VU0 has no GIF path)
+	// or Esadd..Waitp (EFU pipe) -- those opcodes fall straight through to
+	// Unsupported below, same as any other not-yet-natively-compiled
+	// instruction. JR/JALR/BAL have no entry either:
 	// they are detected generically via lregs.pipe == VUPIPE_BRANCH in
 	// Compile(), which ends the trace there.
 	enum class Lower
@@ -1346,11 +1348,12 @@ namespace
 		a.Str(w0, Field(offsetof(VURegs, ialucount)));
 	}
 
-	// Builds a straight-line trace starting at pc. Stops one pair before
-	// anything this file does not natively compile: an unsupported upper or
-	// lower op, a branch (lregs.pipe == VUPIPE_BRANCH), or an E/M/D/T-bit
-	// pair. That excluded pair, and everything after it, still runs on the
-	// interpreter via Arm64VU0Recompiler::Step() -- see Execute() below.
+	// Builds a trace starting at pc, following static B and taken
+	// integer-branch edges. Stops one pair before anything this file does not
+	// natively compile: an unsupported upper or lower op, JR/JALR/BAL, a branch
+	// in another branch's delay slot, or an E/M/D/T-bit pair. That excluded
+	// pair, and everything after it, still runs on the interpreter via
+	// Arm64VU0Recompiler::Step() -- see Execute() below.
 	__noinline Block& Compile(u32 pc)
 	{
 		if (static_cast<size_t>(s_end - s_write) < MaxBlockBytes)
