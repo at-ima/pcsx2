@@ -1,6 +1,22 @@
-# Intro performance investigation (2026-09-18)
+# ARM64 backend investigation log
 
-## Scope and controls
+This is a chronological log. Later sections can supersede statements in
+earlier ones. For the current design, see [README.md](README.md). Figures
+come from the runs described in each section; they are not comparable across
+sections unless a section says so.
+
+| Dates | Workload | Sections |
+| --- | --- | --- |
+| 09-18 | Saru! Get You! 2 opening movie | "Scope and controls" to "Local artifacts" (intro investigation) |
+| 09-18..19 | same | "Follow-up: avoid premature EE branch event polling" to "IOP branch event polling" |
+| 09-19..20 | Saru! Get You! 2 gameplay | "Outdoor gameplay state" to "MTVU (THREAD_VU1) on the ARM64 backend" |
+| 09-20..21 | Saru! Get You! 3 | "Saru! Get You! 3: VU0, IOP and EE dispatch" |
+| 09-21..22 | Ridge Racer V | "Ridge Racer V: VU0 correctness" |
+| 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
+
+## Intro performance investigation (2026-09-18)
+
+### Scope and controls
 
 The test is the opening movie of Saru! Get You! 2, SCPS-15025, CRC FE0A6AB6,
 on an Apple M5 with 32 GB RAM. Source baseline: `98b0f5267` (runtime changes
@@ -29,7 +45,7 @@ same-settings x64 measurement remains necessary before attributing the entire
 reported difference to the architecture. The user's approximately 15 FPS was
 not reproduced by this dedicated configuration.
 
-## Controlled ARM64 measurements
+### Controlled ARM64 measurements
 
 | Condition | VPS | CPU thread ms/frame | GS thread ms/frame |
 | --- | ---: | ---: | ---: |
@@ -50,7 +66,7 @@ the VU1 interpreter in this scene. Disabling EE native execution is also slower.
 These are whole-emulator comparisons, not isolated backend speedups or direct
 measurements of each subsystem's share of CPU time.
 
-## CPU sampling
+### CPU sampling
 
 A separate five-second `sample` capture begins after the first metric at frame
 900. It contains 2,985 CPU-thread samples and excludes shutdown. Sampling itself
@@ -78,7 +94,7 @@ control, flag, and boundary work, not just arithmetic. These approximate shares
 describe this short window, not the whole game. Hot shared-pipeline locations
 include FMAC latency loads, queue-count stores, and retirement return paths.
 
-## Separate execution-count run
+### Separate execution-count run
 
 Counters were collected from boot until frame 1104 in another build. They are
 not restricted to frames 850–1100, and counter overhead makes their FPS unsuitable
@@ -102,7 +118,7 @@ boundary and publishes/reloads cached VU vectors. Meanwhile, native VU blocks
 are reasonably long: assuming that most calls execute tiny prefixes would be
 incorrect for this workload.
 
-## Implications and next experiments
+### Implications and next experiments
 
 1. Investigate reducing repeated pipeline work across a native block. Per-pair
    architectural queue retirement remains expensive even when the executed pairs
@@ -126,7 +142,7 @@ sampled cost would imply only about 1.5x throughput if the sample were fully
 representative and other costs stayed constant; this is an upper-bound estimate,
 not a promised optimization result.
 
-## Local artifacts
+### Local artifacts
 
 Ignored files under `build-arm64/` retain `investigate-intro.py`,
 `analyze-diagnostic-sample.py`, `diagnostic-*.log/json`,
@@ -2148,6 +2164,9 @@ Both remain the largest identified opportunities and the natural next
 target, but each is a multi-session undertaking on its own, not a
 follow-up to this change.
 
+*Superseded:* both now have native recompilers (`5b7546952` VU0,
+`8d0425cbd` IOP); see "Saru! Get You! 3: VU0, IOP and EE dispatch" below.
+
 ## MTVU (THREAD_VU1) on the ARM64 backend
 
 `THREAD_VU1` is now enabled on ARM64. It is independent of `REC_VU1`
@@ -2217,3 +2236,206 @@ path and the shared incremental path (left MTVU-unaware on purpose by
 upstream, per the PATH3-masking comment in `_vuXGKICKTransfer`) both need
 proper testing across games, as does T-bit behaviour, which this title
 does not appear to exercise.
+
+## Saru! Get You! 3: VU0, IOP and EE dispatch
+
+2026-09-20..21, slow scenes of Saru! Get You! 3 loaded from save states. The
+figures here come from the commit messages; the captures they were taken
+from were not kept.
+
+**VU0 micro mode** (`5b7546952`). VU0 micro mode, run by the interpreter,
+took 12.2% of EE-thread time in a VU0-heavy scene. `VU0Recompiler.cpp` and
+`VU0Pipeline.cpp` were adapted from the VU1 files, which were left untouched.
+The first version compiled straight-line FMAC blocks only. Every other pair
+still went to the interpreter, including branches, DIV and E/M/D/T bits. No
+after-measurement was recorded; see the Ridge Racer V section for what that
+scope turned out to cost.
+
+**EE source validation** (`064e2744a`). `TryExecute` compared every cached
+block with its source (`memcmp`) on every entry, which took 10.6% of
+CPU-thread time. Blocks now write-protect their source page through vtlb's
+existing tracking, the same mechanism the x86 recompiler uses. After this
+change, `memcmp` took 0.23%. The thread stayed CPU-bound, so this did not by
+itself change the frame rate. The page tracking goes through the physical
+mapping, so it is used only when that mapping and the virtual mapping resolve
+to the same byte. `EERecompilerTest.MixedBlocksAndModifiedCode` caught a
+version without that check: the test's synthetic code buffers override only
+the virtual mapping.
+
+**COP1** (`12f22ce1c`). Every FPU instruction ended a native EE block, so FPU
+code broke into many one-instruction interpreter steps between tiny blocks.
+The common subset is now native (see README.md).
+
+**IOP** (`8d0425cbd`, `440b2b5e3`). This commit added the native IOP
+recompiler. After it, a *normal* boot stayed on a black screen with no audio,
+while resuming from a save state worked. Bisecting found `8d0425cbd`. Rebuilds
+of that commit with parts stubbed out narrowed it to the store path. Boot and
+kernel code isolate the cache (Status.IsC) and then store dummy values to
+flush it. The interpreter skips those RAM writes; native stores did not, and
+corrupted BIOS/kernel state. A save state resumes after that phase, so it
+never showed the bug.
+
+**VU1 register jumps** (`0bf297d63`). Attributing VU1 interpreter steps by
+opcode showed that JR alone accounted for about 38%, ahead of XTOP and BAL.
+JR/JALR/BAL and XTOP/XITOP are now native. Live testing found a second bug.
+When the delay slot of such a jump was the last pair of a deferred region,
+the region's exit overwrote the runtime target in TPC with a compile-time
+constant, and rendering broke.
+
+**EE dispatch** (`3f5ca209f`, `e285b2be4`, `fcd2d8eab`, `887bbc493`).
+`TryExecute`'s own code took about 15-22% of EE-thread samples. The hot
+instructions were the bucket walk in `std::unordered_map::find`: libc++ uses
+a prime bucket count, so each probe costs an integer division. A histogram of
+block-entry PCs was dominated by a few PCs, each called millions of times per
+second. The top one was a tiny delay loop:
+
+```text
+addiu $t6, $zero, 3
+addiu $t6, $t6, -1
+addiu $t7, $zero, -1
+nop x5                      <- block entry
+bnel  $t6, $t7, -24         <- back to the block entry
+  addiu $t6, $t6, -1        (delay slot)
+```
+
+A native block ends at its first branch, so every iteration returned to the
+shared driver and looked the block up again. Four changes followed:
+
+1. A one-entry cache of the most recently dispatched block, and `s_lookup`
+   grown from 1024 to 65536 entries.
+2. The `unordered_map` replaced by a power-of-two, linear-probed table with
+   Fibonacci hashing, so a probe needs no division.
+3. Clearing that table by bumping a generation tag. `ClearProvider` runs on
+   every TLB remap, and a normal boot remaps very often. Wiping all 524,288
+   slots each time made a normal boot appear to hang. Save-state resume
+   barely remaps, so it was unaffected, as with the IOP bug above.
+4. `TryExecute` itself re-running a block whose taken branch targets its own
+   entry, up to 4096 times, doing the driver's commit/cycle/event bookkeeping
+   between iterations. This broke two older unit tests; see "Known gaps"
+   below.
+
+No before/after frame rate for Saru! Get You! 3 was recorded.
+
+## Ridge Racer V: VU0 correctness
+
+2026-09-21..22. The new VU0 recompiler broke Ridge Racer V several times. Most
+of the bugs below were found in live play rather than by the test suite.
+
+- **Stale Q** (`26d22d973`). A compiled VU0 block never contained a divide,
+  but it did contain the MULq-style instructions that read the result. The
+  block-retire code drained only the FMAC and IALU pipes. So a block that
+  advanced the cycle past a pending divide's latency kept reading the old Q.
+  The transform code divides for a perspective factor and multiplies vertices
+  by Q in a tight loop, so vertices were corrupted and the game froze. The
+  FDIV/EFU retirement from `VU1Pipeline.cpp` was ported. A new test was
+  confirmed to fail before the fix.
+- **Livelock on the car-selection screen** (`982f7986e`). An M-bit pair sets
+  `VUFLAG_MFLAGSET` to end that `Execute()` call. The interpreter and microVU
+  both clear the flag at the start of the next call; the ARM64 VU0 provider
+  did not. After the first M bit, every call returned immediately without
+  advancing VU0, and the EE thread spun at 100% with no crash and no output.
+  Diagnosis attached lldb to the hung process. Across repeated samples,
+  `VU0.cycle`, `VI[REG_TPC]` and the flags were bit-for-bit frozen.
+- **Stack overflow after a cache flush** (`b0f7793b5`). `InvalidateAll()`
+  rewound the code buffer but kept the pipeline stubs at its start. The next
+  block overwrote them, and each pair's `Blr` into a stub then landed in that
+  block's own prologue. VU1's `InvalidateAll()` already cleared its stubs. The
+  added test checks that native code is emitted at all. A recompiler that
+  silently interprets everything passes every differential test.
+- **Branches** (`112d91969`, `80f7b984b`). This was a performance change. In
+  a sample of about 11.9M VU0 interpreter steps, branches and their delay
+  slots made up about 74%. Compiled blocks averaged 3.76 pairs, and 47% of
+  them were empty because their entry pair was a branch. Porting VU1's static
+  B and integer-branch tracing raised compiled-block execution from 36.8% to
+  54.3% of VU0 dispatches and average block length to 7.81 pairs. VU0's share
+  of CPU-thread self time fell from 14.6% to 4.0%. An integer branch then
+  tested an ILW result before the load had landed, so `80f7b984b` ported
+  VU1's IALU wait stub.
+- **Black shadow over the car** (`5562940a1`, reverted in `9abc1876c`,
+  re-landed as `139068d34`). Compiling DIV/SQRT/RSQRT/WAITQ emitted the FDIV
+  stall inside the lower instruction, after the paired upper one. The
+  interpreter runs `_vuTestFDIVStalls` and `_vuTestPipes` *before*
+  `_vu0ExecUpper`. So "DIV + MULq" and "WAITQ + MULq" pairs multiplied by the
+  previous divide's Q, exactly the shape of this game's transform code. The
+  re-land emits the stall before the upper instruction (`IsFDIVPipe`); tests
+  for both shapes were confirmed to fail without it.
+
+## Ridge Racer V: VU1 generic preparation share
+
+2026-09-22..26, `RIDGE_RACER_V_002` save state, MTVU on. The scene ran at
+about 30 fps before the Ridge Racer V work and runs at 60 fps at the end of
+this section. This section targets the cost of VU1's generated code, the
+largest share of the MTVU thread.
+
+**Measurement.** Several obvious metrics misled:
+
+- Frame rate stops at 60 once the scene is fast enough.
+- MTVU thread CPU time is confounded: the MTVU thread spin-waits, so a faster
+  VU1 idles more and can look *worse*.
+- One A/B pair showed +22%. It did not reproduce and was retracted; single
+  runs varied by about 10%.
+
+What worked: launch with `-unlimited` (it takes effect together with
+`-statefile`). Time only the inside of `Arm64VU1Recompiler::Execute` with
+`CLOCK_THREAD_CPUTIME_ID`, and divide by the VU1 cycles it advanced: ns per
+emulated VU1 cycle. Run at least three alternating A/B pairs and trust only a
+consistent sign. The timer was a throwaway patch and is not in the tree.
+
+**Profile.** `sample` put 65% of the MTVU thread inside VU1 generated code.
+Half of that was the shared per-pair preparation stub alone: a serialised
+chain of loads over `fmaccount`, `fdiv.enable`, `efu.enable`, `ialucount`,
+`xgkickenable` and `VIBackupCycles`. A temporary counter in
+`AnalyzeRetirement` recorded why each pair took that stub, weighted by block
+run counts. 62.3% of executed pairs took it. The largest single reason was a
+divide: the whole seven-cycle FDIV latency window was excluded from the
+precomputed schedule, and that window alone covered 16% of all pairs.
+
+**Changes**, each measured over three alternating pairs:
+
+| Commit | Change | Result |
+| --- | --- | --- |
+| `9f52085ec` | Pairs inside a divide's latency stay scheduled (`fdiv_pending`) and retire the FDIV slot inline | generic pairs 62% -> 55%; VU1 about 4-8% faster |
+| `7a2f50549` | Stubs publish TPC/`code` from precomputed `Instruction` fields with one `Ldp` | median 6.26 -> 5.18 ns per VU1 cycle; lower in all three pairs |
+| `0357d1853` | Prologue pairs that read no VF keep a known one-cycle advance | about 1% lower in all three pairs |
+
+The generic share ended at 54.8%. Run-to-run drift is comparable to these
+gains, so only their sign is dependable.
+
+Removing the divide window also exposed a gap in the model.
+`WaitqExcludedFromPrecomputedSchedule` failed. The cause: a pair that touches
+Q or P while an FDIV or EFU entry is outstanding stalls until that entry
+retires, but `AnalyzeRetirement` had fed the nominal advance into its age
+tracking. The divide window had hidden this. Such pairs now report an
+unknown advance.
+
+The first test written for `0357d1853` was vacuous: schedule dumps with and
+without the change were identical. It was rebuilt around an FMAC producer
+that reads only VF0 in the prologue and is consumed three slots later. A dump
+confirmed that the rebuilt test changes the schedule of pair 7. A test for a
+performance-only change cannot fail on the old code, so this check is how to
+show it is not vacuous.
+
+**End state.** The scene runs at 60 fps. The EE and VU1 threads are each about
+27% idle. The GS thread is about 82% idle, waiting in
+`-[CAMetalLayer nextDrawable]`, so output is bound by Metal presentation.
+Further VU1 work in this scene only buys headroom. When computing idle time
+from `sample`, count `semaphore_timedwait_trap`. Leaving it out once made
+the GS thread look 92% busy.
+
+## Known gaps (2026-09-26)
+
+- **VU1 same-pair DIV/SQRT/RSQRT + Q broadcast.** Found while writing up the
+  branch history. VU1's `EmitPair` hoists the FDIV stall above the upper
+  instruction for WAITQ only, while VU0 now hoists it for all four
+  (`IsFDIVPipe`). A temporary differential test issued a DIV while another
+  was pending, with a Q-broadcast upper in the same pair. At budget 2, VF
+  differed from the interpreter. The test was removed and the bug is not fixed.
+- **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions`** has
+  failed since `4293623d6`; see "OPMULA/OPMSUB" above.
+- **`EERecompilerTest.BranchAndDelayMustFitBlockAndPage` and
+  `MemoryExitsBeforeBranchDoNotExecuteLinkOrDelay` crash** with SIGSEGV in
+  `_cpuEventTest_Shared`, called from `TryExecute` through `intEventTest`.
+  Both branch to their own block's entry, which since `887bbc493` loops
+  inside `TryExecute`. When the event deadline is due, that loop runs the
+  event test, which the unit-test fixture cannot. The other 253 tests pass
+  (256 total).

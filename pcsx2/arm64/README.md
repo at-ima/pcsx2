@@ -4,12 +4,55 @@ These backends are incomplete. Native instruction coverage should grow within
 the existing provider and block-execution contracts, with differential tests
 against the interpreters. Do not add game-specific execution shortcuts.
 
-See [the intro performance investigation](PERFORMANCE.md) for measured bottlenecks
-and the limits of the current x64 comparison.
+See [the investigation log](PERFORMANCE.md) for measured bottlenecks, the
+limits of the current x64 comparison, and the reasoning behind each change.
+
+Every processor now has a partial native block recompiler. Each one compiles
+what it supports and hands the rest to the existing interpreter, one
+instruction or pair at a time, through the same architectural state:
+
+| Unit | Files | Setting | Still interpreted |
+| --- | --- | --- | --- |
+| EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, BC2, MMIO/unmapped accesses |
+| IOP | `IopRecompiler.cpp`, `IopCodeGenerator.cpp` | `EnableIOP` | J, GTE, LWL/LWR/SWL/SWR, SYSCALL/BREAK, RFE, code outside the 8 MiB RAM window |
+| VU0 micro mode | `VU0Recompiler.cpp`, `VU0Pipeline.cpp` | `EnableVU0` | JR/JALR/BAL, ISWR, MFP, RINIT/RGET/RNEXT/RXOR, the EFU pipe, E/M/D/T-bit pairs |
+| VU1 | `VU1Recompiler.cpp`, `VU1Pipeline.cpp` | `EnableVU1` | ISWR, MFP, RINIT/RGET/RNEXT/RXOR, EATAN*/ESIN/EEXP, nested branches, end-bit delay slots |
+
+VU0 macro mode (COP2 from EE code) still runs the interpreter's handlers,
+called from native EE blocks. MTVU (`THREAD_VU1`) is supported. See
+[Known issues](#known-issues) before relying on any of this.
 
 ## IOP
 
-ARM64 still uses the IOP interpreter. Aligned instruction fetches in the first
+`IopRecompiler.cpp` owns the IOP block cache and the execution loop, and
+`IopCodeGenerator.cpp` emits straight-line blocks of at most 32 instructions.
+Generated code returns the completed-instruction prefix and an exit action,
+following the EE contract below. Cycle accounting, event tests and exceptions
+stay outside generated code. The outer loop copies `R3000AInterpreter.cpp`'s
+`intExecuteBlock` cycle-budget loop, since that loop is not exported; keep the
+two in sync. When no block can start at the current PC, the loop runs the
+interpreter until a branch is actually taken, instead of looking up a block
+again after every instruction.
+
+Native code covers ALU, shift, multiply/divide, HI/LO moves, the COP0 moves
+(not RFE), and aligned byte/halfword/word loads and stores through the LUT fast
+path. Branches and jumps are native except plain J, whose interpreter handler
+checks the delay slot for an IRX import-table marker. A delay slot must be a
+supported non-memory, non-branch integer instruction. Stores honour
+Status.IsC: with the cache isolated, the interpreter skips the RAM write, and
+so does native code. Without that check, a normal boot never got past a black
+screen, while resuming from a save state worked.
+
+Only main RAM and its mirrors below 8 MiB are compiled. The IOP has no page
+write protection, so each entry compares the whole block against its source
+with `memcmp`. A word-indexed reverse map, modelled on the x86 recompiler's
+`PSX_GETBLOCK` table, lets `Clear()` drop only the blocks a store overlaps;
+`Clear()` runs on every IOP store. Clearing the whole cache on every store
+was measured recompiling thousands of blocks per second. Self-modifying IRX
+loaders and stores through a different RAM mirror still need proper testing.
+
+The interpreter fallback keeps the earlier interpreter-side improvements.
+Aligned instruction fetches in the first
 8 MiB physical RAM window read through the live RLUT directly, including RAM
 mirrors and virtual aliases. Each fetch reloads both the page mapping and the
 instruction; no decoded-code cache or invalidation mechanism is introduced.
@@ -60,8 +103,16 @@ subtraction, signed greater-than/min/max, equality masks, 128-bit logic,
 PEXT/PPAC lane rearrangement and PCPYLD/PCPYUD. Both source vectors are loaded
 before the full destination is written, including aliased source/destination
 registers. These non-saturating operations preserve host floating-point status
-and are eligible in native delay slots. Saturating arithmetic, other packed
-operations and floating-point arithmetic remain interpreted.
+and are eligible in native delay slots. Saturating arithmetic and other packed
+operations remain interpreted.
+
+COP1 (the EE FPU) covers MFC1/CFC1/MTC1/CTC1, LWC1/SWC1, ADD.S/SUB.S/MUL.S,
+ABS.S/NEG.S/MOV.S, CVT.S.W/CVT.W.S, C.F/C.EQ/C.LT/C.LE and BC1F/BC1T/BC1FL/
+BC1TL. Operands and results follow the interpreter's non-IEEE rules in
+`FPU.cpp`: denormals flush to signed zero and Inf/NaN saturate to +-Fmax, with
+the same O/U and sticky flags in FCR31. DIV.S/SQRT.S/RSQRT.S and the
+ACC-based MADD/MSUB/MULA family still end the block. This needs proper
+testing across games.
 
 COP2 (VU0 macro-mode: `QMFC2`/`CFC2`/`QMTC2`/`CTC2` and the `COP2_SPECIAL`
 arithmetic family) no longer ends the native block. `EmitCOP2` sets
@@ -73,7 +124,8 @@ trailing `Ret()` otherwise returns into itself — see "COP2 (VU0 macro-mode)
 no longer ends the native EE block" in `PERFORMANCE.md`), as must `x0` and
 `x14`, since the handler is an ordinary AAPCS64 function free to clobber
 every caller-saved register. BC2 (rs == 8) is not modeled and still ends the
-block. VU0 micro-mode programs and IOP remain fully interpreted regardless.
+block. A VU0 micro-mode program started from macro mode runs on the VU0
+provider described below.
 
 Supported integer branches and jumps terminate the block. Their delay slot must
 be a supported, nontrapping integer instruction in the same page and block.
@@ -87,6 +139,18 @@ branch, before any link-register changes. Goemon TLB callbacks remain interprete
 changing that gamefix invalidates the block cache. Branch/event integration still
 needs proper testing across more games.
 
+A taken branch whose target is the entry PC of the block that just ran is
+common in delay and polling loops. `TryExecute` runs that block again itself,
+at most 4096 times, instead of returning to the shared driver. Between
+iterations it does the driver's bookkeeping: it commits the branch
+(`intFinishBranch` without the wait-loop hack, which is interpreter-only),
+calls `intUpdateCPUCycles`, and checks `EEBranchEventDue`. When an event is due
+it calls `intEventTest` and returns `Continue`, so the driver does not commit
+the cycles a second time. Repeated iterations do not revalidate the block's
+source; the iteration cap keeps that window short. As a result, `TryExecute`
+can run more than one block per call and can process events itself. Two
+older unit tests assume otherwise (see [Known issues](#known-issues)).
+
 An unsupported opcode ends compilation. An unsupported memory access exits
 before that instruction: MMIO, counter reads requiring event tests, unmapped
 addresses and alignment errors are handled by the original interpreter path.
@@ -95,25 +159,41 @@ current block's source exits after that store, before any stale instruction can
 execute. This comparison uses host addresses to cover virtual aliases.
 
 Blocks stay within one guest page. Every entry validates the current virtual
-mapping and all compiled source words. This handles TLB remapping, DMA, code
-patches and state restoration without requiring a separate invalidation scheme.
-The initial implementation uses memory-backed guest registers; register caching
-must preserve the same entry, exit and fallback contracts when introduced.
+mapping. Compiling a block write-protects its source page through vtlb's
+existing page tracking (`mmap_MarkCountedRamPage`), the mechanism the x86
+recompiler uses. While the page stays protected (`ProtMode_Write`), or is not
+RAM (`ProtMode_NotRequired`), entries skip comparing source words. A write to a
+protected page faults, and `ClearProvider` drops every cached block. Pages that
+keep self-modifying end up in `ProtMode_Manual` and are compared on every entry,
+as before. The page tracking goes through the physical mapping, so it is used
+only when that mapping and the virtual mapping resolve to the same byte;
+otherwise the entry falls back to `memcmp`. The unit tests' synthetic code
+buffers take that fallback. The initial implementation uses memory-backed guest
+registers; register caching must preserve the same entry, exit and fallback
+contracts when introduced.
 
-A small direct-mapped lookup cache avoids repeated hash-table searches for hot
-PCs. Tags contain the full virtual PC. Unsupported entry opcodes are cached only
-while their mapped source pointer and instruction word remain unchanged; rejected
-branch/delay pairs still validate both words. Supported hits retain full source
-validation. The owning map keeps block addresses stable across rehash, and reset
-or shutdown clears lookup pointers before destroying blocks.
+Lookup goes through three levels. First, a one-entry cache holds the most
+recently dispatched PC. Second, a 65536-entry direct-mapped cache is tagged with
+the full virtual PC. Third, the block table is a fixed 2^19-slot,
+linear-probed open-addressing table indexed by Fibonacci hashing. It replaced
+`std::unordered_map`, whose prime bucket count cost an integer division per
+probe; that division was measured as a large share of `TryExecute`'s own time.
+Each table slot carries a generation tag. `Reset` and `ClearProvider` bump the
+generation instead of wiping all slots, because a normal boot calls
+`ClearProvider` on every TLB remap. With a full wipe per remap, a normal boot
+appeared to hang. Blocks live in a `std::deque`, so pointers held by the caches
+stay valid. `Compile` resets the whole cache once the table is three quarters
+full. Unsupported entry opcodes are cached only while their mapped source
+pointer and instruction word remain unchanged.
 
 The cache is keyed by the full guest PC. Distinct blocks with the same page
 offset coexist instead of repeatedly evicting and recompiling each other.
 Rejected branch/delay pairs retain their source words so unchanged unsupported
 pairs do not repeatedly invoke compilation. Patching either word rechecks the
-pair. Cache hits validate bytes without decoding the entry opcode again;
-allocation and compilation stay outside the frequently executed dispatcher.
-Exhausting the reserved executable buffer resets the cache as a whole.
+pair. Cache hits do not decode the entry opcode again; on pages that are not
+write-protected, they still compare the source bytes. Allocation and
+compilation stay outside the frequently executed dispatcher. Exhausting the
+reserved executable buffer resets the cache as a whole.
 
 Native execution uses the x86 dispatcher's signed 64-bit event-deadline check
 for branch polling, including interpreted branch fallbacks. Boot and ordinary
@@ -127,17 +207,61 @@ Interrupt-sensitive games still need broader testing.
 and architectural TLB-miss behavior. It is independent of whether a provider
 emits native instructions; the existing x86 recompiler keeps its own behavior.
 
+## VU0
+
+`VU0Recompiler.cpp` and `VU0Pipeline.cpp` compile VU0 micro-mode programs.
+They were adapted from the VU1 files below, which they leave untouched. VU0
+runs synchronously on the EE thread and has no XGKICK path, so none of the
+MTVU or packet machinery applies. Upper FMAC instructions use a copy of VU1's
+decoder (currently identical) and emitters. The lower set covers
+LQ/SQ/LQI/SQI/LQD/SQD, the integer ALU ops, MOVE/MR32/MFIR/MTIR,
+ILW/ILWR/ISW, the CLIP/status/MAC flag family, DIV/SQRT/RSQRT/WAITQ, B and
+the six integer-conditional branches. Up to eight
+VF/ACC registers stay in host vector registers for the whole block. Every pair
+goes through a generic preparation stub; VU0 has neither VU1's precomputed
+schedule nor its deferred regions.
+
+Traces follow a static B and the taken edge of an integer-conditional branch;
+a guard exits on the fall-through edge. A trace ends at JR/JALR/BAL, at a
+branch inside another branch's delay slot, and at a PC it has already visited,
+since there is no loop-to-entry back edge yet. A block records every source
+range it covered, and validation walks those ranges. An integer-conditional
+branch uses a separate stub that waits for a pending ILW writing the tested
+register.
+
+DIV/SQRT/RSQRT/WAITQ stall on a pending divide and retire it *before* the
+paired upper instruction runs. `VU0microInterp.cpp` runs `_vuTestFDIVStalls`
+and `_vuTestPipes` ahead of `_vu0ExecUpper`, so a Q broadcast in the same pair
+(MULq and friends) sees the newly retired value. The first version emitted the
+stall in source order, and Ridge Racer V then rendered a large black shadow
+over the car. The block-retire path also retires the FDIV and EFU slots. A
+block that advances the cycle past a divide's latency would otherwise go on
+reading the old Q. `Execute()` clears `VUFLAG_MFLAGSET` on entry, as the
+interpreter does. `InvalidateAll()` also drops the pipeline stubs, since
+rewinding the code buffer overwrites them.
+
+JR/JALR/BAL, ISWR, MFP, the RINIT/RGET/RNEXT/RXOR random-number ops,
+ESADD..WAITP and E/M/D/T-bit pairs fall back to the interpreter. On VU0,
+unlike VU1, the M bit ends interpreter execution after its pair. This needs
+proper testing beyond Ridge Racer V, particularly back-to-back branches.
+
 ## VU1
 
 `VU1Recompiler.cpp` uses the interpreter's architectural registers and pipeline
 queues. Static unconditional B edges can connect the branch, supported delay
-pair and destination within one bounded native trace. Taken IBEQ/IBNE/IBGTZ edges also
-connect their supported delay pair and destination, including integer-load waits
-and VI backup selection. Not-taken edges exit with complete architectural state. Other conditional/indirect branches,
-nested branches and end-bit delay slots retain interpreter fallback. Pipeline
-retirement retains the interpreter timing. Normal
-XGKICK follows microVU's delayed whole-packet policy; the interpreter and
-`XgKickHack` keep incremental transfers.
+pair and destination within one bounded native trace. Taken integer-branch
+edges (IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ) also connect their supported delay
+pair and destination, including integer-load waits and VI backup selection.
+Not-taken edges exit with complete architectural state. JR/JALR (target from
+a VI register) and BAL execute natively together with their delay pair. The
+trace then ends and the next dispatch resolves the target. A deferred region
+ending in such a delay slot must not overwrite TPC with a compile-time value;
+a version that did broke rendering. XTOP/XITOP read VIF1's TOP/ITOP, or the
+MTVU thread's `vu1Thread.vifRegs` copy under MTVU, as `_vuXTOP`/`_vuXITOP`
+do. Nested branches and end-bit delay slots retain interpreter fallback.
+Pipeline retirement retains the interpreter timing. Normal XGKICK follows
+microVU's delayed whole-packet policy; the interpreter and `XgKickHack` keep
+incremental transfers.
 
 Connected regions share the VF/ACC cache assignment and the pipeline schedule in
 execution order. They do not publish/reload cached vectors or restart preparation
@@ -156,10 +280,16 @@ Wider gameplay and callback combinations still need proper testing.
 Within a block, the first three pairs inspect the incoming FMAC queue. Later
 pairs can use a dependency calculated during compilation: incoming four-cycle
 FMAC results have matured, and only producers in the preceding three pairs can
-still stall. Cycle-wrap boundaries retain the general queue scan. Preparation
-entry points are specialized for read-free pairs, incoming dependencies,
-each scheduled producer distance, and integer-branch VI dependencies. `VU1Pipeline.cpp` emits these entry stubs
-and one shared ARM64 retirement body per code-cache generation. It mirrors the
+still stall. A pair that reads no VF cannot stall on the FMAC pipe, so its
+advance is one cycle even among the first three; this stops unknown ages from
+spreading from the prologue into later scheduled pairs. Cycle-wrap boundaries
+retain the general queue scan. The stubs publish TPC and `code` from two
+adjacent `Instruction` fields (`tpc`, `code`) that `Compile()` fills in, with
+one `Ldp`, instead of deriving them from pc/upper/lower on every pair.
+Preparation entry points are specialized for read-free pairs, incoming
+dependencies, each scheduled producer distance, and integer-branch VI
+dependencies. `VU1Pipeline.cpp` emits these entry stubs and one shared ARM64
+retirement body per code-cache generation. It mirrors the
 reference retirement order in `VUPipeline.h`; generated blocks do not each contain
 a copy of the retirement routine. Native retirement omits interpreter trace logs.
 Five of the seven entry stubs always carry a zero integer-branch-wait register
@@ -195,10 +325,17 @@ single-slot FDIV pipe for its 7 (DIV/SQRT) or 13 (RSQRT) cycle latency, where th
 existing generic retirement publishes it. An outstanding entry stalls the next
 FDIV issue and is retired before being replaced, mirroring `_vuTestFDIVStalls`
 followed by `_vuTestPipes`. FDIV reads also participate in the FMAC hazard scan.
-Because a deferred region skips shared preparation, pairs within the pipe's
-latency stay on the generic path, as ILW already does for the IALU pipe. The EFU
-instructions still fall back. This needs proper testing across games rather than
-only the differential tests.
+Pairs issued while a divide is still in the pipe stay on the precomputed
+schedule. They are marked `fdiv_pending` and retire the FDIV slot inline,
+after their own FMAC writeback, so the two status-flag merges keep
+`VUPipeline::Retire`'s order. Deferred regions still end at these pairs,
+because a region keeps the status flag in a host register. A pair that reads or
+writes Q or P while an FDIV or EFU entry is outstanding stalls until that entry
+retires, so its advance is not the nominal one. `AnalyzeRetirement` treats that
+advance as unknown, and the following pairs use the generic path until their
+producers' ages are known again. The EFU pipe's latency window is still
+excluded from the schedule, as ILW's is for the IALU pipe. This needs proper
+testing across games rather than only the differential tests.
 
 WAITQ shares DIV/SQRT/RSQRT's pending-entry stall but issues nothing of its own,
 so it leaves the FDIV pipe empty once retired instead of re-arming it. Its
@@ -209,7 +346,10 @@ that actually settles Q. The interpreter also runs this stall-and-retire step
 before executing the paired upper instruction, so an upper op that broadcasts Q
 in the same pair (a common idiom pairing WAITQ with a Q-broadcast MULq/MADDq/etc.)
 observes the freshly retired value; native emission orders the same-pair FDIV
-stall ahead of the upper instruction to match.
+stall ahead of the upper instruction to match. On VU1 this is done for WAITQ
+only. DIV/SQRT/RSQRT still stall inside `EmitLower`, after the upper
+instruction, so a same-pair Q broadcast there reads the previous Q. VU0 hoists
+all four (`IsFDIVPipe`). See [Known issues](#known-issues).
 
 ESADD, ERSADD, ELENG, ERLENG, ESUM, ERCPR, ESQRT, ERSQRT and WAITP use a second,
 structurally identical single-slot pipe (EFU, retiring into P instead of Q).
@@ -283,8 +423,9 @@ which had no MTVU handling because that combination is unreachable on x64. On th
 MTVU thread it therefore touched EE-owned state (VPU_STAT, FBRST, `vif1Regs`,
 `cpuRegs.cycle`, INTC). Those sites now use the `VUFLAG_MTVURUNNING` VU1-local run
 flag and report E/T bits through `mtvuInterrupts`, matching `mVUEBit`/`mVUTBit`.
-See "MTVU (THREAD_VU1) on the ARM64 backend" in PERFORMANCE.md. Only one game has
-been exercised so far; this needs proper testing across games.
+See "MTVU (THREAD_VU1) on the ARM64 backend" in PERFORMANCE.md. Only Saru! Get
+You! 2 and Ridge Racer V have been played with it so far; this needs proper
+testing across games.
 
 Arithmetic input clamping uses signed/unsigned NEON min operations to clamp both
 signs of infinity/NaN. When VU1's FPCR flushes denormals, arithmetic supplies the
@@ -394,7 +535,7 @@ TPC/code updates from those regions. It shares pair emission and metadata encodi
 with the general path. EmitPair must preserve q28..q31 and x25..x28. There are no
 C++ callbacks or unsupported instructions inside a deferred region; expanding supported
 operations must preserve that invariant. Wider gameplay still needs proper testing.
-This is an internal block-state contract, not yet cross-block linking or MTVU.
+This is an internal block-state contract, not yet cross-block linking.
 Runtime profiles should distinguish these management costs from arithmetic throughput.
 
 ## Validation
@@ -417,3 +558,47 @@ A generated wrapper checks all preparation entries across C++ callouts, includin
 cached-value publication, callback modifications and upper-vector ABI clobbers.
 Synthetic timing results are kept under the ignored build directory; they are
 not game-performance guarantees.
+
+`ee_recompiler_tests.cpp` also covers COP1 against `FPU.cpp`, COP2 transfers and
+macro arithmetic, and a self-looping branch against a manual replay of the
+driver's bookkeeping. `iop_recompiler_tests.cpp` compares native IOP blocks with
+the interpreter, including IsC stores. `vu0_recompiler_tests.cpp` checks that
+native code is actually emitted: a recompiler that interprets every pair would
+pass all the differential tests. It also covers back-to-back divides, the
+DIV+MULq and WAITQ+MULq same-pair shapes, branches, and ILW before an integer
+branch. The VU0 Q tests were confirmed to fail without their fixes. The
+`VUFLAG_MFLAGSET` livelock and the EE block-table boot hang have no regression
+tests. A test for a performance-only change cannot fail on the old, merely
+slower code; a schedule dump with the change toggled confirmed that the VU1
+prologue-scheduling test exercises it.
+
+Differential tests are necessary but not sufficient. Several bugs on this
+branch passed every test and showed up only in live play: whole-screen MTVU
+breakage, the black shadow, the VU0 livelock, and two ways a normal boot never
+started. Resuming a save state skips boot entirely, so check a normal boot as
+well.
+
+## Known issues
+
+As of 2026-09-26, `core_test` has 256 tests; 253 pass.
+
+- **VU1 same-pair DIV/SQRT/RSQRT with a Q broadcast.** VU1 hoists the FDIV stall
+  above the upper instruction only for WAITQ (`EmitPair`); for DIV/SQRT/RSQRT
+  it stays in `EmitLower`, after the upper op. Take a pair such as `MULq` +
+  `DIV`, issued while an earlier divide is still pending. Native code
+  multiplies by Q from before that divide retires; the interpreter uses the
+  retired value. A temporary differential test confirmed the mismatch. This
+  is the same ordering bug VU0 had, and the same fix (`IsFDIVPipe`) applies.
+  Not fixed yet.
+- **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
+  has failed since `4293623d6` (OPMULA/OPMSUB). The cause is a cross-block FMAC
+  hazard gap, not those opcodes; see "OPMULA/OPMSUB" in PERFORMANCE.md.
+- **Two EE tests crash (SIGSEGV):** `BranchAndDelayMustFitBlockAndPage` and
+  `MemoryExitsBeforeBranchDoNotExecuteLinkOrDelay`. They call `TryExecute`
+  directly on a block that branches to its own entry. Since `887bbc493` that
+  path can call `intEventTest()`, and the test fixture has no event system;
+  the crash is inside `_cpuEventTest_Shared`. The tests' one-block-per-call
+  assumption needs updating, or the fixture needs to keep the event deadline
+  out of reach. Exclude them with
+  `--gtest_filter=-EERecompilerTest.BranchAndDelayMustFitBlockAndPage:EERecompilerTest.MemoryExitsBeforeBranchDoNotExecuteLinkOrDelay`.
+- Game coverage is narrow: Saru! Get You! 2 and 3 and Ridge Racer V.
