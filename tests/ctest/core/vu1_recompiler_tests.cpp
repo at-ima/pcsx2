@@ -2678,6 +2678,39 @@ TEST_F(VU1RecompilerTest, ErcprEsqrtErsqrtComputeScalarLane)
 			}
 }
 
+TEST_F(VU1RecompilerTest, EfuReciprocalsKeepTheOverflowClampBounds)
+{
+	// v6/v7 hold the block's overflow clamp bounds. ERSADD/ERLENG/ERCPR/ERSQRT
+	// used to build their 1.0 dividend in s6/d6, which zeroes v6's upper lanes,
+	// so every later clamped FMAC input had y/z/w clamped to 0 and x to 1.0.
+	// This broke Burnout 3's lighting.
+	const VURegs initial = VU1, initial0 = VU0;
+	const bool overflow = EmuConfig.Cpu.Recompiler.vu1Overflow;
+	EmuConfig.Cpu.Recompiler.vu1Overflow = true;
+	constexpr u32 opcodes[] = {0x73d, 0x73f, 0x7be, 0x7bd}; // ERSADD, ERLENG, ERCPR, ERSQRT
+	for (u32 opcode : opcodes)
+		for (u32 budget : {2u, 3u, 8u})
+		{
+			SCOPED_TRACE(testing::Message() << std::hex << opcode << std::dec << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			for (u32 lane = 0; lane < 4; lane++)
+			{
+				VU1.VF[1].F[lane] = 4.0f;
+				VU1.VF[3].F[lane] = 10.0f + lane;
+				VU1.VF[4].F[lane] = -3.0f - lane;
+			}
+			Put(0, 0x2ff, 0x80000000 | opcode | (1 << 11)); // reads VF1.x
+			Put(8, (15 << 21) | (4 << 16) | (3 << 11) | (2 << 6) | 0x28, 0); // ADD.xyzw VF2, VF3, VF4
+			for (u32 pc = 16; pc < 64; pc += 8)
+				Put(pc, 0x800002ff, 0);
+			Compare(budget);
+			if (HasFatalFailure())
+				break;
+		}
+	EmuConfig.Cpu.Recompiler.vu1Overflow = overflow;
+}
+
 TEST_F(VU1RecompilerTest, WaitpStallsOnPendingEfuPipeAcrossBudgets)
 {
 	const VURegs initial = VU1, initial0 = VU0;

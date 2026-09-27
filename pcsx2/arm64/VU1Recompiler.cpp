@@ -499,7 +499,9 @@ namespace
 	// VU1Pipeline.cpp stubs, which never touch vector registers at all).
 	// v8-v15 hold the VectorCache and v28-v31 are used by EmitDeferredRegion's
 	// per-slot MAC/status/clip flag cache, so v6/v7/v24 are deliberately
-	// outside both ranges.
+	// outside both ranges. Never use s6/d6/s7/d7 as scratch either: a scalar
+	// write zeroes the other lanes, which then clamps every later input's
+	// y/z/w to 0 (the EFU reciprocals did this; Burnout 3's lighting broke).
 	void ClampInputAlways(MacroAssembler& a, VRegister reg)
 	{
 		a.And(v17.V16B(), reg.V16B(), v24.V16B());
@@ -1153,8 +1155,8 @@ namespace
 				Label done;
 				a.Fcmp(s5, 0.0);
 				a.B(eq, &done);
-				a.Fmov(s6, 1.0f);
-				a.Fdiv(s5, s6, s5);
+				a.Fmov(s1, 1.0f);
+				a.Fdiv(s5, s1, s5);
 				a.Bind(&done);
 			}
 			else if (op == Lower::Eleng || op == Lower::Erleng)
@@ -1172,8 +1174,8 @@ namespace
 					Label done;
 					a.Fcmp(s5, 0.0);
 					a.B(eq, &done);
-					a.Fmov(s6, 1.0f);
-					a.Fdiv(s5, s6, s5);
+					a.Fmov(s1, 1.0f);
+					a.Fdiv(s5, s1, s5);
 					a.Bind(&done);
 				}
 				a.Bind(&skip_sqrt);
@@ -1232,8 +1234,8 @@ namespace
 				a.Fcmp(s2, 0.0);
 				a.B(eq, &done);
 				a.Fcvt(d2, s2);
-				a.Fmov(d6, 1.0);
-				a.Fdiv(d2, d6, d2);
+				a.Fmov(d1, 1.0);
+				a.Fdiv(d2, d1, d2);
 				a.Fcvt(s2, d2);
 				a.Bind(&done);
 			}
@@ -1248,8 +1250,8 @@ namespace
 					Label done;
 					a.Fcmp(s2, 0.0);
 					a.B(eq, &done);
-					a.Fmov(s6, 1.0f);
-					a.Fdiv(s2, s6, s2);
+					a.Fmov(s1, 1.0f);
+					a.Fdiv(s2, s1, s2);
 					a.Bind(&done);
 				}
 				a.Bind(&skip_sqrt);
