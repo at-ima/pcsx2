@@ -185,3 +185,28 @@ bool Threading::KernelSemaphore::TryWait()
 }
 
 #endif
+
+bool Threading::UserspaceSemaphore::TryWaitWithLowPowerSpin(u32 max_ns)
+{
+	if (TryWait())
+		return true;
+#if defined(ARCH_ARM64)
+	const u64 start = GetCPUTicks();
+	const u64 limit = static_cast<u64>(max_ns) * GetTickFrequency() / 1000000000;
+	do
+	{
+		// Arm the exclusive monitor on the counter. WFE then returns once
+		// another core writes its cache line (a Post()), or on an interrupt or
+		// event, whichever comes first. Needs proper testing across games.
+		s32 value;
+		asm volatile("ldaxr %w0, [%1]" : "=&r"(value) : "r"(&m_counter) : "memory");
+		if (value <= 0)
+			asm volatile("wfe" ::: "memory");
+		else
+			asm volatile("clrex" ::: "memory");
+		if (TryWait())
+			return true;
+	} while (GetCPUTicks() - start < limit);
+#endif
+	return false;
+}

@@ -10,6 +10,7 @@
 #include "VMManager.h"
 
 #include "common/FPControl.h"
+#include "common/HostSys.h"
 #include "common/ScopedGuard.h"
 #include "common/StringUtil.h"
 #include "common/WrappedMemCopy.h"
@@ -463,8 +464,11 @@ void MTGS::MainLoop()
 					if (!vu1Thread.semaXGkick.TryWait())
 					{
 						mtvu_lock.unlock();
-						// Wait for MTVU to complete vu1 program
-						vu1Thread.semaXGkick.Wait();
+						// Wait for MTVU to complete vu1 program. Many programs take
+						// microseconds (Shadow of the Colossus runs ~500k a second),
+						// and waking a sleeping GS thread took ~15% of MTVU there.
+						if (!vu1Thread.semaXGkick.TryWaitWithLowPowerSpin(SPIN_TIME_NS))
+							vu1Thread.semaXGkick.Wait();
 						mtvu_lock.lock();
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
