@@ -535,6 +535,43 @@ TEST_F(VU1RecompilerTest, BranchEndBitAndSpecialInstructionFallback)
 	EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x100, 0u);
 }
 
+TEST_F(VU1RecompilerTest, EndBitPairEndsTraceAtEveryBudget)
+{
+	// The E pair runs natively as the last pair of its trace; the interpreter
+	// steps its delay slot and ends the program.
+	constexpr u32 upper[] = {0x2ff, 0x28, 0x2a, 0x08, 0x1c, 0x1d, 0x2bc, 0x2fd, 0x13c};
+	constexpr u32 lower[] = {0x8000033c, 0x80000030, 0x80000031, 0x800003bc, 0x10000003, 0x12000003, 0x02000000, 0};
+	const VURegs initial0 = VU0, initial1 = VU1;
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		const u32 length = seed % 6;
+		const auto pair = [&](u32 i, u32 extra) {
+			const u32 op = upper[(seed * 7 + i * 3) % std::size(upper)];
+			const u32 dest = (op & 0x3f) >= 0x3c ? 0 : ((seed + i) % 4) << 6;
+			Put(i * 8, extra | (((seed + i) % 15 + 1) << 21) | (2 << 16) | (1 << 11) | dest | op,
+				(((seed + i) % 16) << 21) | (3 << 16) | (1 << 11) | lower[(seed * 5 + i) % std::size(lower)]);
+		};
+		for (u32 i = 0; i < length; i++)
+			pair(i, 0);
+		pair(length, 0x40000000); // E
+		pair(length + 1, 0); // Its delay slot
+		for (u32 budget = 1; budget <= length * 4 + 16; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "seed " << seed << " budget " << budget);
+			VU0 = initial0;
+			VU1 = initial1;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+		// The program ended where the interpreter ends it.
+		EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x100, 0u);
+		EXPECT_EQ(VU1.VI[REG_TPC].UL, (length + 2) * 8 / 8);
+		for (u32 i = 0; i < length + 2; i++)
+			Put(i * 8, 0x800002ff, 0x3f800000);
+	}
+}
+
 TEST_F(VU1RecompilerTest, ConnectedBranchRegionsPreserveEveryBudgetAndSourceEdit)
 {
 	const VURegs initial = VU1, initial0 = VU0;

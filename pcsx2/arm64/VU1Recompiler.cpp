@@ -250,7 +250,10 @@ namespace
 	Upper DecodeUpper(u32 code)
 	{
 		const u32 op = code & 0x3f;
-		if (code & 0x58000000) // E/D/T need the complete interpreter control path.
+		// D/T need the complete interpreter control path. An E pair is compiled as
+		// the last pair of its trace; its delay slot and the program end stay
+		// with the interpreter (see Compile()).
+		if (code & 0x18000000)
 			return {};
 		if (op < 0x1c)
 		{
@@ -1774,6 +1777,11 @@ namespace
 			}
 			StoreWord(a, 1, offsetof(VURegs, branch));
 		}
+		else if (ins.upper & 0x40000000)
+		{
+			// What _vu1Exec() leaves after an E pair: ebit 2, counted down once.
+			StoreWord(a, 1, offsetof(VURegs, ebit));
+		}
 		else if (block.delay[index])
 		{
 			const auto& prev = block.instructions[index - 1];
@@ -2770,6 +2778,12 @@ namespace
 				(!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Unsupported))
 				break;
 			const bool conditional = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
+			const bool ebit = ins.upper & 0x40000000;
+			// The interpreter retires an E pair in a delay slot, or one that
+			// branches itself, together with that branch.
+			if (ebit && (pending_branch || conditional || (!(ins.upper & 0x80000000) &&
+				(DecodeLower(ins.lower) == Lower::Branch || IsRegisterBranch(DecodeLower(ins.lower))))))
+				break;
 			// Follow the taken edge; the generated guard exits on the other path.
 			if (conditional && pending_branch)
 				break;
@@ -2873,6 +2887,8 @@ namespace
 			block->count++;
 			if (finishing_terminal_delay)
 				break; // JR/JALR/BAL's delay slot is native; the runtime target is not.
+			if (ebit)
+				break; // Execute() sees VU1.ebit and steps the delay slot and program end.
 		}
 		VU1.code = saved_code;
 		if (block->count)
