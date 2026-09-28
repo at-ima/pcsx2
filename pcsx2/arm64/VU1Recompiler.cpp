@@ -2111,8 +2111,13 @@ namespace
 				// the flags. Q and P are final here (a pending divide is retired
 				// above via fdiv_pending, and the EFU is idle). An FDIV/EFU issue
 				// stamps its own sCycle and stalls on the previous entry, so it
-				// stays generic.
-				if (ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P)))
+				// stays generic. WAITQ only carries the Q write as a tag (see
+				// Compile); with its stall known above, the divide it waits on
+				// is due by the end of this pair's advance, so fdiv_pending
+				// retires it before the body and the body's own stall check
+				// finds the pipe empty.
+				const bool waitq = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Waitq;
+				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq)
 					plan.cycles = 0;
 				// Flag, Q and P readers stay in a region, which publishes the
 				// status and MAC flags it keeps in registers before them. An
