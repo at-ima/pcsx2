@@ -1709,6 +1709,11 @@ public:
 	/// Uses box downsampling to resize a texture.
 	virtual void FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) = 0;
 
+	/// Like FilteredDownsampleTexture() into a new texture of the given size, but the device may hand out a texture it
+	/// keeps, reusing earlier downsamples of sTex while sTex is unchanged. Only valid until the next call.
+	/// Returns nullptr if the device doesn't do this (the caller then makes its own copy).
+	virtual GSTexture* GetCachedDownsample(GSTexture* sTex, const GSVector2i& size, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) { return nullptr; }
+
 	virtual void RenderHW(GSHWDrawConfig& config) = 0;
 
 	virtual void ClearSamplerCache() = 0;

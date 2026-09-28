@@ -402,6 +402,25 @@ void GSDeviceMTL::EndRenderPass()
 	}
 }
 
+void GSDeviceMTL::MarkWritten(GSTextureMTL* tex, MTLLoadAction load)
+{
+	// Only RenderHW says which part of its attachments it draws to (m_pending_write_area). Anything else, or a pass
+	// that doesn't keep the old contents, counts as rewriting the whole texture.
+	const bool partial = m_pending_write_area && load == MTLLoadActionLoad;
+	const u64 old_serial = tex->m_write_serial;
+	tex->MarkWritten();
+	if (!partial)
+		return;
+	for (DownsampleCache& cache : m_downsample_cache)
+	{
+		if (cache.src == tex && cache.src_serial == old_serial)
+		{
+			cache.src_serial = tex->m_write_serial;
+			cache.dirty = cache.dirty.rempty() ? *m_pending_write_area : cache.dirty.runion(*m_pending_write_area);
+		}
+	}
+}
+
 static GSVector4 GetRTLoadInfo(GSTextureMTL* tex, MTLLoadAction* load_action)
 {
 	if (tex)
@@ -454,9 +473,9 @@ void GSDeviceMTL::BeginRenderPass(NSString* name, GSTexture* color, MTLLoadActio
 	needs_new |= md && depth_load == MTLLoadActionClear;
 
 	// Reset texture state
-	if (mc) mc->SetState(GSTexture::State::Dirty);
-	if (md) md->SetState(GSTexture::State::Dirty);
-	if (ms) ms->SetState(GSTexture::State::Dirty);
+	if (mc) { mc->SetState(GSTexture::State::Dirty); MarkWritten(mc, needs_new ? color_load : MTLLoadActionLoad); }
+	if (md) { md->SetState(GSTexture::State::Dirty); MarkWritten(md, needs_new ? depth_load : MTLLoadActionLoad); }
+	if (ms) { ms->SetState(GSTexture::State::Dirty); MarkWritten(ms, needs_new ? stencil_load : MTLLoadActionLoad); }
 
 	if (!needs_new)
 	{
@@ -762,6 +781,7 @@ bool GSDeviceMTL::DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, con
 	[enc setComputePipelineState:m_cas_pipeline[sharpen_only]];
 	[enc setTexture:static_cast<GSTextureMTL*>(sTex)->GetTexture() atIndex:0];
 	[enc setTexture:static_cast<GSTextureMTL*>(dTex)->GetTexture() atIndex:1];
+	static_cast<GSTextureMTL*>(dTex)->MarkWritten();
 	[enc setBytes:&constants length:sizeof(constants) atIndex:GSMTLBufferIndexUniforms];
 	[enc dispatchThreadgroups:MTLSizeMake(dispatchX, dispatchY, 1)
 	    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -1345,6 +1365,7 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 void GSDeviceMTL::Destroy()
 { @autoreleasepool {
 	FlushEncoders();
+	m_downsample_cache = {};
 	std::lock_guard<std::mutex> guard(m_backref->first);
 	m_backref->second = nullptr;
 
@@ -1646,6 +1667,7 @@ void GSDeviceMTL::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& r
 
 	sT->m_last_read  = m_current_draw;
 	dT->m_last_write = m_current_draw;
+	dT->MarkWritten();
 
 	id<MTLCommandBuffer> cmdbuf = GetRenderCmdBuf();
 	id<MTLBlitCommandEncoder> encoder = [cmdbuf blitCommandEncoder];
@@ -1883,6 +1905,100 @@ void GSDeviceMTL::FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u3
 
 	DoStretchRect(sTex, GSVector4::zero(), dTex, dRect, pipeline, Nearest, LoadAction::DontCareIfFull, &uniform, sizeof(uniform));
 }}
+
+GSTexture* GSDeviceMTL::GetCachedDownsample(GSTexture* sTex, const GSVector2i& size, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect)
+{ @autoreleasepool {
+	// Each downsampled texel only depends on the source and the uniform, so texels computed for an earlier draw stay
+	// good until the source is written. Games often read the same target over and over, e.g. SotC's post effects
+	// downsample a 4K target ~7 times a frame, some of them in a loop that only draws a few pixels in between.
+	// Unlike a fresh copy, texels outside dRect may hold data from other draws instead of zero, which only matters for
+	// draws that sample outside their own coverage. Needs proper testing with more native scaling games.
+	GSTextureMTL* sT = static_cast<GSTextureMTL*>(sTex);
+	FlushClears(sTex);
+	const GSVector4i irect(dRect);
+	if (sT->GetState() != GSTexture::State::Dirty || (GSVector4(irect) != dRect).mask() || irect.rempty() ||
+		irect.x < 0 || irect.y < 0 || irect.z > size.x || irect.w > size.y)
+	{
+		return nullptr;
+	}
+
+	id<MTLRenderPipelineState> pipeline = GetConvertPipeline(ShaderConvert::DOWNSAMPLE_COPY);
+	if (!pipeline)
+		return nullptr;
+	GSMTLDownsamplePSUniform uniform = { {static_cast<uint>(clamp_min.x), static_cast<uint>(clamp_min.x)}, downsample_factor,
+	  static_cast<float>(downsample_factor * downsample_factor), (GSConfig.UserHacks_NativeScaling > GSNativeScaling::Aggressive) ? 2.0f : 1.0f };
+
+	DownsampleCache* cache = nullptr;
+	for (DownsampleCache& entry : m_downsample_cache)
+	{
+		if (entry.tex && entry.src == sT && entry.tex->GetSize() == size && entry.tex->GetFormat() == sTex->GetFormat() &&
+			entry.factor == downsample_factor && entry.clamp_min == clamp_min.x && entry.step == uniform.step_multiplier)
+		{
+			cache = &entry;
+			break;
+		}
+	}
+	if (!cache)
+	{
+		cache = &*std::min_element(m_downsample_cache.begin(), m_downsample_cache.end(),
+			[](const DownsampleCache& a, const DownsampleCache& b) { return a.last_use < b.last_use; });
+		if (!cache->tex || cache->tex->GetSize() != size || cache->tex->GetFormat() != sTex->GetFormat())
+		{
+			cache->tex.reset(CreateSurface(GSTexture::Usage::RenderTarget, size.x, size.y, 1, sTex->GetFormat()));
+			if (!cache->tex)
+			{
+				*cache = {};
+				return nullptr;
+			}
+		}
+		cache->src = sT;
+		cache->src_serial = sT->m_write_serial - 1; // force a reset below
+		cache->factor = downsample_factor;
+		cache->clamp_min = clamp_min.x;
+		cache->step = uniform.step_multiplier;
+	}
+	cache->last_use = ++m_downsample_cache_uses;
+
+	GSTexture* ctex = cache->tex.get();
+	if (cache->src_serial != sT->m_write_serial)
+	{
+		cache->src_serial = sT->m_write_serial;
+		cache->valid.clear();
+		cache->dirty = GSVector4i::zero();
+		ClearRenderTarget(ctex, 0); // Zero outside the downsampled areas like a fresh copy, folded into the next pass
+	}
+	else if (!cache->dirty.rempty())
+	{
+		// Draws touched part of the source: redo the cached texels that read from there.
+		// Texel p reads source [max(p * factor, clamp_min), p * factor + (factor - 1) * step].
+		const int f = static_cast<int>(downsample_factor);
+		const int reach = (f - 1) * static_cast<int>(uniform.step_multiplier);
+		GSVector4i redo((cache->dirty.x - reach) / f - 1, (cache->dirty.y - reach) / f - 1,
+			(cache->dirty.z - 1) / f + 2, (cache->dirty.w - 1) / f + 2);
+		if (redo.x <= 1) redo.x = 0; // clamp_min makes texel 0 read like texel 1
+		if (redo.y <= 1) redo.y = 0;
+		cache->dirty = GSVector4i::zero();
+		for (const GSVector4i& r : cache->valid)
+		{
+			const GSVector4i area = r.rintersect(redo);
+			if (!area.rempty())
+				DoStretchRect(sTex, GSVector4::zero(), ctex, GSVector4(area), pipeline, Nearest, LoadAction::Load, &uniform, sizeof(uniform));
+		}
+	}
+
+	const bool hit = std::any_of(cache->valid.begin(), cache->valid.end(),
+		[&irect](const GSVector4i& r) { return r.rintersect(irect).eq(irect); });
+	if (!hit)
+	{
+		DoStretchRect(sTex, GSVector4::zero(), ctex, dRect, pipeline, Nearest, LoadAction::Load, &uniform, sizeof(uniform));
+		if (cache->valid.size() >= 16)
+			cache->valid.erase(cache->valid.begin());
+		cache->valid.push_back(irect);
+	}
+
+	return ctex;
+}}
+
 
 static id<MTLTexture> CreateDSAsRTTexture(id<MTLDevice> dev, NSUInteger width, NSUInteger height, MTLStorageMode storage, NSString* name)
 {
@@ -2343,6 +2459,7 @@ __fi void GSDeviceMTL::PrepareROVTexture(GSTexture** ptex)
 	FlushClears(tex);
 	tex->m_last_read  = m_current_draw;
 	tex->m_last_write = m_current_draw;
+	tex->MarkWritten();
 	*ptex = nullptr;
 }
 
@@ -2514,7 +2631,11 @@ void GSDeviceMTL::RenderHW(GSHWDrawConfig& config)
 	if (!rt_bind && !ds_bind && !stencil)
 		BeginFullROV(@"RenderHWROV", rt_size->GetWidth(), rt_size->GetHeight());
 	else
+	{
+		m_pending_write_area = &config.drawarea;
 		BeginRenderPass(@"RenderHW", rt_bind, MTLLoadActionLoad, ds_bind, MTLLoadActionLoad, stencil, MTLLoadActionLoad, rt1);
+		m_pending_write_area = nullptr;
+	}
 	id<MTLRenderCommandEncoder> mtlenc = m_current_render.encoder;
 	FlushDebugEntries(mtlenc);
 	if (usesStencil(config.destination_alpha))
