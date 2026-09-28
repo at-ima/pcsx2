@@ -2439,13 +2439,24 @@ namespace
 		a.Orr(w25, w25, Operand(w11, LSL, 6));
 	}
 
+	// x12 = &VU1.fmac[0] and w13 = the slot size, for EmitRegionSlotAddress.
+	void EmitRegionSlotBase(MacroAssembler& a)
+	{
+		a.Add(x12, x19, offsetof(VURegs, fmac));
+		a.Mov(w13, sizeof(fmacPipe));
+	}
+
+	// x0 = the FMAC slot `relative` places after w27 (always 0..3).
 	void EmitRegionSlotAddress(MacroAssembler& a, u32 relative)
 	{
-		a.Add(w0, w27, relative & 3);
-		a.And(w0, w0, 3);
-		a.Mov(w1, sizeof(fmacPipe));
-		a.Madd(x0, x0, x1, x19);
-		a.Add(x0, x0, offsetof(VURegs, fmac));
+		if (relative & 3)
+		{
+			a.Add(w0, w27, relative & 3);
+			a.And(w0, w0, 3);
+			a.Umaddl(x0, w0, w13, x12);
+		}
+		else
+			a.Umaddl(x0, w27, w13, x12);
 	}
 
 	// Publish what a deferred region keeps in registers, as of the end of pair
@@ -2467,20 +2478,33 @@ namespace
 		const u32 live = block.schedule[last_index].remaining + HasFmac(last);
 		// Only live entries are ever read again (queue walks start at fmacreadpos
 		// and cover fmaccount entries). Retired slots keep stale contents.
+		bool base = false;
 		for (u32 slot = 0; slot < 4; slot++)
 		{
 			const auto& entry = state.slots[slot];
 			if (entry.writer < 0 || entry.order + live < state.issued)
 				continue;
+			if (!base)
+			{
+				EmitRegionSlotBase(a);
+				a.Movi(v17.V4S(), 4);
+				base = true;
+			}
 			EmitRegionSlotAddress(a, slot);
-			EmitFmacMetadata(a, block.instructions[entry.writer]);
-			a.Sub(x9, x26, state.elapsed - entry.issue_cycle);
-			a.Str(x9, MemOperand(x0, offsetof(fmacPipe, sCycle)));
-			a.Mov(w9, 4);
-			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, Cycle)));
-			a.Str(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
-			a.Umov(w9, VRegister(28 + slot, 128).V4S(), 2);
-			a.Str(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
+			// The same fields as EmitFmacMetadata, two words per store.
+			const auto& ins = block.instructions[entry.writer];
+			const bool upper = ins.uregs.pipe == VUPIPE_FMAC;
+			const bool lower = ins.lregs.pipe == VUPIPE_FMAC;
+			const u64 flags = (upper ? ins.uregs.VIwrite : 0) | (lower ? ins.lregs.VIwrite : 0);
+			a.Mov(x9, (upper ? ins.uregs.VFwrite : 0) | (u64(lower ? ins.lregs.VFwrite : 0) << 32));
+			a.Mov(x10, flags | (u64(upper ? ins.uregs.VFwxyzw : 0) << 32));
+			a.Stp(x9, x10, MemOperand(x0, offsetof(fmacPipe, regupper)));
+			a.Mov(x9, lower ? ins.lregs.VFwxyzw : 0); // also clears the padding
+			a.Sub(x10, x26, state.elapsed - entry.issue_cycle);
+			a.Stp(x9, x10, MemOperand(x0, offsetof(fmacPipe, xyzwlower)));
+			// Cycle = 4, then the MAC/status/clip lanes of the slot register.
+			a.Ext(v16.V16B(), v17.V16B(), VRegister(28 + slot, 128).V16B(), 12);
+			a.Str(q16, MemOperand(x0, offsetof(fmacPipe, Cycle)));
 		}
 		a.Add(w9, w27, state.issued & 3);
 		a.And(w9, w9, 3);
@@ -2522,12 +2546,17 @@ namespace
 		a.Ldr(w27, Field(offsetof(VURegs, fmacwritepos)));
 		a.Ldr(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Ldr(w28, Field(VI(REG_MAC_FLAG)));
-		for (u32 slot = 0; slot < 4; slot++)
+		// Only the entries in flight at the region's first pair are retired from
+		// these registers; the region's own entries overwrite their slots. Lane 3
+		// (the next slot's first word) is never read for them.
+		const u32 incoming = block.schedule[first].retired + block.schedule[first].remaining;
+		if (incoming)
+			EmitRegionSlotBase(a);
+		for (u32 k = 1; k <= incoming; k++)
 		{
+			const u32 slot = (4 - k) & 3;
 			EmitRegionSlotAddress(a, slot);
-			a.Ldr(VRegister(28 + slot, 64), MemOperand(x0, offsetof(fmacPipe, macflag)));
-			a.Ldr(w9, MemOperand(x0, offsetof(fmacPipe, clipflag)));
-			a.Ins(VRegister(28 + slot, 128).V4S(), 2, w9);
+			a.Ldr(VRegister(28 + slot, 128), MemOperand(x0, offsetof(fmacPipe, macflag)));
 		}
 		// Which FMAC entries issued here can be observed. The status/MAC flags
 		// and the flag scratch only become visible through flag readers and
