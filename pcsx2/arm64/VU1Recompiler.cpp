@@ -2967,8 +2967,14 @@ namespace
 			block->links.resize(block->count + 1);
 			u32 link_count = 0;
 			std::array<Label, MaxInstructions + 1> link_sites;
-			const auto add_link = [&](u32 pair) {
-				block->links[link_count].deterministic = block->profiled && pair < block->known_prefix;
+			const auto add_link = [&](u32 /*pair*/) {
+				// A profiled block is entered only in the state it was compiled for,
+				// and everything after that follows from it: packet XGKICKs charge no
+				// VU cycles, and the divide and IALU pipes are part of the profile.
+				// known_prefix only bounds what the schedule can compute. Budget,
+				// branch and pending-packet exits never take a link. Needs proper
+				// testing across games.
+				block->links[link_count].deterministic = block->profiled;
 				return &link_sites[link_count++];
 			};
 			// Entered from another block's exit: the frame, start and budget are

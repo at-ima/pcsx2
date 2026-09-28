@@ -1771,6 +1771,44 @@ TEST_F(VU1PacketXgkickTest, ConditionalConnectionPublishesBeforePendingTransfer)
 	EXPECT_EQ(std::memcmp(gifUnit.gifPath[0].buffer + 16, previous.data(), previous.size()), 0);
 }
 
+TEST_F(VU1PacketXgkickTest, ExitAfterKickLinksToProfiledTarget)
+{
+	// A packet XGKICK never charges VU cycles, so a profiled block leaves every
+	// exit after one in the same state and may link to the profiled target.
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28; // ADD vf3, vf3, vf2
+	constexpr u32 nop = 0x8000033c;
+	Tag(0, 2, true);
+	VU1.VI[1].UL = 0;
+	VU1.VI[5].UL = 32; // JR target: pair 32
+	Put(0, add, nop);
+	Put(8, 0x2ff, 0x800006fc | (1 << 11)); // XGKICK vi1
+	Put(16, add, nop);
+	Put(24, add, 0x48000000 | (5 << 11)); // JR vi5
+	Put(32, add, nop); // Its delay slot
+	for (u32 i = 32; i < 36; i++)
+		Put(i * 8, add, nop);
+	Put(36 * 8, 0x400002ff, nop); // E bit
+	Put(37 * 8, 0x2ff, nop);
+	const VURegs initial = VU1, initial0 = VU0;
+	u64 dispatches[4];
+	for (u32 run = 0; run < 4; run++)
+	{
+		SCOPED_TRACE(run);
+		gifUnit.Reset();
+		gifRegs.ctrl.PSE = 1;
+		VU0 = initial0;
+		VU1 = initial;
+		const u64 before = CpuArm64VU1.GetDispatchCount();
+		Compare(200);
+		if (HasFatalFailure())
+			return;
+		dispatches[run] = CpuArm64VU1.GetDispatchCount() - before;
+		EXPECT_EQ(VU0.VI[REG_VPU_STAT].UL & 0x100, 0u);
+	}
+	// The first run links the JR exit; later runs enter the target through it.
+	EXPECT_LT(dispatches[3], dispatches[0]);
+}
+
 TEST_F(VU1PacketXgkickTest, NativeKickMatchesReferenceStepsAcrossEveryBudget)
 {
 	const VURegs initial = VU1, initial0 = VU0;
