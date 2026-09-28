@@ -1493,6 +1493,112 @@ TEST_F(VU1RecompilerTest, SpecialFloatsAndChangedFloatingPointOptions)
 	}
 }
 
+TEST_F(VU1RecompilerTest, InputClampsSkippedOnlyForClampedResults)
+{
+	// FMAC inputs last written by a clamped FMAC result skip their input
+	// clamp. Every other writer has to make the next read clamp again: loads
+	// of non-finite and denormal memory, MOVE/MR32, MAX/MINI, ABS, FTOI and an
+	// interpreter-run MULA (D bit) writing ACC. Random traces over those,
+	// reading each other's results.
+	const VURegs initial = VU1, initial0 = VU0;
+	// Fractions tell an input clamp from an output clamp: inf * 0.5 is the
+	// largest float, max * 0.5 is half of it.
+	constexpr u32 edge[] = {0x7f800000, 0xff800000, 0x7fc12345, 0xff812345, 0x00000001, 0x80400000,
+		0x7f7fffff, 0x3f000000, 0xbf000000, 0x3e800000, 0xc0400000, 0x00000000};
+	u32 random = 777;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	const auto reg = [&next]() { return 1 + next() % 6; };
+	for (u32 options = 0; options < 8; options++)
+	{
+		EmuConfig.Cpu.VU1FPCR = FPControlRegister::GetDefault().DisableExceptions().SetFlushToZero(options & 1).SetDenormalsAreZero(options & 2);
+		EmuConfig.Cpu.Recompiler.vu0Overflow = (options & 4) != 0;
+		EmuConfig.Cpu.Recompiler.vu1Overflow = true;
+		for (u32 seed = 0; seed < 24; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "options=" << options << " seed=" << seed);
+			CpuArm64VU1.Reserve();
+			VU0 = initial0;
+			VU0.VI[REG_FBRST].UL = 0; // the D bit only marks the pair for the interpreter
+			VU1 = initial;
+			for (u32 q = 0; q < 16; q++)
+				for (u32 lane = 0; lane < 4; lane++)
+					std::memcpy(VU1.Mem + q * 16 + lane * 4, &edge[(q + lane * 3 + seed) % std::size(edge)], 4);
+			for (u32 r = 1; r < 8; r++)
+				for (u32 lane = 0; lane < 4; lane++)
+					VU1.VF[r].UL[lane] = edge[(r * 5 + lane + seed) % std::size(edge)];
+			VU1.ACC = VU1.VF[2];
+			VU1.VI[1].UL = 0;
+			Put(47 * 8, 0x800002ff, 0);
+			for (u32 i = 0; i < 47; i++)
+			{
+				const u32 mask = next() % 3 ? 15 : 1 + next() % 15;
+				const u32 kind = next() % 10;
+				// The interpreter's OPMULA keeps the previous W MAC bits (the
+				// native code clears them, as microVU does), so zero them first.
+				if (kind == 6)
+					Put(i++ * 8, (1 << 21) | 0x2a, 0x8000033c); // MUL.w VF0, VF0, VF0
+				const u32 fd = reg(), fs = reg(), ft = reg();
+				u32 upper;
+				switch (kind)
+				{
+					case 0:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x2b;
+						break; // MAX
+					case 1:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (7 << 6) | 0x3d;
+						break; // ABS ft, fs
+					case 2:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (5 << 6) | 0x3c;
+						break; // FTOI0
+					case 3:
+						upper = 0x10000000 | (mask << 21) | (ft << 16) | (fs << 11) | (10 << 6) | 0x3e;
+						break; // MULA, D bit
+					case 4:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (10 << 6) | 0x3e;
+						break; // MULA
+					case 5:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (10 << 6) | 0x3d;
+						break; // MADDA
+					case 6:
+						upper = (ft << 16) | (fs << 11) | (11 << 6) | 0x3e;
+						break; // OPMULA
+					case 7:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x29;
+						break; // MADD
+					case 8:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (fd << 6) | (next() % 4);
+						break; // ADDbc
+					default:
+						upper = (mask << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x2a;
+						break; // MUL
+				}
+				u32 lower;
+				switch (next() % 5)
+				{
+					case 0:
+						lower = (mask << 21) | (reg() << 16) | (1 << 11) | (next() % 16);
+						break; // LQ from edge memory
+					case 1:
+						lower = 0x8000033c | (mask << 21) | (reg() << 16) | (reg() << 11);
+						break; // MOVE
+					case 2:
+						lower = 0x8000033d | (mask << 21) | (reg() << 16) | (reg() << 11);
+						break; // MR32
+					default:
+						lower = 0x8000033c;
+						break;
+				}
+				Put(i * 8, upper, lower);
+			}
+			Put(48 * 8, 0x400002ff, 0x8000033c);
+			Put(49 * 8, 0x2ff, 0x8000033c);
+			Compare(256);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 namespace
 {
 	class VU1PacketXgkickTest : public VU1RecompilerTest

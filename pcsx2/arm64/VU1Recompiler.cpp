@@ -160,6 +160,9 @@ namespace
 		std::vector<SourceRange> ranges;
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<RetirementSchedule, MaxInstructions> schedule{};
+		// Per pair: which FMAC inputs (1: fs, 2: ft, 4: ACC) are known to be
+		// clamped already in every lane the op uses (see AnalyzeClamps).
+		std::array<u8, MaxInstructions> clamp_skip{};
 		std::array<u32, MaxInstructions * 2> words{};
 		std::array<u32, MaxInstructions> next_pc{};
 		std::array<bool, MaxInstructions> delay{};
@@ -689,6 +692,8 @@ namespace
 	// then leaves the weighted per-lane MAC bits in v(28 + slot) for the region's
 	// sticky accumulator, instead of publishing the MAC/status scratch.
 	int s_raw_flag_slot = -1;
+	// The current pair's Block::clamp_skip.
+	u8 s_clamp_skip = 0;
 	u32 s_store_mac_count = 0;
 
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
@@ -879,14 +884,17 @@ namespace
 			a.Ins(v1.V4S(), 0, v3.V4S(), 2);
 			a.Ins(v1.V4S(), 1, v3.V4S(), 0);
 			a.Ins(v1.V4S(), 2, v3.V4S(), 1);
-			ClampInput(a, v0);
-			ClampInput(a, v1);
+			if (!(s_clamp_skip & 1))
+				ClampInput(a, v0);
+			if (!(s_clamp_skip & 2))
+				ClampInput(a, v1);
 			if (op.op == Op::Opmula)
 				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
 			else
 			{
 				LoadVector(a, cache, q2, 32);
-				ClampInput(a, v2);
+				if (!(s_clamp_skip & 4))
+					ClampInput(a, v2);
 				// Match the ARM64 interpreter's contracted multiply/subtract.
 				a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
 				a.Mov(v0.V16B(), v2.V16B());
@@ -894,8 +902,10 @@ namespace
 			StoreMAC(a, cache, op, code, 0xE);
 			return;
 		}
-		ClampInput(a, v0);
-		ClampInput(a, v1);
+		if (!(s_clamp_skip & 1))
+			ClampInput(a, v0);
+		if (!(s_clamp_skip & 2))
+			ClampInput(a, v1);
 		switch (op.op)
 		{
 			case Op::Add:
@@ -910,7 +920,8 @@ namespace
 			case Op::Madd:
 			case Op::Msub:
 				LoadVector(a, cache, q2, 32);
-				ClampInput(a, v2);
+				if (!(s_clamp_skip & 4))
+					ClampInput(a, v2);
 				// Match the ARM64 interpreter's contracted multiply/add operations.
 				if (op.op == Op::Madd)
 					a.Fmla(v2.V4S(), v0.V4S(), v1.V4S());
@@ -1911,6 +1922,56 @@ namespace
 		}
 	}
 
+	// Every MAC-updating FMAC result leaves StoreMAC clamped and free of
+	// denormals, and clamping is idempotent, so an input lane last written
+	// that way needs no input clamp. Tracks those lanes (x = 8 .. w = 1) of
+	// VF0..VF31 and ACC (32) through the trace. Any other write forgets them,
+	// including interpreter fallbacks (whose ACC writes are not described).
+	// In Shadow of the Colossus the transform chains read ACC and results of
+	// the previous pair, so about half of the input clamps go.
+	void AnalyzeClamps(Block& block)
+	{
+		block.clamp_skip.fill(0);
+		if (!CHECK_VU_OVERFLOW(1))
+			return;
+		std::array<u8, 33> clamped{};
+		clamped[0] = 15; // VF0 is (0, 0, 0, 1)
+		for (u32 i = 0; i < block.count; i++)
+		{
+			const auto& ins = block.instructions[i];
+			const u32 code = ins.upper;
+			const Upper op = DecodeUpper(code);
+			const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, fd = (code >> 6) & 31;
+			const bool opm = op.op == Op::Opmula || op.op == Op::Opmsub;
+			const u32 mask = opm ? 0xE : (code >> 21) & 15;
+			const bool mac = UpdatesMacFlags(code);
+			if (mac)
+			{
+				u8 skip = 0;
+				if ((clamped[fs] & mask) == mask)
+					skip |= 1;
+				if (op.broadcast < 0 ? (clamped[ft] & mask) == mask : op.broadcast < 4 && (clamped[ft] & (8 >> op.broadcast)))
+					skip |= 2;
+				if ((clamped[32] & mask) == mask)
+					skip |= 4;
+				block.clamp_skip[i] = skip;
+				const u32 dest = op.acc ? 32 : fd;
+				if (dest)
+					clamped[dest] |= mask;
+			}
+			else
+			{
+				if (ins.uregs.VFwrite)
+					clamped[ins.uregs.VFwrite] &= ~ins.uregs.VFwxyzw;
+				if (op.op == Op::Unsupported)
+					clamped[32] = 0;
+			}
+			if (!(code & 0x80000000) && ins.lregs.VFwrite)
+				clamped[ins.lregs.VFwrite] &= ~ins.lregs.VFwxyzw;
+			clamped[0] = 15;
+		}
+	}
+
 	void AnalyzeRetirement(Block& block)
 	{
 		// Ages saturate at four (already retired). -1 represents an age which
@@ -2604,7 +2665,9 @@ namespace
 			const u32 macs = s_store_mac_count;
 			s_raw_flag_slot = kind == Entry::Raw ? static_cast<int>(issued & 3) : -1;
 			s_vi_backup = &state.vi;
+			s_clamp_skip = block.clamp_skip[i];
 			EmitPair(a, block.cache, ins, false);
+			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;
 			pxAssertRel((s_store_mac_count != macs) == (HasFmac(ins) && UpdatesMacFlags(ins.upper)),
 				"UpdatesMacFlags() disagrees with EmitUpper");
@@ -2808,6 +2871,7 @@ namespace
 			else
 				AnalyzeRetirement(*block);
 			AssignVectorCache(*block);
+			AnalyzeClamps(*block);
 			const VectorCache& cache = block->cache;
 			if (!s_pipeline.prepare[0])
 			{
@@ -2973,7 +3037,9 @@ namespace
 				if (schedule_pair)
 					a.Bind(&prepared);
 				cycle_dirty = schedule_pair;
+				s_clamp_skip = block->clamp_skip[i];
 				EmitPair(a, cache, ins, true);
+				s_clamp_skip = 0;
 				const bool kick = ins.lregs.pipe == VUPIPE_XGKICK;
 				if (kick)
 				{
