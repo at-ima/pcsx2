@@ -1280,6 +1280,8 @@ if (APPLE)
 		${QUARTZCORE_LIBRARY}
 		${AVFOUNDATION_LIBRARY}
 		${COREMEDIA_LIBRARY}
+		# MetalFX needs macOS 13, which is newer than the deployment target.
+		"-weak_framework MetalFX"
 	)
 endif()
 

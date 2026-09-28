@@ -308,6 +308,13 @@ public:
 	/// Area RenderHW is about to draw to, so writes to a cached source only invalidate part of it
 	const GSVector4i* m_pending_write_area = nullptr;
 
+	// MetalFX spatial upscaler for presenting (id<MTLFXSpatialScaler>, macOS 13+)
+	MRCOwned<id<NSObject>> m_fx_scaler;
+	std::unique_ptr<GSTexture> m_fx_input;
+	std::unique_ptr<GSTexture> m_fx_output;
+	GSVector4i m_fx_key = GSVector4i::zero();
+	MTLPixelFormat m_fx_format = MTLPixelFormatInvalid;
+
 	UploadBuffer m_texture_upload_buf;
 	BufferPair m_vertex_upload_buf;
 
@@ -414,6 +421,7 @@ public:
 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) override;
 
 	bool DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) override;
+	bool SpatialUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect) override;
 
 	MRCOwned<id<MTLFunction>> LoadShader(NSString* name);
 	MRCOwned<id<MTLRenderPipelineState>> MakePipeline(MTLRenderPipelineDescriptor* desc, id<MTLFunction> vertex, id<MTLFunction> fragment, NSString* name);

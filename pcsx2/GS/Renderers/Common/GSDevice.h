@@ -1727,6 +1727,10 @@ public:
 
 	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);
 
+	/// Upscales the display area of tex to the size of draw_rect with a device specific spatial upscaler (MetalFX),
+	/// updating the arguments like CAS() does. Returns false and leaves them alone if that's unavailable.
+	virtual bool SpatialUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect) { return false; }
+
 	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
 
 	void AgePool();

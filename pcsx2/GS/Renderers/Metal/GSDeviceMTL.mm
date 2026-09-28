@@ -18,6 +18,8 @@
 #ifdef __APPLE__
 #include "GSMTLSharedHeader.h"
 
+#include <MetalFX/MetalFX.h>
+
 static constexpr simd::float2 ToSimd(const GSVector2& vec)
 {
 	return simd::make_float2(vec.x, vec.y);
@@ -766,6 +768,107 @@ void GSDeviceMTL::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float par
 	RenderCopy(sTex, m_shadeboost_pipeline, GSVector4i(0, 0, dTex->GetSize().x, dTex->GetSize().y));
 }
 
+bool GSDeviceMTL::SpatialUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect)
+{ @autoreleasepool {
+	if (@available(macOS 13, *))
+	{
+		const int out_w = static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
+		const int out_h = static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
+		const int in_w = src_rect.width();
+		const int in_h = src_rect.height();
+		if (in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0)
+			return false;
+
+		GSTextureMTL* src = static_cast<GSTextureMTL*>(tex);
+		const MTLPixelFormat fmt = [src->GetTexture() pixelFormat];
+		// The scaler reads its input from the origin, so an offset display area needs a copy first.
+		const bool offset = src_rect.x != 0 || src_rect.y != 0;
+		const GSVector2i in_size = offset ? GSVector2i(in_w, in_h) : src->GetSize();
+		const GSVector4i key(in_size.x, in_size.y, out_w, out_h);
+		if (!m_fx_scaler || !m_fx_key.eq(key) || m_fx_format != fmt)
+		{
+			m_fx_scaler = nullptr;
+			m_fx_output.reset();
+			m_fx_input.reset();
+			if (![MTLFXSpatialScalerDescriptor supportsDevice:m_dev.dev])
+				return false;
+			MTLFXSpatialScalerDescriptor* desc = [[MTLFXSpatialScalerDescriptor new] autorelease];
+			desc.inputWidth = in_size.x;
+			desc.inputHeight = in_size.y;
+			desc.outputWidth = out_w;
+			desc.outputHeight = out_h;
+			desc.colorTextureFormat = fmt;
+			desc.outputTextureFormat = fmt;
+			// PS2 output is gamma encoded.
+			desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+			id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:m_dev.dev];
+			if (!scaler)
+			{
+				Console.Error(fmt::format("Metal: Failed to create MetalFX scaler {}x{} -> {}x{}", in_size.x, in_size.y, out_w, out_h));
+				return false;
+			}
+			m_fx_scaler = MRCTransfer(static_cast<id<NSObject>>(scaler));
+
+			MTLTextureDescriptor* tdesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:out_w height:out_h mipmapped:NO];
+			[tdesc setStorageMode:MTLStorageModePrivate];
+			[tdesc setUsage:[scaler outputTextureUsage] | MTLTextureUsageShaderRead];
+			MRCOwned<id<MTLTexture>> out = MRCTransfer([m_dev.dev newTextureWithDescriptor:tdesc]);
+			if (!out)
+			{
+				m_fx_scaler = nullptr;
+				return false;
+			}
+			[out setLabel:@"MetalFX Output"];
+			m_fx_output = std::make_unique<GSTextureMTL>(this, std::move(out), nil, GSTexture::Usage::RenderTarget, src->GetFormat());
+			m_fx_key = key;
+			m_fx_format = fmt;
+		}
+		id<MTLFXSpatialScaler> scaler = static_cast<id<MTLFXSpatialScaler>>(m_fx_scaler.Get());
+
+		GSTexture* input = tex;
+		const MTLTextureUsage in_usage = [scaler colorTextureUsage];
+		if (offset || ([src->GetTexture() usage] & in_usage) != in_usage)
+		{
+			if (!m_fx_input)
+			{
+				MTLTextureDescriptor* tdesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:in_size.x height:in_size.y mipmapped:NO];
+				[tdesc setStorageMode:MTLStorageModePrivate];
+				[tdesc setUsage:in_usage | MTLTextureUsageShaderRead];
+				MRCOwned<id<MTLTexture>> in = MRCTransfer([m_dev.dev newTextureWithDescriptor:tdesc]);
+				if (!in)
+					return false;
+				[in setLabel:@"MetalFX Input"];
+				m_fx_input = std::make_unique<GSTextureMTL>(this, std::move(in), nil, GSTexture::Usage::RenderTarget, src->GetFormat());
+			}
+			CopyRect(tex, m_fx_input.get(), src_rect, 0, 0);
+			input = m_fx_input.get();
+		}
+		else
+		{
+			FlushClears(tex);
+		}
+
+		EndRenderPass();
+		if (m_late_texture_upload_encoder)
+		{
+			[m_late_texture_upload_encoder endEncoding];
+			m_late_texture_upload_encoder = nullptr;
+		}
+		[scaler setColorTexture:static_cast<GSTextureMTL*>(input)->GetTexture()];
+		[scaler setOutputTexture:static_cast<GSTextureMTL*>(m_fx_output.get())->GetTexture()];
+		[scaler setInputContentWidth:in_w];
+		[scaler setInputContentHeight:in_h];
+		[scaler encodeToCommandBuffer:GetRenderCmdBuf()];
+		static_cast<GSTextureMTL*>(m_fx_output.get())->MarkWritten();
+
+		tex = m_fx_output.get();
+		src_rect = GSVector4i(0, 0, out_w, out_h);
+		src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+		return true;
+	}
+	return false;
+}}
+
 bool GSDeviceMTL::DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants)
 { @autoreleasepool {
 	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
@@ -1366,6 +1469,9 @@ void GSDeviceMTL::Destroy()
 { @autoreleasepool {
 	FlushEncoders();
 	m_downsample_cache = {};
+	m_fx_scaler = nullptr;
+	m_fx_input.reset();
+	m_fx_output.reset();
 	std::lock_guard<std::mutex> guard(m_backref->first);
 	m_backref->second = nullptr;
 

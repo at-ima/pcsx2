@@ -410,6 +410,7 @@ enum class GSCASMode : u8
 	Disabled,
 	SharpenOnly,
 	SharpenAndResize,
+	MetalFXUpscale, // Apple MetalFX spatial upscaler to display resolution, Metal only
 };
 
 enum class GSHWAutoFlushLevel : u8
