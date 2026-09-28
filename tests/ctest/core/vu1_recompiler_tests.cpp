@@ -2659,6 +2659,73 @@ TEST_F(VU1RecompilerTest, WaitqRetiresQBeforePairedUpperBroadcastRead)
 	}
 }
 
+TEST_F(VU1RecompilerTest, KnownDivideStallsKeepLaterPairsScheduled)
+{
+	const VURegs initial = VU1, initial0 = VU0;
+	// Shadow of the Colossus' transform loop waits at its top for the divide the
+	// previous iteration issued. The block is profiled with that divide's
+	// remaining cycles, so the WAITQ stall is computed at compile time and the
+	// FMAC consumers after it stay scheduled. Sweeps the incoming divide from
+	// already due to just issued (and absent), a divide issued over the
+	// incoming one, and an in-block divide waited on later, against every budget.
+	constexpr u32 kNop = 0x8000033c;
+	constexpr u32 kWaitq = 0x800003bf;
+	constexpr u32 kDiv = 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11); // DIV Q, VF1x, VF1y
+	const auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+	const auto mulq = [](u32 fd, u32 fs) { return (15u << 21) | (fs << 11) | (fd << 6) | 0x1c; };
+	// The wait only moves producer ages if something issued before it is
+	// consumed after it, so a producer sits right before each wait and its
+	// consumer right after.
+	for (u32 top : {kWaitq, kDiv})
+	{
+		for (int remaining = -1; remaining <= 8; remaining++)
+		{
+			for (u32 gap = 0; gap < 8; gap++)
+			{
+				for (u32 budget : {1u, 2u, 3u, 4u, 6u, 8u, 12u, 16u, 20u, 24u, 32u, 48u})
+				{
+					SCOPED_TRACE(testing::Message() << std::hex << "top=" << top << std::dec << " remaining=" << remaining << " gap=" << gap << " budget=" << budget);
+					// Each pc gets a limited number of profiled compiles.
+					CpuArm64VU1.Reserve();
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 1000;
+					VU1.VI[REG_Q].UL = 0x3f800000;
+					VU1.VF[1].F[0] = 5.0f;
+					VU1.VF[1].F[1] = 2.0f;
+					if (remaining >= 0)
+					{
+						VU1.fdiv.enable = 1;
+						VU1.fdiv.Cycle = 7;
+						VU1.fdiv.sCycle = VU1.cycle - 7 + std::min(remaining, 7);
+						VU1.fdiv.reg.UL = 0x40400000;
+						VU1.fdiv.statusflag = 0x820;
+					}
+					Put(0, add(3, 1, 2), kNop);
+					Put(8, mulq(4, 1), top); // Q consumer paired with the wait (or a new divide)
+					Put(16, add(5, 3, 2), kNop); // producer issued after the wait...
+					Put(24, add(6, 4, 2), kNop); // ...and consumers of the MULq and of pair 0
+					Put(32, add(7, 3, 5), kDiv); // in-block divide
+					u32 pc = 40;
+					for (u32 k = 0; k < gap; k++, pc += 8)
+						Put(pc, add(9, 1, 2), kNop);
+					Put(pc, add(11, 6, 2), kNop); // producer before the in-block wait
+					Put(pc + 8, mulq(8, 1), kWaitq);
+					Put(pc + 16, add(12, 11, 2), kNop); // two FMAC slots back
+					Put(pc + 24, add(13, 8, 11), kNop);
+					for (pc += 32; pc < 176; pc += 8)
+						Put(pc, add(pc / 8 % 4 + 14, 13, 3), kNop);
+					Put(176, 0x400002ff, kNop);
+					Put(184, 0x2ff, kNop);
+					Compare(budget);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, DivideRetiresPreviousQBeforePairedUpperBroadcastRead)
 {
 	const VURegs initial = VU1, initial0 = VU0;

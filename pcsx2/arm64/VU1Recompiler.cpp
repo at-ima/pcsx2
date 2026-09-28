@@ -1929,6 +1929,12 @@ namespace
 		}
 		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0, efu_ready = 0;
 		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
+		// Cycles from block entry to the current pair, while every advance so
+		// far is known, and the cycle on that scale at which the pending divide
+		// comes due (-1: unknown). The profile records the incoming divide's
+		// remaining cycles plus one.
+		int elapsed = 0;
+		int fdiv_due = block.profiled && block.incoming.Fdiv() ? static_cast<int>(block.incoming.Fdiv()) - 1 : -1;
 		block.known_prefix = block.count;
 		for (u32 i = 0; i < block.count; i++)
 		{
@@ -2017,7 +2023,15 @@ namespace
 			// P. Read before this pair's own issue updates fdiv_ready/efu_ready,
 			// since a pipe it arms itself cannot be what it stalls on.
 			const bool fdiv_op = ins.lregs.pipe == VUPIPE_FDIV, efu_op = ins.lregs.pipe == VUPIPE_EFU;
-			if ((fdiv_op && i < fdiv_ready) || (efu_op && i < efu_ready))
+			// With the divide's due cycle known, its stall is not a guess: the
+			// pair advances to that cycle if it is later than where the FMAC
+			// hazards alone would leave it. The pair itself stays generic (WAITQ
+			// and divides write Q), but later pairs keep known producer ages.
+			// This is SotC's transform loop, which waits on the previous
+			// iteration's divide at its top. Needs proper testing across games.
+			if (fdiv_op && i < fdiv_ready)
+				cycles = (cycles > 0 && elapsed >= 0 && fdiv_due >= 0) ? std::max(cycles, fdiv_due - elapsed) : -1;
+			if (efu_op && i < efu_ready)
 				cycles = -1;
 			// An unprofiled block may be entered with a divide (up to 13 cycles)
 			// or an EFU operation (up to 54) in flight. Each pair advances at
@@ -2031,7 +2045,11 @@ namespace
 			// slot inline: those pairs carry fdiv_pending instead and do it themselves
 			// (see EmitScheduledPrepare and EmitDeferredRegion).
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
+			{
 				fdiv_ready = i + ins.lregs.cycles + 1;
+				// _vuFDIVAdd stamps the cycle the pair ends on.
+				fdiv_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
+			}
 			// The EFU pipe's single slot (ESADD..EEXP, retiring into P) is rare enough
 			// that it keeps the simpler treatment: stay generic for its full latency.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
@@ -2122,6 +2140,7 @@ namespace
 					ages[j] = -1;
 			}
 			ages[i] = 0;
+			elapsed = (elapsed >= 0 && cycles > 0) ? elapsed + cycles : -1;
 		}
 	}
 
