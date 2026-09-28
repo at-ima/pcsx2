@@ -3911,4 +3911,63 @@ TEST_F(VU1RecompilerTest, ReadinessPassesOnlyDividesThePairRetires)
 				}
 }
 
+
+TEST_F(VU1RecompilerTest, DividesInsideScheduledLoopsMatchEveryBudget)
+{
+	// DIV/SQRT/RSQRT issue inside scheduled pairs and deferred regions when their
+	// stall is known. A loop keeps divides pending across its edge (profiled
+	// entries) and mixes them with flag-writing FMAC ops, Q readers and WAITQ.
+	// Zero operands raise D/I, and the scratch status starts with the sticky
+	// D/I bits that only FSSET sets, which a divide passes on until a flag op
+	// clears them.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {0, 0x80000000, 0x3fc00000, 0xc0000000, 0x40400000, 0x3e800000, 0xc0e00000, 0x42c80000};
+	constexpr u32 length = 40;
+	u32 random = 777;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		CpuArm64VU1.Reset();
+		for (u32 i = 0; i < length; i++)
+		{
+			u32 upper = 0x2ff;
+			const u32 fd = 1 + next() % 8, fs = 1 + next() % 8, ft = 1 + next() % 8, dest = 1 + next() % 15;
+			const u32 kind = next() % 20;
+			if (kind < 8)
+				upper = (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | (kind < 3 ? 0x28 : kind < 5 ? 0x2c : 0x2a); // ADD/SUB/MUL
+			else if (kind < 11)
+				upper = (dest << 21) | (fs << 11) | (fd << 6) | 0x1c; // MULq
+			u32 lower = 0x8000033c;
+			const u32 op = next() % 20, fsf = next() % 4, ftf = next() % 4, lfs = 1 + next() % 8, lft = 1 + next() % 8;
+			if (op < 2)
+				lower = 0x800003bc | (ftf << 23) | (fsf << 21) | (lft << 16) | (lfs << 11); // DIV
+			else if (op < 3)
+				lower = 0x800003bd | (ftf << 23) | (lft << 16); // SQRT
+			else if (op < 4)
+				lower = 0x800003be | (ftf << 23) | (fsf << 21) | (lft << 16) | (lfs << 11); // RSQRT
+			else if (op < 5)
+				lower = 0x800003bf; // WAITQ
+			if (i == length - 1)
+				lower = 0x40000000 | ((0 - length) & 0x7ff); // B to the top
+			Put(i * 8, upper, lower);
+		}
+		Put(length * 8, 0x2ff, 0x8000033c); // Delay slot
+		for (u32 budget : {1u, 7u, 23u, 64u, 150u, 400u, 1000u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			for (u32 reg = 1; reg <= 8; reg++)
+				for (u32 lane = 0; lane < 4; lane++)
+					VU1.VF[reg].UL[lane] = values[(reg * 3 + lane + seed) % std::size(values)];
+			VU1.statusflag = 0xc00 | (seed & 0xf);
+			VU1.VI[REG_STATUS_FLAG].UL = 0x800;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 #endif

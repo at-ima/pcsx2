@@ -2178,15 +2178,18 @@ namespace
 				}
 				// A scheduled pair retires FMAC entries into memory, so it can read
 				// the flags. Q and P are final here (a pending divide is retired
-				// above via fdiv_pending, and the EFU is idle). An FDIV/EFU issue
-				// stamps its own sCycle and stalls on the previous entry, so it
-				// stays generic. WAITQ only carries the Q write as a tag (see
-				// Compile); with its stall known above, the divide it waits on
-				// is due by the end of this pair's advance, so fdiv_pending
-				// retires it before the body and the body's own stall check
-				// finds the pipe empty.
+				// above via fdiv_pending, and the EFU is idle). WAITQ only carries
+				// the Q write as a tag (see Compile); with its stall known above,
+				// the divide it waits on is due by the end of this pair's advance,
+				// so fdiv_pending retires it before the body and the body's own
+				// stall check finds the pipe empty. DIV/SQRT/RSQRT are the same
+				// plus a new entry, stamped with the cycle this pair ends on, which
+				// is where a scheduled pair has already moved x26. Splitting
+				// regions at every divide cost SotC's transform loops ~10% of the
+				// VU1 thread in region exits. EFU issues stay generic.
 				const bool waitq = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Waitq;
-				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq)
+				const bool fdiv_issue = ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles;
+				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq && !fdiv_issue)
 					plan.cycles = 0;
 				// Flag, Q and P readers stay in a region, which publishes the
 				// status and MAC flags it keeps in registers before them. An
@@ -2611,6 +2614,10 @@ namespace
 						needed[count] = true;
 					count++;
 				}
+				// A divide reads the status scratch (for the sticky D/I bits it
+				// passes on) from memory, so the latest flag op has to store it.
+				if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles && scratch >= 0)
+					scratch_full[scratch] = true;
 				const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 				if ((integer_branch && i + 1 < block.count) || i + 1 == end)
 				{
