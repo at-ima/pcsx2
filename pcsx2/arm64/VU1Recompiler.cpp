@@ -120,10 +120,19 @@ namespace
 	// first time the exit returns to it (see s_pending_link).
 	struct LinkSlot
 	{
-		const void* entry = nullptr;
-		const u32* epoch = nullptr; // the target's Block::validated_epoch
-		u32 generation = 0;
-		u32 pc = 0;
+		// One target per next PC seen. A subroutine's JR returns to every caller
+		// through the same exit: SotC's transform loops call shared helpers, and
+		// a single target sent ~1.4 exits per microprogram back to Execute().
+		static constexpr u32 Ways = 4;
+		struct Way
+		{
+			const void* entry = nullptr;
+			const u32* epoch = nullptr; // the target's Block::validated_epoch
+			u32 generation = 0;
+			u32 pc = ~0u; // never a TPC
+		};
+		std::array<Way, Ways> ways{};
+		u32 next_way = 0;
 		// The exit state follows from the block's own incoming profile, so a
 		// profiled target compiled for the state seen once always matches.
 		bool deterministic = false;
@@ -3205,24 +3214,12 @@ namespace
 			a.Ldp(x19, x20, MemOperand(sp, frame_size, PostIndex));
 			a.Ret();
 			// x0 = the exit's LinkSlot. Publish the state the next block (or
-			// Execute()) reads, then take the link if it is current and
-			// Execute() would enter a block at this point too.
+			// Execute()) reads, then take the link if Execute() would enter a
+			// block at this point too and the slot has a current target for TPC.
 			a.Bind(&link_exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
-			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_link_generation));
-			a.Ldr(w9, MemOperand(x16));
-			a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, generation)));
-			a.Cmp(w9, w10);
-			a.B(ne, &link_request);
-			a.Ldr(x11, MemOperand(x0, offsetof(LinkSlot, entry)));
-			a.Ldr(x12, MemOperand(x0, offsetof(LinkSlot, epoch)));
-			a.Ldr(w12, MemOperand(x12));
-			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_epoch));
-			a.Ldr(w13, MemOperand(x16));
-			a.Cmp(w12, w13);
-			a.B(ne, &link_request);
 			a.Sub(x9, x26, x20);
 			a.Cmp(x9, x21);
 			a.B(hs, &restore);
@@ -3246,10 +3243,29 @@ namespace
 			a.Orr(w9, w9, w10);
 			a.Cbnz(w9, &restore);
 			a.Ldr(w9, Field(VI(REG_TPC)));
-			a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, pc)));
-			a.Cmp(w9, w10);
-			a.B(ne, &restore);
-			a.Br(x11);
+			for (u32 way = 0; way < LinkSlot::Ways; way++)
+			{
+				const size_t base = offsetof(LinkSlot, ways) + way * sizeof(LinkSlot::Way);
+				Label next_way;
+				a.Ldr(w10, MemOperand(x0, base + offsetof(LinkSlot::Way, pc)));
+				a.Cmp(w9, w10);
+				a.B(ne, &next_way);
+				a.Mov(x16, reinterpret_cast<uintptr_t>(&s_link_generation));
+				a.Ldr(w12, MemOperand(x16));
+				a.Ldr(w10, MemOperand(x0, base + offsetof(LinkSlot::Way, generation)));
+				a.Cmp(w10, w12);
+				a.B(ne, &link_request);
+				a.Ldr(x12, MemOperand(x0, base + offsetof(LinkSlot::Way, epoch)));
+				a.Ldr(w12, MemOperand(x12));
+				a.Mov(x16, reinterpret_cast<uintptr_t>(&s_epoch));
+				a.Ldr(w13, MemOperand(x16));
+				a.Cmp(w12, w13);
+				a.B(ne, &link_request);
+				a.Ldr(x11, MemOperand(x0, base + offsetof(LinkSlot::Way, entry)));
+				a.Br(x11);
+				a.Bind(&next_way);
+			}
+			// A next PC this exit has not linked yet.
 			a.Bind(&link_request);
 			a.Mov(x16, reinterpret_cast<uintptr_t>(&s_pending_link));
 			a.Str(x0, MemOperand(x16));
@@ -3538,10 +3554,18 @@ void Arm64VU1Recompiler::Execute(u32 cycles)
 			if (pending_link && pending_generation == s_link_generation &&
 				block->validated_epoch == s_epoch && (!block->profiled || pending_link->deterministic))
 			{
-				pending_link->entry = block->linked_entry;
-				pending_link->epoch = &block->validated_epoch;
-				pending_link->pc = pc;
-				pending_link->generation = s_link_generation;
+				LinkSlot::Way* way = nullptr;
+				for (auto& candidate : pending_link->ways)
+				{
+					if (candidate.pc == pc)
+						way = &candidate;
+				}
+				if (!way)
+					way = &pending_link->ways[pending_link->next_way++ % LinkSlot::Ways];
+				way->entry = block->linked_entry;
+				way->epoch = &block->validated_epoch;
+				way->pc = pc;
+				way->generation = s_link_generation;
 			}
 			s_pending_link = nullptr;
 			pending_generation = s_link_generation;

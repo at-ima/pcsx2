@@ -3970,4 +3970,37 @@ TEST_F(VU1RecompilerTest, DividesInsideScheduledLoopsMatchEveryBudget)
 	}
 }
 
+
+TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
+{
+	// A subroutine's JR exit returns to each of its callers. Once every return
+	// target has been seen, a microprogram runs without going back to Execute()
+	// between blocks: the only dispatch is its start.
+	const u32 add = (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28; // ADD vf3, vf3, vf2
+	constexpr u32 nop = 0x8000033c;
+	constexpr u32 sub = 40;
+	const auto bal = [](u32 pair) { return 0x42000000 | (14 << 16) | ((sub - (pair + 1)) & 0x7ff); }; // BAL vi14
+	for (u32 pc = 0; pc < 64 * 8; pc += 8)
+		Put(pc, add, nop);
+	for (u32 call : {0u, 3u, 6u})
+		Put(call * 8, add, bal(call));
+	Put(9 * 8, 0x400002ff, nop); // E bit
+	Put(10 * 8, 0x2ff, nop);
+	Put((sub + 1) * 8, add, 0x48000000 | (14 << 11)); // JR vi14
+	const VURegs initial = VU1, initial0 = VU0;
+	u64 dispatches[4];
+	for (u32 run = 0; run < 4; run++)
+	{
+		SCOPED_TRACE(run);
+		VU0 = initial0;
+		VU1 = initial;
+		const u64 before = CpuArm64VU1.GetDispatchCount();
+		Compare(200);
+		if (HasFatalFailure())
+			return;
+		dispatches[run] = CpuArm64VU1.GetDispatchCount() - before;
+	}
+	EXPECT_EQ(dispatches[3], 1u) << "first run " << dispatches[0];
+}
+
 #endif
