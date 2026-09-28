@@ -2351,8 +2351,13 @@ void GSDeviceMTL::RenderHW(GSHWDrawConfig& config)
 	if (config.tex && (config.ds == config.tex || config.rt == config.tex))
 		EndRenderPass(); // Barrier
 
-	if (m_dev.features.broken_shader_depth && (config.depth.ztst >= ZTST_GEQUAL || config.depth.zwe))
-		config.ps.zfloor = true; // Depth must always go through shader (see tfx vs for comment with details)
+	// Depth must go through the shader (see tfx vs for comment with details), except for draws that only test
+	// GEQUAL: the stored depth is already floored, so the biased hardware depth is at most one Z unit too lenient
+	// (like other backends, which never floor there), and leaving out shader depth lets the GPU reject hidden
+	// fragments before shading them (big win for layered fog).
+	// Needs proper testing on other games that stack GEQUAL decals.
+	if (m_dev.features.broken_shader_depth && (config.depth.ztst > ZTST_GEQUAL || config.depth.zwe))
+		config.ps.zfloor = true;
 
 	size_t vertsize = config.nverts * sizeof(*config.verts);
 	size_t idxsize = config.vs.UseFixedExpandIndexBuffer() ? 0 : (config.nindices * sizeof(*config.indices));
