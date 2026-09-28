@@ -182,6 +182,58 @@ namespace
 		return {static_cast<BlockExit>(exit), completed};
 	}
 
+	// Replicates doBranch()'s post-branch deadline/pending-IRQ poll, since no
+	// events run inside generated code (see IopCodeGenerator.h).
+	void PollAfterBranch()
+	{
+		if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0 ||
+			((psxRegs.CP0.n.Status & 0xFE01) >= 0x401 && psxHu32(HW_ICTRL) != 0 &&
+				(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
+		{
+			iopEventTest();
+		}
+	}
+
+	// True for `j pc` or `b pc` with a nop delay slot: an idle loop that nothing
+	// but an event can leave.
+	bool IsIdleLoop(u32 pc)
+	{
+		const u32 physical = pc & 0x1fffffff;
+		if (!EmuConfig.Speedhacks.WaitLoop || (pc & 3) || physical >= 0x00800000 || ((physical + 4) & 0xffff) == 0)
+			return false;
+		const uptr page = psxMemRLUT[physical >> 16];
+		if (!page)
+			return false;
+		const u32* code = reinterpret_cast<const u32*>(page + (physical & 0xffff));
+		if (code[1] != 0)
+			return false;
+		if ((code[0] >> 26) == 2) // J
+			return (((pc + 4) & 0xf0000000u) | ((code[0] & 0x03ffffffu) << 2)) == pc;
+		return code[0] == 0x1000ffff; // BEQ $0, $0, pc
+	}
+
+	// Same fast-forward as upstream's x86 IOP recompiler (iPsxBranchTest() with
+	// s_nBlockFF): jump straight to the next event or the end of the timeslice
+	// instead of spinning the loop. SotC's IOP idles in `j` about 16M times a
+	// second, which cost ~20% of the EE thread through the interpreter.
+	// start_cycle is where ExecuteBlock() last charged the EE budget.
+	bool SkipIdleLoop(u64 start_cycle)
+	{
+		const u64 cycle = psxRegs.cycle;
+		const s64 budget = psxRegs.iopCycleEE - static_cast<s64>(cycle - start_cycle) * 8;
+		if (budget <= 0)
+			return false;
+		u64 target = cycle + ((budget + 7) >> 3);
+		if (static_cast<s64>(target - psxRegs.iopNextEventCycle) >= 0)
+			target = psxRegs.iopNextEventCycle;
+		if (static_cast<s64>(target - cycle) <= 0)
+			return false; // Event already due: let the loop run once and take it.
+		psxRegs.cycle = target;
+		psxRegs.code = 0; // The delay slot, as doBranch() leaves it.
+		PollAfterBranch();
+		return true;
+	}
+
 	// Mirrors R3000AInterpreter.cpp's intExecuteBlock() outer cycle-budget loop
 	// exactly (it is not exported, so this is necessarily a parallel copy --
 	// keep the two in sync if that loop's HW_ICFG/PS1-mode accounting changes).
@@ -206,9 +258,15 @@ namespace
 			bool taken = false;
 			while (!taken)
 			{
+				const u32 pc = psxRegs.pc;
 				const BlockResult result = TryExecuteImpl();
 				if (result.exit == BlockExit::NotHandled)
 				{
+					if (IsIdleLoop(pc) && SkipIdleLoop(lastIOPCycle))
+					{
+						taken = true;
+						continue;
+					}
 					// Run a full interpreter burst here -- straight through until an
 					// actually-taken branch -- instead of one instruction at a time.
 					// A compiled block can only ever start at a pc TryExecuteImpl()
@@ -243,14 +301,9 @@ namespace
 					if (result.exit == BlockExit::TakenBranch)
 					{
 						taken = true;
-						// Replicates doBranch()'s post-branch deadline/pending-IRQ poll,
-						// since no events run inside generated code (see IopCodeGenerator.h).
-						if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0 ||
-							((psxRegs.CP0.n.Status & 0xFE01) >= 0x401 && psxHu32(HW_ICTRL) != 0 &&
-								(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
-						{
-							iopEventTest();
-						}
+						PollAfterBranch();
+						if (psxRegs.pc == pc && IsIdleLoop(pc))
+							SkipIdleLoop(lastIOPCycle);
 					}
 					// Exit::Continue (untaken conditional branch inside a compiled
 					// block): not a real burst boundary, loop back and retry

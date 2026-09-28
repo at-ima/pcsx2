@@ -340,4 +340,53 @@ TEST_F(IopRecompilerTest, SelfModifyingStoreInvalidatesCachedBlock)
 	Compare(1);
 	EXPECT_EQ(psxRegs.GPR.r[1], 9u);
 }
+TEST_F(IopRecompilerTest, IdleLoopSkipsToEndOfTimeslice)
+{
+	const bool wait_loop = EmuConfig.Speedhacks.WaitLoop;
+	constexpr u32 AddOne = (9u << 26) | (1u << 21) | (1u << 16) | 1; // ADDIU r1, r1, 1
+	for (const u32 branch : {(2u << 26) | (Base >> 2), 0x1000ffffu}) // J Base, BEQ $0,$0,Base
+		for (const u32 delay : {0u, AddOne})
+			for (const s32 budget : {1, 8, 9, 800, 12345})
+			{
+				SCOPED_TRACE(testing::Message() << std::hex << branch << " " << delay << std::dec << " " << budget);
+				// Reference: spin the loop instruction by instruction.
+				Arm64IOP::Reset();
+				Init(0);
+				program[0] = branch;
+				program[1] = delay;
+				psxRegs.cycle = 1000;
+				EmuConfig.Speedhacks.WaitLoop = false;
+				const s32 expected_left = arm64IopCpu.ExecuteBlock(budget);
+				const psxRegisters expected = psxRegs;
+
+				Arm64IOP::Reset();
+				Init(0);
+				program[0] = branch;
+				program[1] = delay;
+				psxRegs.cycle = 1000;
+				EmuConfig.Speedhacks.WaitLoop = true;
+				const s32 left = arm64IopCpu.ExecuteBlock(budget);
+				if (delay)
+				{
+					// Not idle: must run exactly like the reference.
+					EXPECT_EQ(left, expected_left);
+					EXPECT_EQ(std::memcmp(&expected, &psxRegs, sizeof(psxRegs)), 0);
+					continue;
+				}
+				// Idle: one jump to the end of the timeslice, same place as the spin
+				// give or take the last loop iteration.
+				// A native `b` runs once (2 cycles) before the skip; a budget that one
+				// pass already exhausts never skips.
+				const s32 native = (branch >> 26) == 2 ? 0 : 2;
+				const u64 skipped = budget > native * 8 ? native + (budget - native * 8 + 7) / 8 : native;
+				EXPECT_EQ(psxRegs.pc, Base);
+				EXPECT_EQ(psxRegs.cycle, 1000u + skipped);
+				EXPECT_LE(left, 0);
+				EXPECT_GT(left, -16);
+				EXPECT_LE(psxRegs.cycle - expected.cycle + 1, 3u);
+				EXPECT_EQ(std::memcmp(psxRegs.GPR.r, expected.GPR.r, sizeof(psxRegs.GPR.r)), 0);
+			}
+	EmuConfig.Speedhacks.WaitLoop = wait_loop;
+}
+
 #endif
