@@ -70,6 +70,22 @@ extern void iopMemRelease();
 extern u8   iopMemRead8 (u32 mem);
 extern u16  iopMemRead16(u32 mem);
 extern u32  iopMemRead32(u32 mem);
+
+// Instruction fetches from main RAM need no device dispatch. Keep the live read
+// mapping (including mirrors) and reload the word on every fetch so writes by
+// either CPU or DMA are immediately visible. Other regions retain MMIO semantics.
+static __fi u32 iopMemFetch32(u32 mem)
+{
+	const u32 physical = mem & 0x1fffffff;
+	if (physical < 0x00800000 && (physical & 3) == 0)
+	{
+		const uptr page = psxMemRLUT[physical >> 16];
+		if (page)
+			return *reinterpret_cast<const u32*>(page + (physical & 0xffff));
+	}
+	return iopMemRead32(mem);
+}
+
 extern void iopMemWrite8 (u32 mem, u8 value);
 extern void iopMemWrite16(u32 mem, u16 value);
 extern void iopMemWrite32(u32 mem, u32 value);

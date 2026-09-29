@@ -3,6 +3,12 @@
 
 #include "Achievements.h"
 #include "BuildVersion.h"
+#if defined(ARCH_ARM64)
+#include "arm64/EERecompiler.h"
+#include "arm64/IopRecompiler.h"
+#include "arm64/VU0Recompiler.h"
+#include "arm64/VU1Recompiler.h"
+#endif
 #include "CDVD/CDVD.h"
 #include "CDVD/IsoReader.h"
 #include "Counters.h"
@@ -2681,9 +2687,13 @@ void VMManager::InitializeCPUProviders()
 	CpuMicroVU0.Reserve();
 	CpuMicroVU1.Reserve();
 #else
-	// Despite not having any VU recompilers on ARM64, therefore no MTVU,
-	// we still need the thread alive. Otherwise the read and write positions
-	// of the ring buffer wont match, and various systems in the emulator end up deadlocked.
+	arm64Cpu.Reserve();
+	arm64IopCpu.Reserve();
+	CpuArm64VU0.Reserve();
+	CpuArm64VU1.Reserve();
+	// Keep the MTVU thread alive even when THREAD_VU1 is off. Otherwise the read
+	// and write positions of the ring buffer wont match, and various systems in
+	// the emulator end up deadlocked.
 	vu1Thread.Open();
 #endif
 
@@ -2705,6 +2715,10 @@ void VMManager::ShutdownCPUProviders()
 	psxRec.Shutdown();
 	recCpu.Shutdown();
 #else
+	arm64Cpu.Shutdown();
+	arm64IopCpu.Shutdown();
+	CpuArm64VU0.Shutdown();
+	CpuArm64VU1.Shutdown();
 	// See the comment in the InitializeCPUProviders for an explaination why we
 	// still need to manage the MTVU thread.
 	if (vu1Thread.IsOpen())
@@ -2730,11 +2744,15 @@ void VMManager::UpdateCPUImplementations()
 	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
 #else
-	Cpu = &intCpu;
-	psxCpu = &psxInt;
+	Cpu = EmuConfig.Cpu.Recompiler.EnableEE ? &arm64Cpu : &intCpu;
+	psxCpu = CHECK_IOPREC ? &arm64IopCpu : &psxInt;
 
-	CpuVU0 = &CpuIntVU0;
-	CpuVU1 = &CpuIntVU1;
+	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
+	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&CpuArm64VU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
+	Console.WriteLn("CPU execution: EE: %s; IOP: %s; VU0: %s; VU1: %s; MTVU: %s",
+		Cpu == &arm64Cpu ? "ARM64 block recompiler (partial)" : "interpreter",
+		psxCpu == &arm64IopCpu ? "ARM64 block recompiler (partial)" : "interpreter",
+		CpuVU0->GetLongName(), CpuVU1->GetLongName(), THREAD_VU1 ? "on" : "off");
 #endif
 }
 

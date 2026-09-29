@@ -176,6 +176,7 @@ set(pcsx2Headers
 	IopGte.h
 	IopHw.h
 	IopMem.h
+	Interpreter.h
 	LayeredSettingsInterface.h
 	PINE.h
 	Mdec.h
@@ -187,6 +188,7 @@ set(pcsx2Headers
 	PerformanceMetrics.h
 	PrecompiledHeader.h
 	R3000A.h
+	R3000AInterpreter.h
 	R5900.h
 	R5900OpcodeTables.h
 	SaveState.h
@@ -211,7 +213,8 @@ set(pcsx2Headers
 	vtlb.h
 	VUflags.h
 	VUmicro.h
-	VUops.h)
+	VUops.h
+	VUPipeline.h)
 
 # CDVD sources
 set(pcsx2CDVDSources
@@ -1053,10 +1056,26 @@ set(pcsx2arm64Sources
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
+	arm64/VU0Recompiler.cpp
+	arm64/VU0Pipeline.cpp
+	arm64/VU1Recompiler.cpp
+	arm64/VU1Pipeline.cpp
+	arm64/EERecompiler.cpp
+	arm64/EECodeGenerator.cpp
+	arm64/IopRecompiler.cpp
+	arm64/IopCodeGenerator.cpp
 	)
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
+	arm64/VU0Recompiler.h
+	arm64/VU0Pipeline.h
+	arm64/VU1Recompiler.h
+	arm64/VU1Pipeline.h
+	arm64/EERecompiler.h
+	arm64/EECodeGenerator.h
+	arm64/IopRecompiler.h
+	arm64/IopCodeGenerator.h
 )
 
 # These ones benefit a lot from LTO
@@ -1261,6 +1280,8 @@ if (APPLE)
 		${QUARTZCORE_LIBRARY}
 		${AVFOUNDATION_LIBRARY}
 		${COREMEDIA_LIBRARY}
+		# MetalFX needs macOS 13, which is newer than the deployment target.
+		"-weak_framework MetalFX"
 	)
 endif()
 

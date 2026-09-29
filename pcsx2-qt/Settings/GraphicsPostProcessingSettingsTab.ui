@@ -55,6 +55,11 @@
             <string>Sharpen and Resize (Display Resolution)</string>
            </property>
           </item>
+          <item>
+           <property name="text">
+            <string>MetalFX Upscale (Display Resolution, Metal)</string>
+           </property>
+          </item>
          </widget>
         </item>
         <item>

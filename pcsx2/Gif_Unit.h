@@ -614,6 +614,10 @@ struct Gif_Unit
 		}
 	}
 
+	// Whole-packet XGKICK used by native VU backends when XgKickHack is off.
+	// addr is a byte offset in the 16 KiB VU1 data memory.
+	u32 TransferXgkickPacket(u8* memory, u32 addr);
+
 	// Specify the transfer type you are initiating
 	// The return value is the amount of data (in bytes) that was processed
 	// If transfer cannot take place at this moment the return value is 0

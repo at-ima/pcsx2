@@ -9,6 +9,26 @@
 
 Gif_Unit gifUnit;
 
+u32 Gif_Unit::TransferXgkickPacket(u8* memory, u32 addr)
+{
+	addr &= 0x3fff;
+	const u32 diff = 0x4000 - addr;
+	// Interpreter-compatible size queries include EOP in bit 31.
+	const u32 size = GetGSPacketSize(GIF_PATH_1, memory, addr, ~0u, true) & 0x7fffffff;
+	if (!size)
+		return 0;
+	if (size > diff)
+	{
+		gifPath[GIF_PATH_1].CopyGSPacketData(memory + addr, diff, true);
+		TransferGSPacketData(GIF_TRANS_XGKICK, memory, size - diff, true);
+	}
+	else
+	{
+		TransferGSPacketData(GIF_TRANS_XGKICK, memory + addr, size, true);
+	}
+	return size;
+}
+
 // Returns true on stalling SIGNAL
 bool Gif_HandlerAD(u8* pMem)
 {

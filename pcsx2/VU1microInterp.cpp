@@ -29,34 +29,87 @@ void _vu1ExecLower(VURegs* VU, u32* ptr)
 
 int vu1branch = 0;
 
+namespace
+{
+	struct VU1DecodedInstruction
+	{
+		u32 upper;
+		u32 lower;
+		_VURegsNum upperRegs;
+		_VURegsNum lowerRegs;
+		bool valid;
+	};
+
+	VU1DecodedInstruction s_vu1DecodedInstructions[VU1_PROGSIZE / 8] = {};
+
+	VU1DecodedInstruction& DecodeInstruction(VURegs* VU, const u32* ptr)
+	{
+		auto& decoded = s_vu1DecodedInstructions[(VU->VI[REG_TPC].UL & VU1_PROGMASK) / 8];
+		// Register dependencies depend only on the instruction words. Check both on
+		// every fetch so MPG uploads, debugger edits and state loads need no invalidation.
+		if (!decoded.valid || decoded.upper != ptr[1] || decoded.lower != ptr[0])
+		{
+			decoded.upper = ptr[1];
+			decoded.lower = ptr[0];
+			decoded.upperRegs = {};
+			decoded.lowerRegs = {};
+			VU->code = ptr[1];
+			VU1regs_UPPER_OPCODE[VU->code & 0x3f](&decoded.upperRegs);
+			if (!(ptr[1] & 0x80000000))
+			{
+				VU->code = ptr[0];
+				VU1regs_LOWER_OPCODE[VU->code >> 25](&decoded.lowerRegs);
+			}
+			decoded.valid = true;
+		}
+		return decoded;
+	}
+} // namespace
+
 static void _vu1Exec(VURegs* VU)
 {
-	_VURegsNum lregs;
-	_VURegsNum uregs;
 	u32* ptr;
 
 	ptr = (u32*)&VU->Micro[VU->VI[REG_TPC].UL];
+	auto& decoded = DecodeInstruction(VU, ptr);
+	_VURegsNum& uregs = decoded.upperRegs;
+	_VURegsNum& lregs = decoded.lowerRegs;
 	VU->VI[REG_TPC].UL += 8;
 
 	if (ptr[1] & 0x40000000) // E flag
 	{
 		VU->ebit = 2;
 	}
+	// Under MTVU this runs on the VU1 thread, which must not touch EE-owned state:
+	// FBRST comes from the snapshot passed through the ring buffer, and the EE is
+	// notified through mtvuInterrupts instead of VPU_STAT/INTC. This mirrors what
+	// microVU does in mVUtBit/mVUeBit. Needs proper testing across games.
+	const u32 fbrst = THREAD_VU1 ? vu1Thread.vuFBRST : VU0.VI[REG_FBRST].UL;
 	if (ptr[1] & 0x10000000) // D flag
 	{
-		if (VU0.VI[REG_FBRST].UL & 0x400)
+		if (fbrst & 0x400)
 		{
-			VU0.VI[REG_VPU_STAT].UL |= 0x200;
-			hwIntcIrq(INTC_VU1);
+			if (!THREAD_VU1)
+			{
+				VU0.VI[REG_VPU_STAT].UL |= 0x200;
+				hwIntcIrq(INTC_VU1);
+			}
 			VU->ebit = 1;
 		}
 	}
 	if (ptr[1] & 0x08000000) // T flag
 	{
-		if (VU0.VI[REG_FBRST].UL & 0x800)
+		if (fbrst & 0x800)
 		{
-			VU0.VI[REG_VPU_STAT].UL |= 0x400;
-			hwIntcIrq(INTC_VU1);
+			if (THREAD_VU1)
+			{
+				vu1Thread.mtvuInterrupts.fetch_or(VU_Thread::InterruptFlagVUTBit, std::memory_order_release);
+			}
+			else
+			{
+				VU0.VI[REG_VPU_STAT].UL |= 0x400;
+				hwIntcIrq(INTC_VU1);
+			}
 			VU->ebit = 1;
 		}
 	}
@@ -64,7 +117,6 @@ static void _vu1Exec(VURegs* VU)
 	//VUM_LOG("VU->cycle = %d (flags st=%x;mac=%x;clip=%x,q=%f)", VU->cycle, VU->statusflag, VU->macflag, VU->clipflag, VU->q.F);
 
 	VU->code = ptr[1];
-	VU1regs_UPPER_OPCODE[VU->code & 0x3f](&uregs);
 
 	u32 cyclesBeforeOp = VU1.cycle-1;
 
@@ -81,9 +133,8 @@ static void _vu1Exec(VURegs* VU)
 		_vu1ExecUpper(VU, ptr);
 
 		VU->VI[REG_I].UL = ptr[0];
-		//Lower not used, set to 0 to fill in the FMAC stall gap
+		//Lower metadata is zero for I-bit instructions to fill in the FMAC stall gap.
 		//Could probably get away with just running upper stalls, but lets not tempt fate.
-		memset(&lregs, 0, sizeof(lregs));
 	}
 	else
 	{
@@ -96,8 +147,6 @@ static void _vu1Exec(VURegs* VU)
 		int discard = 0;
 
 		VU->code = ptr[0];
-		lregs.cycles = 0;
-		VU1regs_LOWER_OPCODE[VU->code >> 25](&lregs);
 
 		_vuTestLowerStalls(VU, &lregs);
 		_vuTestPipes(VU);
@@ -191,15 +240,25 @@ static void _vu1Exec(VURegs* VU)
 		{
 			VU->VIBackupCycles = 0;
 			_vuFlushAll(VU);
-			VU0.VI[REG_VPU_STAT].UL &= ~0x100;
-			vif1Regs.stat.VEW = false;
+			if (THREAD_VU1)
+			{
+				// VPU_STAT and vif1Regs belong to the EE thread; report the end of
+				// the microprogram the way microVU's mVUEBit does instead.
+				VU->flags &= ~VUFLAG_MTVURUNNING;
+				vu1Thread.mtvuInterrupts.fetch_or(VU_Thread::InterruptFlagVUEBit, std::memory_order_release);
+			}
+			else
+			{
+				VU0.VI[REG_VPU_STAT].UL &= ~0x100;
+				vif1Regs.stat.VEW = false;
+			}
 
 			if(VU1.xgkickenable)
 				_vuXGKICKTransfer(0, true);
 			// In instant VU mode, VU1 goes WAY ahead of the CPU, making the XGKick fall way behind
 			// We also have some code to update it in VIF Unpacks too, since in some games (Aggressive Inline) overwrite the XGKick data
 			// VU currently flushes XGKICK on end, so this isn't needed, yet
-			if (INSTANT_VU1)
+			if (INSTANT_VU1 && !THREAD_VU1)
 				VU1.xgkicklastcycle = cpuRegs.cycle;
 		}
 	}

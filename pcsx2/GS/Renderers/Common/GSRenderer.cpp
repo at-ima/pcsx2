@@ -667,7 +667,22 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
 
-			if (GSConfig.CASMode != GSCASMode::Disabled)
+			if (GSConfig.CASMode == GSCASMode::MetalFXUpscale)
+			{
+				// Only worth it when the display is bigger than the internal resolution.
+				if (src_rect.width() < draw_rect.z - draw_rect.x || src_rect.height() < draw_rect.w - draw_rect.y)
+				{
+					static bool fx_log_once = false;
+					if (!g_gs_device->SpatialUpscale(current, src_rect, src_uv, draw_rect) && !fx_log_once)
+					{
+						Host::AddIconOSDMessage("MetalFXUnsupported", ICON_FA_TRIANGLE_EXCLAMATION,
+							TRANSLATE_SV("GS", "MetalFX upscaling is not available, it needs the Metal renderer on macOS 13 or newer."),
+							10.0f);
+						fx_log_once = true;
+					}
+				}
+			}
+			else if (GSConfig.CASMode != GSCASMode::Disabled)
 			{
 				static bool cas_log_once = false;
 				if (g_gs_device->Features().cas_sharpening)

@@ -1,0 +1,309 @@
+// SPDX-FileCopyrightText: 2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "Common.h"
+
+#if defined(ARCH_ARM64)
+#include "arm64/VU0Recompiler.h"
+#include "common/HostSys.h"
+#include <gtest/gtest.h>
+#include <array>
+#include <cstring>
+
+namespace
+{
+	// An upper op that decodes to Op::None, paired with a MOVE whose masks are
+	// empty, gives a pair that is compiled but architecturally inert.
+	constexpr u32 kNopUpper = 0x000002ff;
+	constexpr u32 kNopLower = 0x8000033c;
+
+	constexpr u32 MakeUpper(u32 op, u32 dest, u32 fd, u32 fs, u32 ft)
+	{
+		return (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | op;
+	}
+
+	// DIV Q, VFs[fsf], VFt[ftf].
+	constexpr u32 MakeDiv(u32 fs, u32 fsf, u32 ft, u32 ftf)
+	{
+		return (0x40u << 25) | (ftf << 23) | (fsf << 21) | (ft << 16) | (fs << 11) | 0x3bc;
+	}
+
+	// Lower branch: target is pc + 8 + (sign-extended imm11 * 8).
+	constexpr u32 MakeBranch(u32 op, u32 is, u32 it, u32 pc, u32 target)
+	{
+		const u32 imm = ((target - pc - 8) / 8) & 0x7ff;
+		return (op << 25) | (it << 16) | (is << 11) | imm;
+	}
+
+	// IADDIU vit, vis, imm -- used to seed the loop counters the branches test.
+	constexpr u32 MakeIaddiu(u32 it, u32 is, u32 imm)
+	{
+		return (8u << 25) | ((imm & 0x7800) << 10) | (it << 16) | (is << 11) | (imm & 0x7ff);
+	}
+
+	// ISUBIU vit, vis, imm.
+	constexpr u32 MakeIsubiu(u32 it, u32 is, u32 imm)
+	{
+		return (9u << 25) | ((imm & 0x7800) << 10) | (it << 16) | (is << 11) | (imm & 0x7ff);
+	}
+
+	// ILW.x vit, offset(vis) -- an integer load, which issues into the IALU pipe
+	// and only lands in vit some cycles later.
+	constexpr u32 MakeIlw(u32 it, u32 is, u32 offset)
+	{
+		return (4u << 25) | (1u << 21) | (it << 16) | (is << 11) | (offset & 0x7ff);
+	}
+
+	class VU0RecompilerTest : public testing::Test
+	{
+	protected:
+		static void SetUpTestSuite() { ASSERT_TRUE(SysMemory::Allocate()); }
+		static void TearDownTestSuite()
+		{
+			CpuArm64VU0.Shutdown();
+			SysMemory::Release();
+		}
+
+		void SetUp() override
+		{
+			m_cpu = EmuConfig.Cpu;
+			m_saved0 = VU0;
+			u8* micro = VU0.Micro;
+			u8* mem = VU0.Mem;
+			std::memset(&VU0, 0, sizeof(VU0));
+			VU0.idx = 0;
+			VU0.Micro = micro;
+			VU0.Mem = mem;
+			VU0.VF[0].f.w = 1.0f;
+			for (u32 r = 1; r < 32; r++)
+			{
+				VU0.VI[r].UL = r * 713;
+				for (u32 lane = 0; lane < 4; lane++)
+					VU0.VF[r].F[lane] = (r + lane) * 0.125f;
+			}
+			VU0.ACC = VU0.VF[7];
+			VU0.VI[REG_TPC].UL = 0;
+			VU0.VI[REG_Q].UL = 0x3f800000;
+			VU0.VI[REG_VPU_STAT].UL = 0x1;
+			std::memset(VU0.Mem, 0x3f, VU0_MEMSIZE);
+			for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+				Put(pc, kNopUpper, kNopLower);
+			CpuArm64VU0.Reserve();
+		}
+
+		void TearDown() override
+		{
+			CpuArm64VU0.Reset();
+			VU0 = m_saved0;
+			EmuConfig.Cpu = m_cpu;
+		}
+
+		// Rewinds to a coherent starting state. Resetting VU0.cycle without also
+		// emptying the pipe queues would leave entries whose sCycle sits in the
+		// future relative to the rewound clock -- a state the emulator never
+		// reaches, and one the two execution paths resolve differently.
+		void Rewind()
+		{
+			VU0.VI[REG_TPC].UL = 0;
+			VU0.cycle = 0;
+			std::memset(VU0.fmac, 0, sizeof(VU0.fmac));
+			VU0.fmacreadpos = VU0.fmacwritepos = VU0.fmaccount = 0;
+			std::memset(VU0.ialu, 0, sizeof(VU0.ialu));
+			VU0.ialureadpos = VU0.ialuwritepos = VU0.ialucount = 0;
+			std::memset(&VU0.fdiv, 0, sizeof(VU0.fdiv));
+			std::memset(&VU0.efu, 0, sizeof(VU0.efu));
+			VU0.VIBackupCycles = 0;
+			VU0.branch = VU0.ebit = 0;
+		}
+
+		void Put(u32 pc, u32 upper, u32 lower)
+		{
+			std::memcpy(VU0.Micro + pc, &lower, 4);
+			std::memcpy(VU0.Micro + pc + 4, &upper, 4);
+		}
+
+		// Runs the interpreter, rewinds, runs the recompiler, and requires the
+		// resulting VU0 state to match bit for bit.
+		void Compare(u32 cycles)
+		{
+			const VURegs initial = VU0;
+			std::array<u8, VU0_MEMSIZE> initial_memory;
+			std::memcpy(initial_memory.data(), VU0.Mem, initial_memory.size());
+
+			CpuIntVU0.Execute(cycles);
+			const VURegs expected = VU0;
+			std::array<u8, VU0_MEMSIZE> expected_memory;
+			std::memcpy(expected_memory.data(), VU0.Mem, expected_memory.size());
+
+			VU0 = initial;
+			std::memcpy(VU0.Mem, initial_memory.data(), initial_memory.size());
+			CpuArm64VU0.Execute(cycles);
+
+			ASSERT_EQ(VU0.VI[REG_Q].UL, expected.VI[REG_Q].UL);
+			ASSERT_EQ(VU0.cycle, expected.cycle);
+			ASSERT_EQ(VU0.VI[REG_TPC].UL, expected.VI[REG_TPC].UL);
+			ASSERT_EQ(std::memcmp(VU0.VF, expected.VF, sizeof(VU0.VF)), 0);
+			ASSERT_EQ(std::memcmp(VU0.VI, expected.VI, sizeof(VU0.VI)), 0);
+			ASSERT_EQ(std::memcmp(&VU0, &expected, sizeof(VU0)), 0);
+			ASSERT_EQ(std::memcmp(VU0.Mem, expected_memory.data(), expected_memory.size()), 0);
+		}
+
+		Pcsx2Config::CpuOptions m_cpu;
+		VURegs m_saved0;
+	};
+} // namespace
+
+// A divide stages its result in the FDIV pipe, and the block's own cycle-driven
+// retire step has to flush that pipe as it advances the cycle, or a Q consumer
+// past the divide's latency reads a stale value -- the shape of the Ridge Racer
+// V regression VU0Pipeline.cpp's FDIV retirement fixed. Back-to-back divides
+// additionally make the second one stall on the first.
+TEST_F(VU0RecompilerTest, BackToBackDividesKeepQInSyncWithTheInterpreter)
+{
+	constexpr u32 kMulQ = MakeUpper(0x1c, 15, 5, 6, 0);
+
+	for (u32 budget : {4u, 8u, 16u, 24u, 40u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
+		Put(32, kMulQ, kNopLower);
+		Put(40, kMulQ, kNopLower);
+		Put(48, kNopUpper, MakeDiv(3, 2, 4, 3));
+		Put(80, kMulQ, kNopLower);
+		Put(88, kMulQ, kNopLower);
+
+		Compare(budget);
+	}
+}
+
+// Every other test here compares against the interpreter, which still passes if
+// the recompiler quietly compiles nothing and steps every pair instead -- the
+// results are identical either way. Assert that native code was actually
+// emitted, so that silent degradation to the interpreter is a test failure.
+TEST_F(VU0RecompilerTest, EmitsNativeCodeForASupportedBlock)
+{
+	ASSERT_EQ(CpuArm64VU0.GetCommittedCache(), 0u);
+	VU0.VI[REG_TPC].UL = 0;
+	VU0.cycle = 0;
+	CpuArm64VU0.Execute(64);
+	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
+}
+
+// An integer load lands in its destination register some cycles after it
+// issues, so a branch testing that register has to wait for the load to retire
+// rather than reading the stale value. The compiled branch gets that wait from
+// the pipeline's branch entry (VU0Pipeline.cpp), not from its own codegen.
+TEST_F(VU0RecompilerTest, BranchesWaitForAPendingIntegerLoad)
+{
+	for (u32 budget : {4u, 8u, 16u, 32u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeIaddiu(3, 0, 0)); // vi3 = 0 (load address)
+		Put(8, kNopUpper, MakeIaddiu(2, 0, 0)); // vi2 = 0 (compare operand)
+		Put(16, kNopUpper, MakeIlw(1, 3, 0)); // vi1 = mem[vi3], still in flight
+		Put(24, kNopUpper, MakeBranch(0x28, 1, 2, 24, 48)); // IBEQ vi1, vi2 -> 48
+		Put(32, kNopUpper, kNopLower); // delay slot
+		Put(40, kNopUpper, MakeIaddiu(4, 0, 1));
+		Put(48, kNopUpper, MakeIaddiu(5, 0, 1));
+
+		Compare(budget);
+	}
+}
+
+// A backward integer-conditional branch is the shape a VU0 microprogram loop
+// actually takes, and the one the recompiler has to get right to keep a trace
+// going instead of handing every branch plus its delay slot to the interpreter.
+// The branch's own register read must observe the interpreter's one-pair integer
+// write delay (VIBackupCycles), so the counter is updated in the pair right
+// before the branch on purpose.
+TEST_F(VU0RecompilerTest, ConditionalLoopBranchesMatchTheInterpreter)
+{
+	constexpr u32 kMul = MakeUpper(0x2a, 15, 9, 5, 6);
+
+	for (u32 budget : {4u, 8u, 16u, 32u, 64u, 128u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeIaddiu(1, 0, 4)); // vi1 = 4
+		Put(8, kNopUpper, MakeIaddiu(2, 0, 0)); // vi2 = 0
+		// loop:
+		Put(16, kMul, kNopLower);
+		Put(24, kNopUpper, MakeIsubiu(1, 1, 1)); // vi1 -= 1, read by the branch below
+		Put(32, kMul, MakeBranch(0x29, 1, 2, 32, 16)); // IBNE vi1, vi2 -> loop
+		Put(40, kMul, kNopLower); // delay slot
+		// fallthrough
+		Put(48, kMul, kNopLower);
+		Put(56, kNopUpper, MakeBranch(0x20, 0, 0, 56, 72)); // B -> 72
+		Put(64, kMul, kNopLower); // delay slot
+		Put(72, kMul, kNopLower);
+
+		Compare(budget);
+	}
+}
+
+// DIV/SQRT/RSQRT are the remaining reason VU0 traces were cut short, so assert
+// that a block starting on one is actually compiled rather than handed back to
+// the interpreter a pair at a time.
+TEST_F(VU0RecompilerTest, EmitsNativeCodeForABlockStartingOnADivide)
+{
+	ASSERT_EQ(CpuArm64VU0.GetCommittedCache(), 0u);
+	Rewind();
+	Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
+	CpuArm64VU0.Execute(64);
+	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
+}
+
+// The idiom that broke Ridge Racer V's car rendering: WAITQ paired with an
+// upper op that broadcasts Q. The interpreter runs the lower op's stall and the
+// pipe retirement before executing the upper (VU0microInterp.cpp calls
+// _vuTestLowerStalls/_vuTestPipes ahead of _vu0ExecUpper), so the multiply sees
+// the divide's freshly retired result. Emitting the pair in source order
+// instead makes it multiply by the previous Q.
+TEST_F(VU0RecompilerTest, WaitqRetiresQBeforeThePairedUpperReadsIt)
+{
+	constexpr u32 kMulQ = MakeUpper(0x1c, 15, 5, 6, 0);
+	constexpr u32 kWaitq = (0x40u << 25) | 0x3bf;
+
+	for (u32 budget : {2u, 3u, 4u, 8u, 12u, 16u, 32u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
+		Put(8, kMulQ, kWaitq); // waits for the divide, then multiplies by its Q
+		Put(16, kMulQ, kNopLower);
+
+		Compare(budget);
+	}
+}
+
+TEST_F(VU0RecompilerTest, ADivideRetiresThePreviousQBeforeThePairedUpperReadsIt)
+{
+	// Same hazard as the WAITQ test above, but through the far more common shape:
+	// a divide whose own FDIV-pipe stall retires the *previous* divide's Q, paired
+	// with an upper op that broadcasts Q in that very pair.
+	constexpr u32 kMulQ = MakeUpper(0x1c, 15, 5, 6, 0);
+
+	for (u32 budget : {2u, 3u, 4u, 8u, 12u, 16u, 32u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		Put(0, kNopUpper, MakeDiv(1, 0, 2, 1));
+		Put(8, kMulQ, MakeDiv(3, 0, 4, 1)); // reads the first divide's Q, issues a second
+		Put(16, kMulQ, kNopLower);
+
+		Compare(budget);
+	}
+}
+#endif

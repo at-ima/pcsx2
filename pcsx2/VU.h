@@ -77,6 +77,10 @@ struct REG_VI
 //#define VUFLAG_BREAKONMFLAG		0x00000001
 #define VUFLAG_MFLAGSET 0x00000002
 #define VUFLAG_INTCINTERRUPT 0x00000004
+// Set by the MTVU thread around a VU1 microprogram run. Under MTVU the EE thread
+// owns VU0.VI[REG_VPU_STAT], so a VU1 provider that runs on the MTVU thread cannot
+// use its 0x100 "busy" bit as a run gate. This VU1-local flag replaces it.
+#define VUFLAG_MTVURUNNING 0x00000008
 struct fdivPipe
 {
 	int enable;
@@ -166,6 +170,9 @@ struct alignas(16) VURegs
 	u32 xgkicksizeremaining;
 	u64 xgkicklastcycle;
 	u32 xgkickcyclecount;
+	// Bit 0 stays the legacy enable bit. Bit 1 distinguishes a delayed native
+	// packet request from an incremental transfer restored from a save state.
+	static constexpr u32 XgkickPacket = 3;
 	u32 xgkickenable;
 	u32 xgkickendpacket;
 

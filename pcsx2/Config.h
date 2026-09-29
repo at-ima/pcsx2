@@ -410,6 +410,7 @@ enum class GSCASMode : u8
 	Disabled,
 	SharpenOnly,
 	SharpenAndResize,
+	MetalFXUpscale, // Apple MetalFX spatial upscaler to display resolution, Metal only
 };
 
 enum class GSHWAutoFlushLevel : u8
@@ -1500,7 +1501,17 @@ namespace EmuFolders
 #define REC_VU1 (EmuConfig.Cpu.Recompiler.EnableVU1)
 #define THREAD_VU1 (REC_VU1 && EmuConfig.Speedhacks.vuThread)
 #else
-#define THREAD_VU1 false
+// The ARM64 block recompiler retains interpreter pipeline/XGKICK timing, so
+// REC_VU1 (which selects microVU's timing) stays off. THREAD_VU1 is independent:
+// it only moves VU1 execution onto the MTVU thread, which the polymorphic
+// BaseVUmicroCPU interface already supports.
+//
+// Unlike microVU, the ARM64 provider delegates control flow (branches, E/D/T bits)
+// to the shared VU1 interpreter, which was written for synchronous EE-thread
+// execution and touched EE-owned state (VPU_STAT, FBRST, vif1Regs, cpuRegs.cycle)
+// from the VU1 thread. Those sites are now MTVU-aware; see VUFLAG_MTVURUNNING.
+// Needs proper testing across games.
+#define THREAD_VU1 (EmuConfig.Cpu.Recompiler.EnableVU1 && EmuConfig.Speedhacks.vuThread)
 #define REC_VU1 false
 #endif
 #define INSTANT_VU1 (EmuConfig.Speedhacks.vu1Instant)

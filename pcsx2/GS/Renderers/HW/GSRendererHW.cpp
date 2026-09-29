@@ -8650,6 +8650,32 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 
 	const GSVector2i scaled_copy_size = GSVector2i(static_cast<int>(std::ceil(static_cast<float>(copy_size.x) * scale)),
 		static_cast<int>(std::ceil(static_cast<float>(copy_size.y) * scale)));
+	// Native scaling often reads the same unchanged target many times (SotC post effects downsample a 4K target
+	// ~7 times a frame), so let the device reuse its earlier downsamples instead of making a new copy every draw.
+	const bool box_downsample = m_downscale_source && !src_target->m_texture->IsDepthStencil() &&
+	                            std::floor(src_target->GetScale()) == src_target->GetScale();
+	const u32 downsample_factor = static_cast<u32>(src_target->GetScale());
+	// When using native HPO, the top-left column/row of pixels are often not drawn. Clamp these away to avoid sampling black,
+	// causing bleeding into the edges of the downsampled texture.
+	const GSVector2i downsample_clamp_min = (GSConfig.UserHacks_HalfPixelOffset != GSHalfPixelOffset::Native) ?
+	                                            GSVector2i(0, 0) :
+	                                            GSVector2i(downsample_factor, downsample_factor);
+	GSVector4 downsample_rect;
+	if (box_downsample)
+	{
+		GSVector4i copy_rect = tmm.coverage;
+		if (target_region)
+		{
+			copy_rect += GSVector4i(source_region.GetMinX(), source_region.GetMinY()).xyxy();
+		}
+		downsample_rect = GSVector4((copy_rect + GSVector4i(-1, 1).xxyy()).rintersect(src_target->GetUnscaledRect()));
+		if (GSTexture* cached = g_gs_device->GetCachedDownsample(src_target->m_texture, scaled_copy_size, downsample_factor, downsample_clamp_min, downsample_rect))
+		{
+			m_conf.tex = cached;
+			return;
+		}
+	}
+
 	const bool clear = src_target->m_texture->IsRenderTarget();
 	src_copy.reset(g_gs_device->CreateCompatible(src_target->m_texture, scaled_copy_size, clear));
 	if (!src_copy) [[unlikely]]
@@ -8663,7 +8689,7 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 	if (m_downscale_source)
 	{
 		// Can't use box filtering on depth (yet), or fractional scales.
-		if (src_target->m_texture->IsDepthStencil() || std::floor(src_target->GetScale()) != src_target->GetScale())
+		if (!box_downsample)
 		{
 			GSVector4 src_rect = GSVector4(tmm.coverage) / GSVector4(GSVector4i::loadh(src_unscaled_size).zwzw());
 			const GSVector4 dst_rect = GSVector4(tmm.coverage);
@@ -8671,19 +8697,7 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 		}
 		else
 		{
-			// When using native HPO, the top-left column/row of pixels are often not drawn. Clamp these away to avoid sampling black,
-			// causing bleeding into the edges of the downsampled texture.
-			const u32 downsample_factor = static_cast<u32>(src_target->GetScale());
-			const GSVector2i clamp_min = (GSConfig.UserHacks_HalfPixelOffset != GSHalfPixelOffset::Native) ?
-			                                 GSVector2i(0, 0) :
-			                                 GSVector2i(downsample_factor, downsample_factor);
-			GSVector4i copy_rect = tmm.coverage;
-			if (target_region)
-			{
-				copy_rect += GSVector4i(source_region.GetMinX(), source_region.GetMinY()).xyxy();
-			}
-			const GSVector4 dRect = GSVector4((copy_rect + GSVector4i(-1, 1).xxyy()).rintersect(src_target->GetUnscaledRect()));
-			g_gs_device->FilteredDownsampleTexture(src_target->m_texture, src_copy.get(), downsample_factor, clamp_min, dRect);
+			g_gs_device->FilteredDownsampleTexture(src_target->m_texture, src_copy.get(), downsample_factor, downsample_clamp_min, downsample_rect);
 		}
 	}
 	else

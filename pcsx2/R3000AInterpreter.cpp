@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-#include "R3000A.h"
+#include "R3000AInterpreter.h"
 #include "Common.h"
 #include "Config.h"
 #include "VMManager.h"
@@ -85,7 +85,7 @@ void psxBNE()   // Branch if Rs != Rt
 void psxJ()
 {
 	// check for iop module import table magic
-	u32 delayslot = iopMemRead32(psxRegs.pc);
+	u32 delayslot = iopMemFetch32(psxRegs.pc);
 	if (delayslot >> 16 == 0x2400 && irxImportExec(irxImportTableAddr(psxRegs.pc), delayslot & 0xffff))
 		return;
 
@@ -226,14 +226,14 @@ static __fi void execI()
 		}
 	}
 
-	psxRegs.code = iopMemRead32(psxRegs.pc);
+	psxRegs.code = iopMemFetch32(psxRegs.pc);
 
-		PSXCPU_LOG("%s", disR3000AF(psxRegs.code, psxRegs.pc));
+	PSXCPU_LOG("%s", disR3000AF(psxRegs.code, psxRegs.pc));
 
 	psxRegs.pc+= 4;
 	psxRegs.cycle++;
 
-	psxBSC[psxRegs.code >> 26]();
+	psxExecuteOpcode();
 }
 
 static void doBranch(s32 tar) {
@@ -261,7 +261,15 @@ static void doBranch(s32 tar) {
 	iopIsDelaySlot = false;
 	psxRegs.pc = branchPC;
 
-	iopEventTest();
+	// As in the x64 dispatcher, scheduled work only needs a scan at its deadline.
+	// Unlike a deadline-only check, keep the interpreter's immediate interrupt
+	// response when CP0 or hardware state changes (including in the delay slot).
+	if (static_cast<s64>(psxRegs.cycle - psxRegs.iopNextEventCycle) >= 0 ||
+		((psxRegs.CP0.n.Status & 0xFE01) >= 0x401 && psxHu32(HW_ICTRL) != 0 &&
+			(psxHu32(HW_ISTAT) & psxHu32(HW_IMASK)) != 0))
+	{
+		iopEventTest();
+	}
 }
 
 static void intReserve() {

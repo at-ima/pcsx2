@@ -250,5 +250,11 @@ namespace Threading
 				;
 			return counter > 0;
 		}
+
+		/// Like TryWait(), but keeps trying for up to max_ns before giving up.
+		/// On ARM64 the core sleeps in WFE until another core writes the counter,
+		/// so a Post() in that window finds no sleeper and skips the kernel call,
+		/// without the power a busy spin costs.
+		bool TryWaitWithLowPowerSpin(u32 max_ns);
 	};
 } // namespace Threading

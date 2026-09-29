@@ -25,6 +25,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 struct PipelineSelectorExtrasMTL
 {
@@ -288,6 +289,32 @@ public:
 	MRCOwned<id<MTLDepthStencilState>> m_dss_hw[1 << 5];
 
 	MRCOwned<id<MTLBuffer>> m_expand_index_buffer;
+
+	/// Native scaling downsamples handed out by GetCachedDownsample(), valid until the source is written again
+	struct DownsampleCache
+	{
+		std::unique_ptr<GSTexture> tex;
+		const GSTextureMTL* src = nullptr;
+		u64 src_serial = 0;
+		u64 last_use = 0;
+		u32 factor = 0;
+		int clamp_min = 0;
+		float step = 0;
+		std::vector<GSVector4i> valid; ///< Areas of tex holding downsampled texels
+		GSVector4i dirty = GSVector4i::zero(); ///< Area of src drawn to since the valid areas were filled
+	};
+	std::array<DownsampleCache, 4> m_downsample_cache;
+	u64 m_downsample_cache_uses = 0;
+	/// Area RenderHW is about to draw to, so writes to a cached source only invalidate part of it
+	const GSVector4i* m_pending_write_area = nullptr;
+
+	// MetalFX spatial upscaler for presenting (id<MTLFXSpatialScaler>, macOS 13+)
+	MRCOwned<id<NSObject>> m_fx_scaler;
+	std::unique_ptr<GSTexture> m_fx_input;
+	std::unique_ptr<GSTexture> m_fx_output;
+	GSVector4i m_fx_key = GSVector4i::zero();
+	MTLPixelFormat m_fx_format = MTLPixelFormatInvalid;
+
 	UploadBuffer m_texture_upload_buf;
 	BufferPair m_vertex_upload_buf;
 
@@ -394,6 +421,7 @@ public:
 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) override;
 
 	bool DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) override;
+	bool SpatialUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect) override;
 
 	MRCOwned<id<MTLFunction>> LoadShader(NSString* name);
 	MRCOwned<id<MTLRenderPipelineState>> MakePipeline(MTLRenderPipelineDescriptor* desc, id<MTLFunction> vertex, id<MTLFunction> fragment, NSString* name);
@@ -441,6 +469,7 @@ public:
 	void UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex, u32 dOffset, u32 dSize) override;
 	void ConvertToIndexedTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, u32 SBW, u32 SPSM, GSTexture* dTex, u32 DBW, u32 DPSM) override;
 	void FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) override;
+	GSTexture* GetCachedDownsample(GSTexture* sTex, const GSVector2i& size, u32 downsample_factor, const GSVector2i& clamp_min, const GSVector4& dRect) override;
 	void BeginDSAsRT(GSTexture* ds, const GSVector4i& drawarea) override;
 
 	void FlushClears(GSTexture* tex);
@@ -466,6 +495,7 @@ public:
 
 	void SetupDestinationAlpha(GSTexture* rt, GSTexture* ds, const GSVector4i& r, SetDATM datm);
 	void PrepareROVTexture(GSTexture** ptex);
+	void MarkWritten(GSTextureMTL* tex, MTLLoadAction load);
 	void RenderHW(GSHWDrawConfig& config) override;
 	void SendHWDraw(GSHWDrawConfig& config, id<MTLRenderCommandEncoder> enc, id<MTLBuffer> buffer, size_t off,
 		bool one_barrier, bool full_barrier);

@@ -1,5 +1,15 @@
 add_pcsx2_test(core_test
 	patch_tests.cpp
+	vu_pipeline_tests.cpp
+	vu1_interpreter_tests.cpp
+	vu_neon_tests.cpp
+	vu1_recompiler_tests.cpp
+	vu0_recompiler_tests.cpp
+	ee_recompiler_tests.cpp
+	iop_recompiler_tests.cpp
+	iop_fetch_tests.cpp
+	iop_dispatch_tests.cpp
+	iop_branch_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )

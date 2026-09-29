@@ -23,6 +23,7 @@ GSTextureMTL::GSTextureMTL(GSDeviceMTL* dev, MRCOwned<id<MTLTexture>> texture, M
 	m_size.x = [m_texture width];
 	m_size.y = [m_texture height];
 	m_mipmap_levels = [m_texture mipmapLevelCount];
+	MarkWritten();
 }
 GSTextureMTL::~GSTextureMTL()
 {
@@ -72,6 +73,7 @@ void* GSTextureMTL::MapWithPitch(const GSVector4i& r, int pitch, int layer)
 	if (layer >= m_mipmap_levels)
 		return nullptr;
 	m_has_mipmaps = false;
+	MarkWritten();
 
 	size_t size = CalcUploadSize(r.height(), pitch);
 	GSDeviceMTL::Map map;
@@ -126,6 +128,7 @@ void GSTextureMTL::GenerateMipmap()
 	{
 		id<MTLBlitCommandEncoder> enc = m_dev->GetTextureUploadEncoder();
 		[enc generateMipmapsForTexture:m_texture];
+		MarkWritten();
 	}
 }}
 

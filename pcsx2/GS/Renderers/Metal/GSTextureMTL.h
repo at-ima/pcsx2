@@ -23,10 +23,13 @@ class GSTextureMTL : public GSTexture
 	MRCOwned<id<MTLTexture>> m_texture;
 	MRCOwned<id<MTLTexture>> m_rov_texture;
 	bool m_has_mipmaps = false;
+	static inline u64 s_write_serial_counter = 0;
 
 public:
 	u64 m_last_read = 0;  ///< Last time this texture was read by a draw
 	u64 m_last_write = 0; ///< Last time this texture was written by a draw
+	u64 m_write_serial;   ///< Changes on every write, unique across textures (for data derived from the contents)
+	void MarkWritten() { m_write_serial = ++s_write_serial_counter; }
 	GSTextureMTL(GSDeviceMTL* dev, MRCOwned<id<MTLTexture>> texture, MRCOwned<id<MTLTexture>> rov_texture, Usage usage, Format format);
 	~GSTextureMTL();
 
