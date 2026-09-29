@@ -2966,3 +2966,11 @@ Other numbers from the same investigation, for later work:
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
+- VU0 macro FMAC ops (V{ADD,SUB,MUL,MADD,MSUB}[A][bc|i|q]) run as NEON code
+  in EE blocks while VU0 is idle. Before, each one called `COP2_SPECIAL`,
+  which dispatched to per-lane `VU_MACx_UPDATE` calls and `VU_STAT_UPDATE`
+  (about 8% of the SotC EE thread in `sample`), and every call dropped the
+  GPR cache. Interpreter calls that remain now save the cached registers. EE
+  host instructions per EE cycle, alternating runs: SotC 27.52, 27.24 ->
+  25.04, 24.90; Burnout 3 26.90, 27.01 -> 26.34, 26.24; Saru! Get You! 3
+  20.60, 20.58 -> 18.63, 18.61. Frame dumps (four states) were unchanged.

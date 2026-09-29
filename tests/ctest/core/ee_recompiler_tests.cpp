@@ -83,6 +83,7 @@ namespace
 			m_fpu = fpuRegs;
 			m_config = EmuConfig.Cpu;
 			m_goemon = EmuConfig.Gamefixes.GoemonTlbHack;
+			m_addsub = EmuConfig.Gamefixes.VuAddSubHack;
 			EmuConfig.Gamefixes.GoemonTlbHack = false;
 			m_mapping = vtlb_private::vtlbdata.vmap[Base >> 12];
 			m_last_mapping = vtlb_private::vtlbdata.vmap[0xfffff];
@@ -108,6 +109,7 @@ namespace
 			fpuRegs = m_fpu;
 			EmuConfig.Cpu = m_config;
 			EmuConfig.Gamefixes.GoemonTlbHack = m_goemon;
+			EmuConfig.Gamefixes.VuAddSubHack = m_addsub;
 		}
 		void Map(u32 address, u32* buffer)
 		{
@@ -350,6 +352,7 @@ namespace
 		fpuRegisters m_fpu;
 		Pcsx2Config::CpuOptions m_config;
 		bool m_goemon;
+		bool m_addsub;
 		vtlb_private::VTLBVirtual m_mapping, m_last_mapping, m_data_mapping, m_alias_mapping;
 	};
 } // namespace
@@ -1349,6 +1352,109 @@ TEST_F(EERecompilerTest, COP2MacroArithmeticMatchesInterpreter)
 		if (HasFailure())
 			return;
 	}
+}
+
+TEST_F(EERecompilerTest, COP2MacroMultiplyAccumulateMatchesInterpreter)
+{
+	// Every V{ADD,SUB,MUL,MADD,MSUB}[A][bc|i|q] runs natively while VU0 is idle.
+	// Operands include signed zeros, denormals, Inf/NaN, Fmax and values whose
+	// sums/products overflow or underflow, under both overflow clamp settings
+	// and the FPCR modes the interpreter also runs with.
+	constexpr u32 ops[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 30,
+		32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45};
+	constexpr u32 values[] = {0x00000000, 0x80000000, 0x00000001, 0x807fffff, 0x00800000, 0x3f800000,
+		0xbf800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x1f800000, 0x5f800000,
+		0xdf000000, 0x40490fdb};
+	constexpr u32 masks[] = {15, 0, 8, 1, 7, 10};
+	constexpr u64 fpcrs[] = {0, 1u << 24, (1u << 24) | (3u << 22)};
+	u64 saved_fpcr;
+	asm volatile("mrs %0, fpcr" : "=r"(saved_fpcr));
+	for (u64 fpcr : fpcrs)
+	{
+		asm volatile("msr fpcr, %0" : : "r"(fpcr));
+		for (bool clamp : {true, false})
+		{
+			EmuConfig.Cpu.Recompiler.vu0Overflow = clamp;
+			for (bool accumulator : {false, true})
+			{
+				for (u32 op : ops)
+				{
+					for (u32 seed = 0; seed < 12; seed++)
+					{
+						const u32 mask = masks[seed % std::size(masks)];
+						// fd 0, fs == ft and fd aliasing a source all appear.
+						const u32 fd = seed % 5, fs = 1 + seed % 3, ft = seed % 4 == 3 ? fs : 1 + (seed / 3) % 4;
+						SCOPED_TRACE(testing::Message() << "op=" << op << " acc=" << accumulator << " mask=" << mask
+														<< " clamp=" << clamp << " fpcr=" << fpcr << " seed=" << seed);
+						Init(seed);
+						InitVU0(seed);
+						for (u32 reg = 1; reg < 32; reg++)
+							for (u32 lane = 0; lane < 4; lane++)
+								if (seed < 8)
+									VU0.VF[reg].UL[lane] = values[(seed * 7 + reg * 5 + lane * 3) % std::size(values)];
+						for (u32 lane = 0; lane < 4; lane++)
+							VU0.ACC.UL[lane] = values[(seed * 3 + lane * 5 + 1) % std::size(values)];
+						VU0.VI[REG_I].UL = values[(seed + 5) % std::size(values)];
+						VU0.VI[REG_Q].UL = values[(seed * 11 + 2) % std::size(values)];
+						VU0.macflag = 0xa5a50000 | seed;
+						VU0.VI[REG_STATUS_FLAG].UL = 0xfff;
+						const u32 operation = accumulator ? ((op >> 2) << 6) | 0x3c | (op & 3) : (fd << 6) | op;
+						program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5 (cached)
+						program[1] = (18u << 26) | (1u << 25) | (mask << 21) | (ft << 16) | (fs << 11) | operation;
+						program[2] = (33u << 0) | (2u << 21) | (1u << 16) | (4u << 11); // ADDU r4, r2, r1
+						CompareWithVU0(3);
+						if (HasFailure())
+						{
+							asm volatile("msr fpcr, %0" : : "r"(saved_fpcr));
+							return;
+						}
+					}
+				}
+			}
+		}
+	}
+	asm volatile("msr fpcr, %0" : : "r"(saved_fpcr));
+}
+
+TEST_F(EERecompilerTest, COP2InterpreterCallsKeepCachedRegisters)
+{
+	// Ops left to the interpreter are called with the block's registers saved,
+	// so cached GPRs survive them; QMFC2/CFC2 write rt, which must be reloaded.
+	const u32 cop2[] = {
+		(18u << 26) | (1u << 25) | (15u << 21) | (3u << 16) | (2u << 11) | (1u << 6) | 43, // VMAX
+		(18u << 26) | (1u << 25) | (14u << 21) | (3u << 16) | (2u << 11) | (12u << 6) | 0x3c, // VMOVE
+		(18u << 26) | (1u << 25) | (15u << 21) | (3u << 16) | (2u << 11) | (7u << 6) | 0x3c | 3, // VCLIPw
+		(18u << 26) | (1u << 21) | (2u << 16) | (3u << 11), // QMFC2 r2, vf3
+		(18u << 26) | (2u << 21) | (2u << 16) | (5u << 11), // CFC2 r2, vi5
+		(18u << 26) | (5u << 21) | (2u << 16) | (3u << 11), // QMTC2 r2, vf3
+		(18u << 26) | (6u << 21) | (2u << 16) | (5u << 11), // CTC2 r2, vi5
+	};
+	for (u32 code : cop2)
+	{
+		for (u32 seed = 0; seed < 4; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "code=" << std::hex << code << " seed=" << seed);
+			Init(seed);
+			InitVU0(seed);
+			program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5
+			program[1] = (9u << 26) | (3u << 21) | (4u << 16) | 7; // ADDIU r4, r3, 7
+			program[2] = code;
+			program[3] = (33u << 0) | (2u << 21) | (4u << 16) | (5u << 11); // ADDU r5, r2, r4
+			program[4] = (33u << 0) | (1u << 21) | (3u << 16) | (6u << 11); // ADDU r6, r1, r3
+			CompareWithVU0(5);
+			if (HasFailure())
+				return;
+		}
+	}
+	// The Tri-Ace fix keeps VADDi on the interpreter.
+	EmuConfig.Gamefixes.VuAddSubHack = true;
+	Init(0);
+	InitVU0(0);
+	program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5;
+	program[1] = (18u << 26) | (1u << 25) | (15u << 21) | (2u << 11) | (1u << 6) | 34; // VADDi
+	program[2] = (33u << 0) | (2u << 21) | (1u << 16) | (4u << 11);
+	program[3] = Stop;
+	CompareWithVU0(3);
 }
 
 TEST_F(EERecompilerTest, COP2SurroundingIntegerCodeStaysNative)

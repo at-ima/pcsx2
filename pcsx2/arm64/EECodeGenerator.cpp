@@ -951,38 +951,242 @@ namespace
 		return rs == 1 || rs == 2 || rs == 5 || rs == 6 || (rs & 16) != 0;
 	}
 
-	// COP2 macro-mode ops are left as plain interpreter calls rather than
-	// reimplemented in native code: their VU0 pipeline/flag/sync semantics
-	// (see the TODOs atop VU0.cpp) are delicate, and every one of them already
-	// operates on cpuRegs/VU0 globals with no arguments, so calling the exact
-	// same, already-validated handler costs one Blr while still letting the
-	// surrounding integer/branch code stay natively compiled instead of the
-	// whole block dropping to the interpreter at the first COP2 instruction.
+	enum class MacroOp
+	{
+		None,
+		Add,
+		Subtract,
+		Multiply,
+		MultiplyAdd,
+		MultiplySubtract,
+	};
+
+	struct MacroArithmetic
+	{
+		MacroOp op = MacroOp::None;
+		bool accumulator = false; // writes ACC instead of fd
+		int lane = -1; // broadcast ft lane (x=0 .. w=3)
+		int vi = -1; // broadcast REG_I or REG_Q
+	};
+
+	// V{ADD,SUB,MUL,MADD,MSUB}[A][bc|i|q]. COP2_SPECIAL's table (funct) and
+	// COP2_SPECIAL2's table (the A forms) number these ops the same way.
+	MacroArithmetic DecodeMacroArithmetic(u32 code)
+	{
+		u32 n = code & 63;
+		MacroArithmetic m;
+		m.accumulator = n >= 60;
+		if (m.accumulator)
+			n = (code & 3) | ((code >> 4) & 0x7c);
+		constexpr MacroOp broadcast[] = {MacroOp::Add, MacroOp::Subtract, MacroOp::MultiplyAdd, MacroOp::MultiplySubtract};
+		constexpr MacroOp scalar[] = {MacroOp::Add, MacroOp::MultiplyAdd, MacroOp::Add, MacroOp::MultiplyAdd,
+			MacroOp::Subtract, MacroOp::MultiplySubtract, MacroOp::Subtract, MacroOp::MultiplySubtract};
+		if (n < 16)
+			m = {broadcast[n >> 2], m.accumulator, static_cast<int>(n & 3)};
+		else if (n >= 24 && n < 28)
+			m = {MacroOp::Multiply, m.accumulator, static_cast<int>(n & 3)};
+		else if (n == 28 || n == 30)
+			m = {MacroOp::Multiply, m.accumulator, -1, n == 28 ? REG_Q : REG_I};
+		else if (n >= 32 && n < 40)
+			m = {scalar[n & 7], m.accumulator, -1, (n & 2) ? REG_I : REG_Q};
+		else if (n == 40 || n == 41 || n == 42 || n == 44 || n == 45)
+			m.op = n == 40 ? MacroOp::Add : n == 41 ? MacroOp::MultiplyAdd : n == 42 ? MacroOp::Multiply :
+			       n == 44 ? MacroOp::Subtract : MacroOp::MultiplySubtract;
+		// The Tri-Ace fix changes VADDi (not VADDAi) rounding; leave it to the interpreter.
+		if (!m.accumulator && m.op == MacroOp::Add && m.vi == REG_I && EmuConfig.Gamefixes.VuAddSubHack)
+			m.op = MacroOp::None;
+		return m;
+	}
+
+	constexpr size_t VF(u32 reg) { return offsetof(VURegs, VF) + sizeof(VECTOR) * reg; }
+	constexpr size_t VI(u32 reg) { return offsetof(VURegs, VI) + sizeof(REG_VI) * reg; }
+
+	// vuDouble() on every lane: a zero exponent keeps only the sign, and with
+	// VU0 overflow clamping an all-ones exponent becomes signed Fmax.
+	// v31 = 0x80000000, v30 = 0x7f800000, v29 = 0x7f7fffff.
+	void EmitVuDouble(MacroAssembler& a, const VRegister& v, bool clamp)
+	{
+		a.And(v16.V16B(), v.V16B(), v30.V16B());
+		a.Cmeq(v17.V4S(), v16.V4S(), 0);
+		a.Bic(v17.V16B(), v17.V16B(), v31.V16B());
+		a.Bic(v.V16B(), v.V16B(), v17.V16B());
+		if (clamp)
+		{
+			a.Cmeq(v16.V4S(), v16.V4S(), v30.V4S());
+			a.And(v17.V16B(), v.V16B(), v31.V16B());
+			a.Orr(v17.V16B(), v17.V16B(), v29.V16B());
+			a.Bit(v.V16B(), v17.V16B(), v16.V16B());
+		}
+	}
+
+	// The VU0 macro FMAC ops of VUops.cpp (applyBinaryMACOp and friends,
+	// followed by SYNCMSFLAGS) with x9 = &VU0. MADD/MSUB fuse like the
+	// interpreter, which is built with -ffp-contract=fast and compiles them to
+	// FMADD/FMSUB; all of it runs under the same FPCR as the interpreter.
+	// Only v0-v7 and v16-v31 are used: d8-d15 are callee-saved.
+	void EmitMacroArithmetic(MacroAssembler& a, u32 code, const MacroArithmetic& m)
+	{
+		const u32 ft = (code >> 16) & 31, fs = (code >> 11) & 31, fd = (code >> 6) & 31;
+		const u32 mask = (code >> 21) & 15; // x=8 y=4 z=2 w=1
+		const bool clamp = CHECK_VU_OVERFLOW(0);
+		a.Movi(v31.V4S(), 0x80000000);
+		a.Movi(v30.V4S(), 0x7f800000);
+		if (clamp)
+			a.Movi(v29.V4S(), 0x7f7fffff);
+		a.Ldr(q0, MemOperand(x9, VF(fs)));
+		if (m.lane >= 0 || m.vi >= 0)
+		{
+			a.Add(x10, x9, m.lane >= 0 ? VF(ft) + 4 * m.lane : VI(m.vi));
+			a.Ld1r(v1.V4S(), MemOperand(x10));
+		}
+		else
+			a.Ldr(q1, MemOperand(x9, VF(ft)));
+		EmitVuDouble(a, v0, clamp);
+		EmitVuDouble(a, v1, clamp);
+		switch (m.op)
+		{
+			case MacroOp::Add:
+				a.Fadd(v2.V4S(), v0.V4S(), v1.V4S());
+				break;
+			case MacroOp::Subtract:
+				a.Fsub(v2.V4S(), v0.V4S(), v1.V4S());
+				break;
+			case MacroOp::Multiply:
+				a.Fmul(v2.V4S(), v0.V4S(), v1.V4S());
+				break;
+			default:
+				a.Ldr(q2, MemOperand(x9, offsetof(VURegs, ACC)));
+				EmitVuDouble(a, v2, clamp);
+				if (m.op == MacroOp::MultiplyAdd)
+					a.Fmla(v2.V4S(), v0.V4S(), v1.V4S());
+				else
+					a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
+				break;
+		}
+
+		// VU_MAC_UPDATE: per lane Z (bit 0, also set on underflow), S (4),
+		// U (8) and O (12), then shifted by 3 for x down to 0 for w. Lanes
+		// outside the mask get no flags.
+		a.And(v16.V16B(), v2.V16B(), v30.V16B());
+		a.Cmeq(v17.V4S(), v16.V4S(), 0); // Z
+		a.Fcmeq(v18.V4S(), v2.V4S(), 0.0);
+		a.Bic(v18.V16B(), v17.V16B(), v18.V16B()); // U: exponent 0 but != 0 (FPCR.FZ decides)
+		a.Cmeq(v19.V4S(), v16.V4S(), v30.V4S()); // O
+		a.Ushr(v20.V4S(), v17.V4S(), 31);
+		a.Ushr(v21.V4S(), v2.V4S(), 31);
+		a.Sli(v20.V4S(), v21.V4S(), 4);
+		a.Ushr(v21.V4S(), v18.V4S(), 31);
+		a.Sli(v20.V4S(), v21.V4S(), 8);
+		a.Ushr(v21.V4S(), v19.V4S(), 31);
+		a.Sli(v20.V4S(), v21.V4S(), 12);
+		const auto weight = [mask](u32 lane) { return u64((mask >> (3 - lane)) & 1) << (3 - lane); };
+		a.Movi(v22.V2D(), weight(2) | (weight(3) << 32), weight(0) | (weight(1) << 32));
+		a.Mul(v20.V4S(), v20.V4S(), v22.V4S());
+		a.Addv(s20, v20.V4S());
+		a.Fmov(w10, s20);
+
+		// Underflow stores the signed zero; overflow clamps like the inputs.
+		a.Bic(v18.V16B(), v18.V16B(), v31.V16B());
+		a.Bic(v2.V16B(), v2.V16B(), v18.V16B());
+		if (clamp)
+		{
+			a.And(v17.V16B(), v2.V16B(), v31.V16B());
+			a.Orr(v17.V16B(), v17.V16B(), v29.V16B());
+			a.Bit(v2.V16B(), v17.V16B(), v19.V16B());
+		}
+		// fd == 0 writes the interpreter's scratch vector, which nothing reads.
+		if (m.accumulator || fd)
+		{
+			const MemOperand dst(x9, m.accumulator ? offsetof(VURegs, ACC) : VF(fd));
+			if (mask != 15)
+			{
+				a.Ldr(q3, dst);
+				a.Cmtst(v23.V4S(), v22.V4S(), v22.V4S());
+				a.Bit(v3.V16B(), v2.V16B(), v23.V16B());
+				a.Str(q3, dst);
+			}
+			else
+				a.Str(q2, dst);
+		}
+
+		// macflag keeps its upper half; VU_STAT_UPDATE then SYNCMSFLAGS.
+		a.Ldr(w11, MemOperand(x9, offsetof(VURegs, macflag)));
+		a.And(w11, w11, 0xffff0000);
+		a.Orr(w11, w11, w10);
+		a.Str(w11, MemOperand(x9, offsetof(VURegs, macflag)));
+		a.Str(w11, MemOperand(x9, VI(REG_MAC_FLAG)));
+		// Status bit n is "any bit in MAC nibble n": fold each nibble into its
+		// low bit, then gather bits 0/4/8/12 into bits 12-15 with one multiply.
+		a.Orr(w12, w10, Operand(w10, LSR, 1));
+		a.Orr(w12, w12, Operand(w12, LSR, 2));
+		a.And(w12, w12, 0x1111);
+		a.Mov(w13, 0x1248);
+		a.Mul(w12, w12, w13);
+		a.Ubfx(w12, w12, 12, 4);
+		a.Str(w12, MemOperand(x9, offsetof(VURegs, statusflag)));
+		a.Ldr(w13, MemOperand(x9, VI(REG_STATUS_FLAG)));
+		a.And(w13, w13, 0xfc0);
+		a.Orr(w13, w13, w12);
+		a.Orr(w13, w13, Operand(w12, LSL, 6));
+		a.Str(w13, MemOperand(x9, VI(REG_STATUS_FLAG)));
+		a.Mov(w13, code);
+		a.Str(w13, MemOperand(x9, offsetof(VURegs, code)));
+	}
+
+	// Calls a COP2 interpreter handler. Handlers are ordinary AAPCS64 functions
+	// that may clobber every caller-saved register, so the block's live ones
+	// are saved around the call: x0 (cpuRegs), x1 (link state), the GPR cache
+	// in x2-x8, x14 (vtlb map) and lr, which the block's own Ret() still needs.
+	// None of these handlers change cpuRegs.GPR except QMFC2/CFC2's rt, which
+	// the caller invalidates.
+	void EmitCOP2Call(MacroAssembler& a, u32 code, u32 pc, void (*handler)())
+	{
+		EmitPosition(a, pc + 4, code);
+		a.Stp(x0, x1, MemOperand(sp, -96, PreIndex));
+		a.Stp(x2, x3, MemOperand(sp, 16));
+		a.Stp(x4, x5, MemOperand(sp, 32));
+		a.Stp(x6, x7, MemOperand(sp, 48));
+		a.Stp(x8, x14, MemOperand(sp, 64));
+		a.Str(lr, MemOperand(sp, 80));
+		a.Mov(x16, reinterpret_cast<uintptr_t>(handler));
+		a.Blr(x16);
+		a.Ldr(lr, MemOperand(sp, 80));
+		a.Ldp(x8, x14, MemOperand(sp, 64));
+		a.Ldp(x6, x7, MemOperand(sp, 48));
+		a.Ldp(x4, x5, MemOperand(sp, 32));
+		a.Ldp(x2, x3, MemOperand(sp, 16));
+		a.Ldp(x0, x1, MemOperand(sp, 96, PostIndex));
+	}
+
+	// The FMAC macro ops run natively while VU0 is idle, which is when
+	// COP2_SPECIAL's _vu0FinishMicro() does nothing. Everything else, and every
+	// op while a microprogram runs, calls the interpreter's handler.
+	// Needs proper testing across more games.
 	void EmitCOP2(MacroAssembler& a, u32 code, u32 pc)
 	{
 		const u32 rs = (code >> 21) & 31;
-		EmitPosition(a, pc + 4, code);
-		void (*handler)() = (rs & 16) ? &COP2_SPECIAL : rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2;
-		// A generated block is a leaf function as far as its caller is concerned:
-		// its own trailing Ret() relies on lr still holding the return address
-		// TryExecute's call left there. Blr overwrites lr with this call site, so
-		// it must be saved/restored around the call, matching VU1Pipeline.cpp's
-		// stub calls (x15 just keeps sp's mandatory 16-byte alignment here; this
-		// codegen never keeps anything live in it across instructions).
-		a.Stp(x15, lr, MemOperand(sp, -16, PreIndex));
-		a.Mov(x16, reinterpret_cast<uintptr_t>(handler));
-		a.Blr(x16);
-		a.Ldp(x15, lr, MemOperand(sp, 16, PostIndex));
-		// COP2 handlers are ordinary C++ functions under the AAPCS64 ABI and are
-		// free to clobber every caller-saved register; x0 (the cpuRegisters*
-		// base every subsequent field access assumes stays live for the whole
-		// compiled function) and x14 (the vtlb map base, cached once per block
-		// when the block needs it at all) must be restored afterward.
-		a.Mov(x0, reinterpret_cast<uintptr_t>(&cpuRegs));
-		a.Mov(x1, reinterpret_cast<uintptr_t>(&Arm64EE::CodeGenerator::g_link_state));
-		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
-		// The call clobbered x2-x8, and the handlers write GPRs.
-		s_gpr.InvalidateAll();
+		if (rs & 16)
+		{
+			const MacroArithmetic m = DecodeMacroArithmetic(code);
+			if (m.op == MacroOp::None)
+			{
+				EmitCOP2Call(a, code, pc, &COP2_SPECIAL);
+				return;
+			}
+			Label slow, done;
+			a.Mov(x9, reinterpret_cast<uintptr_t>(&VU0));
+			a.Ldr(w10, MemOperand(x9, VI(REG_VPU_STAT)));
+			a.Tbnz(w10, 0, &slow);
+			EmitMacroArithmetic(a, code, m);
+			a.B(&done);
+			a.Bind(&slow);
+			EmitCOP2Call(a, code, pc, &COP2_SPECIAL);
+			a.Bind(&done);
+			return;
+		}
+		EmitCOP2Call(a, code, pc, rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2);
+		if (rs == 1 || rs == 2)
+			s_gpr.Invalidate((code >> 16) & 31);
 	}
 
 	// Natively compiles the COP1 (FPU) instructions accepted by SupportsCOP1().
