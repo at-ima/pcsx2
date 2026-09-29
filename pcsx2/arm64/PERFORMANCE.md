@@ -2952,6 +2952,11 @@ Other numbers from the same investigation, for later work:
   is one PC-relative load. EE host instructions per EE cycle, alternating
   runs: SotC 29.12, 28.72 -> 28.48, 28.40; Burnout 3 29.95, 29.81 -> 28.96,
   28.71. Frame dumps (frames 60-600, four states) were unchanged.
+- The within-block GPR cache (write-through, x2-x8) removes those reloads.
+  EE host instructions per EE cycle, alternating runs: SotC 28.48, 28.85 ->
+  27.83, 27.99; Burnout 3 29.02, 28.85 -> 28.53, 28.33; Saru! Get You! 3
+  21.45, 21.37 -> 21.32, 21.13. Frame dumps (four states) and a SotC BIOS
+  boot to frame 2400 were unchanged.
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.

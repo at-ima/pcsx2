@@ -174,9 +174,13 @@ bumps the link generation so no link leads to the old code. Needs proper
 testing in games that really modify their code. The page tracking goes through the physical mapping, so it is used
 only when that mapping and the virtual mapping resolve to the same byte;
 otherwise the entry falls back to `memcmp`. The unit tests' synthetic code
-buffers take that fallback. The initial implementation uses memory-backed guest
-registers; register caching must preserve the same entry, exit and fallback
-contracts when introduced.
+buffers take that fallback. Guest GPRs live in `cpuRegs`. Within a block,
+`GprCache` keeps the low 64 bits of up to seven of them in x2-x8 once an
+integer op, address, store value or branch comparison has loaded or written
+them. It is write-through: every write still stores to `cpuRegs`, so exits and
+fallbacks see memory exactly as before, and a cached value is only dropped when
+another emitter writes that GPR (`GPRWrite`: loads, HI/LO, MULT, packed and
+COP1 transfers, branch links) or a COP2 call clobbers x2-x8.
 
 Lookup goes through three levels. First, a one-entry cache holds the most
 recently dispatched PC. Second, a 65536-entry direct-mapped cache is tagged with
@@ -631,7 +635,7 @@ well.
 
 ## Known issues
 
-As of 2026-09-30, `core_test` has 289 tests; 288 pass.
+As of 2026-09-30, `core_test` has 290 tests; 289 pass.
 
 - **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
   has failed since `4293623d6` (OPMULA/OPMSUB), with VU1Recompiler.cpp from
