@@ -19,6 +19,7 @@ sections unless a section says so.
 | 09-28..29 | Shadow of the Colossus at 6x | "Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides" |
 | 09-29 | Shadow of the Colossus at 6x | "VU1 flags under the flag hack" |
 | 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
+| 09-30 | Shadow of the Colossus at 6x | "MTVU ring: shared cache lines" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2957,9 +2958,23 @@ Other numbers from the same investigation, for later work:
   27.83, 27.99; Burnout 3 29.02, 28.85 -> 28.53, 28.33; Saru! Get You! 3
   21.45, 21.37 -> 21.32, 21.13. Frame dumps (four states) and a SotC BIOS
   boot to frame 2400 were unchanged.
+- A linked exit now stores only `pc`; `cpuRegs.code` is decode scratch and is
+  written only on paths that return to C++. The CP0.Config cycle scaling is
+  a compile-time constant, and a change of that bit drops every block. EE
+  host instructions per EE cycle, means of alternating runs: SotC 28.07 ->
+  27.14, Burnout 3 28.44 -> 26.78, Saru! Get You! 3 21.10 -> 20.58. Frame
+  dumps (four states) were unchanged.
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
+- VU0 macro FMAC ops (V{ADD,SUB,MUL,MADD,MSUB}[A][bc|i|q]) run as NEON code
+  in EE blocks while VU0 is idle. Before, each one called `COP2_SPECIAL`,
+  which dispatched to per-lane `VU_MACx_UPDATE` calls and `VU_STAT_UPDATE`
+  (about 8% of the SotC EE thread in `sample`), and every call dropped the
+  GPR cache. Interpreter calls that remain now save the cached registers. EE
+  host instructions per EE cycle, alternating runs: SotC 27.52, 27.24 ->
+  25.04, 24.90; Burnout 3 26.90, 27.01 -> 26.34, 26.24; Saru! Get You! 3
+  20.60, 20.58 -> 18.63, 18.61. Frame dumps (four states) were unchanged.
 
 ## MTVU ring: shared cache lines
 

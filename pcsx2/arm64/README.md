@@ -13,13 +13,13 @@ instruction or pair at a time, through the same architectural state:
 
 | Unit | Files | Setting | Still interpreted |
 | --- | --- | --- | --- |
-| EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, BC2, MMIO/unmapped accesses |
+| EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, COP2 ops other than FMAC (called from blocks), BC2, MMIO/unmapped accesses |
 | IOP | `IopRecompiler.cpp`, `IopCodeGenerator.cpp` | `EnableIOP` | J (idle loops are skipped natively), GTE, LWL/LWR/SWL/SWR, SYSCALL/BREAK, RFE, code outside the 8 MiB RAM window |
 | VU0 micro mode | `VU0Recompiler.cpp`, `VU0Pipeline.cpp` | `EnableVU0` | JR/JALR/BAL, ISWR, MFP, RINIT/RGET/RNEXT/RXOR, the EFU pipe, E/M/D/T-bit pairs |
 | VU1 | `VU1Recompiler.cpp`, `VU1Pipeline.cpp` | `EnableVU1` | ISWR, RINIT/RGET/RNEXT/RXOR, EATAN*/ESIN/EEXP, nested branches, end-bit delay slots |
 
-VU0 macro mode (COP2 from EE code) still runs the interpreter's handlers,
-called from native EE blocks. MTVU (`THREAD_VU1`) is supported. See
+VU0 macro mode (COP2 from EE code) runs its FMAC ops natively in EE blocks
+and calls the interpreter's handlers for the rest. MTVU (`THREAD_VU1`) is supported. See
 [Known issues](#known-issues) before relying on any of this.
 
 ## IOP
@@ -115,16 +115,23 @@ ACC-based MADD/MSUB/MULA family still end the block. This needs proper
 testing across games.
 
 COP2 (VU0 macro-mode: `QMFC2`/`CFC2`/`QMTC2`/`CTC2` and the `COP2_SPECIAL`
-arithmetic family) no longer ends the native block. `EmitCOP2` sets
-`pc`/`code` and calls the exact interpreter handler via `Blr`, so VU0's own
-pipeline/flag/sync semantics are never reimplemented here; only the
-surrounding integer/branch code stops falling out of native compilation
-alongside it. `lr` must be saved/restored around this call (the block's own
-trailing `Ret()` otherwise returns into itself — see "COP2 (VU0 macro-mode)
-no longer ends the native EE block" in `PERFORMANCE.md`), as must `x0` and
-`x14`, since the handler is an ordinary AAPCS64 function free to clobber
-every caller-saved register. BC2 (rs == 8) is not modeled and still ends the
-block. A VU0 micro-mode program started from macro mode runs on the VU0
+arithmetic family) no longer ends the native block.
+V{ADD,SUB,MUL,MADD,MSUB}[A][bc|i|q] are NEON code while VU0 is idle
+(`VPU_STAT` bit 0 clear, when `COP2_SPECIAL`'s `_vu0FinishMicro()` does
+nothing). They match `VUops.cpp`: `vuDouble()` on every input, VU0 overflow
+clamping, per-lane MAC flags, then `VU_STAT_UPDATE` and `SYNCMSFLAGS`.
+MADD/MSUB use fused `FMLA`/`FMLS`, because the interpreter is built with
+`-ffp-contract=fast` and compiles them to `FMADD`/`FMSUB`. Changing
+`vu0Overflow` or the Tri-Ace `VuAddSubHack` (which keeps VADDi on the
+interpreter) resets the block cache.
+
+Every other COP2 op, and any op while a microprogram runs, calls the exact
+interpreter handler via `Blr` after setting `pc`/`code`. The call saves the
+block's live registers: `x0`, `x1`, the GPR cache in `x2`-`x8`, `x14` and `lr`
+(the block's own trailing `Ret()` otherwise returns into itself — see "COP2
+(VU0 macro-mode) no longer ends the native EE block" in `PERFORMANCE.md`).
+Only QMFC2/CFC2 write a GPR, and they drop just that one from the cache. BC2
+(rs == 8) is not modeled and still ends the block. A VU0 micro-mode program started from macro mode runs on the VU0
 provider described below.
 
 Supported integer branches and jumps terminate the block. Their delay slot must
@@ -180,7 +187,7 @@ integer op, address, store value or branch comparison has loaded or written
 them. It is write-through: every write still stores to `cpuRegs`, so exits and
 fallbacks see memory exactly as before, and a cached value is only dropped when
 another emitter writes that GPR (`GPRWrite`: loads, HI/LO, MULT, packed and
-COP1 transfers, branch links) or a COP2 call clobbers x2-x8.
+COP1 transfers, branch links, QMFC2/CFC2).
 
 Lookup goes through three levels. First, a one-entry cache holds the most
 recently dispatched PC. Second, a 65536-entry direct-mapped cache is tagged with
@@ -614,8 +621,10 @@ cached-value publication, callback modifications and upper-vector ABI clobbers.
 Synthetic timing results are kept under the ignored build directory; they are
 not game-performance guarantees.
 
-`ee_recompiler_tests.cpp` also covers COP1 against `FPU.cpp`, COP2 transfers and
-macro arithmetic, and a self-looping branch against a manual replay of the
+`ee_recompiler_tests.cpp` also covers COP1 against `FPU.cpp`, COP2 transfers,
+every native macro FMAC op (edge operands, masks, both clamp settings and
+three FPCR modes; an unfused MADD fails it) and interpreter calls keeping
+cached GPRs, and a self-looping branch against a manual replay of the
 driver's bookkeeping. `iop_recompiler_tests.cpp` compares native IOP blocks with
 the interpreter, including IsC stores. `vu0_recompiler_tests.cpp` checks that
 native code is actually emitted: a recompiler that interprets every pair would
@@ -635,7 +644,7 @@ well.
 
 ## Known issues
 
-As of 2026-09-30, `core_test` has 290 tests; 289 pass.
+As of 2026-09-30, `core_test` has 292 tests; 291 pass.
 
 - **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
   has failed since `4293623d6` (OPMULA/OPMSUB), with VU1Recompiler.cpp from

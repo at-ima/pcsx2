@@ -132,6 +132,13 @@ namespace
 	bool s_goemon_tlb_hack = false;
 	// Native links inline intUpdateCPUCycles() for the default cycle rate only.
 	s8 s_cycle_rate = 0;
+	// Generated exits scale cycles by the CP0.Config bit 18 they were compiled
+	// with. Only MTC0, which the interpreter runs, changes it.
+	u32 s_config_cycle_bit = 0;
+	u32 ConfigCycleBit() { return (cpuRegs.CP0.n.Config >> 18) & 1; }
+	// Native COP2 macro ops bake in VU0 overflow clamping and the Tri-Ace VADDi fix.
+	u32 s_vu0_options = 0;
+	u32 Vu0Options() { return EmuConfig.Cpu.Recompiler.vu0Overflow | (EmuConfig.Gamefixes.VuAddSubHack << 1); }
 	bool Linkable() { return s_cycle_rate == 0; }
 	// 1-entry "most recently dispatched" cache, checked before s_lookup. A
 	// branch that loops back to its own containing block's entry pc (a very
@@ -233,6 +240,8 @@ __noinline void Arm64EE::Reset()
 	s_write_limit = SysMemory::GetEERecEnd() - 16 * 1024;
 	s_goemon_tlb_hack = EmuConfig.Gamefixes.GoemonTlbHack;
 	s_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
+	s_config_cycle_bit = ConfigCycleBit();
+	s_vu0_options = Vu0Options();
 }
 
 void Arm64EE::Shutdown()
@@ -262,7 +271,7 @@ namespace
 			return nullptr;
 		const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
 		if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_cycle_rate != EmuConfig.Speedhacks.EECycleRate ||
-			s_write > s_write_limit)
+			s_config_cycle_bit != ConfigCycleBit() || s_vu0_options != Vu0Options() || s_write > s_write_limit)
 			Arm64EE::Reset();
 		// Checked before s_lookup: see the comment on its declaration. Reset() /
 		// ClearProvider() invalidate it alongside s_lookup and the block table.
