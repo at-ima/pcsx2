@@ -2960,3 +2960,19 @@ Other numbers from the same investigation, for later work:
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
+
+## MTVU ring: shared cache lines
+
+`VU_Thread::VifUnpack` was about 10% of the SotC EE thread, most of it on the
+release store of the write position and the `NotifyOfWork` atomic. The EE
+thread's `m_write_pos`, the VU thread's `m_read_pos` and `semaEvent` shared one
+128-byte line, and the EE thread reloaded `m_ato_read_pos` (written by the VU
+thread after every packet) on every `ReserveSpace`. Each now has its own line,
+and the EE thread keeps the last read position it loaded, reloading only when
+that says the space is not free, and after the writer wraps.
+
+Share of the EE thread in `VifUnpack` itself (`sample`, 6 s,
+`WANDER_TO_KYOZOU_001` at 6x, alternating runs): 7.6%, 10.0% -> 4.0%, 4.3%;
+`ReserveSpace` 1.2%, 1.1% -> 0.8%, 0.9%. Host cycles per EE cycle moved with
+thermals and are not a usable comparison. Frame dumps (four states) and a
+SotC BIOS boot to frame 2400 matched the unchanged build.

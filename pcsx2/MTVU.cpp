@@ -116,6 +116,7 @@ void VU_Thread::Reset()
 	vuCycleIdx = 0;
 	m_ato_write_pos = 0;
 	m_write_pos = 0;
+	m_cached_read_pos = 0;
 	m_ato_read_pos = 0;
 	m_read_pos = 0;
 	std::memset(&vif, 0, sizeof(vif));
@@ -217,9 +218,17 @@ void VU_Thread::ExecuteRingBuffer()
 // Should only be called by ReserveSpace()
 __ri void VU_Thread::WaitOnSize(s32 size)
 {
-	for (;;)
+	// Within one lap of the writer, a stale read position only underestimates
+	// the free space: the reader has since moved forward or wrapped to the
+	// start, and neither can make the space checked here unsafe. So only
+	// reload m_ato_read_pos, a line the VU thread writes after every packet,
+	// when the old value says no. ReserveSpace() reloads it when the writer
+	// wraps.
+	s32 readPos = m_cached_read_pos;
+	for (bool reload = false;; reload = true)
 	{
-		s32 readPos = GetReadPos();
+		if (reload)
+			readPos = m_cached_read_pos = GetReadPos();
 		if (readPos <= m_write_pos)
 			break; // MTVU is reading in back of write_pos
 		// FIXME greg: there is a bug somewhere in the queue pointer
@@ -255,6 +264,7 @@ void VU_Thread::ReserveSpace(s32 size)
 		// Reset local write pointer/position
 		m_write_pos = 0;
 		CommitWritePos();
+		m_cached_read_pos = GetReadPos();
 	}
 
 	WaitOnSize(size);
