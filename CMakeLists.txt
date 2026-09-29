@@ -83,12 +83,12 @@ endif()
 
 if(ARCH_ARM64)
 	message(WARNING "
-*************** UNSUPPORTED CONFIGURATION ***************
-Apple Silicon support in PCSX2 is INCOMPLETE. VU1 has an
-experimental block recompiler with interpreter fallback.
-EE integer blocks have experimental native acceleration.
-Full EE/VU0/IOP recompilers and ARM64 MTVU are not implemented,
-so games can still run very slowly. Use
--DCMAKE_OSX_ARCHITECTURES=x86_64 for the mature recompilers.
+*************** EXPERIMENTAL CONFIGURATION **************
+Native Apple Silicon builds use this fork's experimental
+EE/IOP/VU0/VU1 block recompilers (pcsx2/arm64), which fall
+back to the interpreters for what they do not compile.
+They are tested on a handful of games only. Use
+-DCMAKE_OSX_ARCHITECTURES=x86_64 for the upstream x86
+recompilers under Rosetta.
 *********************************************************")
 endif()

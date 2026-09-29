@@ -15,6 +15,8 @@ sections unless a section says so.
 | 09-22..26 | Ridge Racer V | "Ridge Racer V: VU1 generic preparation share", "Known gaps (2026-09-26)" |
 | 09-27 | Burnout 3 | "Burnout 3: VU1 entry profiles and deferred coverage" (includes block linking) |
 | 09-27 | Burnout 3 | "Burnout 3: EE interpreter fallbacks", "Burnout 3: EE register jumps and the remaining fallbacks" |
+| 09-28 | Shadow of the Colossus | "Shadow of the Colossus: per-call VU1 overhead" |
+| 09-28..29 | Shadow of the Colossus at 6x | "Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2775,6 +2777,9 @@ Needs proper testing across more games.
 
 ## Known gaps (2026-09-26)
 
+Superseded: the first and third items are fixed. See "Known issues" in
+README.md for the current list.
+
 - **VU1 same-pair DIV/SQRT/RSQRT + Q broadcast.** Found while writing up the
   branch history. VU1's `EmitPair` hoists the FDIV stall above the upper
   instruction for WAITQ only, while VU0 now hoists it for all four
@@ -2790,3 +2795,92 @@ Needs proper testing across more games.
   inside `TryExecute`. When the event deadline is due, that loop runs the
   event test, which the unit-test fixture cannot. The other 253 tests pass
   (256 total).
+
+## Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides
+
+2026-09-28..29, `WANDER_TO_KYOZOU_001`, 6x (3072x2688 internal), M5 MacBook
+Air. Goal: about 60 fps at 4K. For the three-way comparison with ARMSX2 and
+the x64 build under Rosetta, see the benchmark table in the top-level
+README.md.
+
+### Measuring
+
+- **GPU: in-process per-frame A/B.** Consecutive runs of the same build
+  differed by 2x from heat alone (52 -> 12 fps). A throwaway patch toggles
+  the change every frame in `EndPresent` and appends `B` to the encoder
+  labels of the B frames. A Metal System Trace (`xctrace record` with a
+  template exported from Instruments) is then split by label, and the big
+  RenderHW passes are compared by median.
+- **An open Xcode GPU capture eats the GPU.** `GPUToolsReplayService` kept
+  replaying a `.gputrace` in the background, and every build fell to
+  15-20 fps. It looked like a regression until Xcode was closed.
+- **CPU: host instructions per VU1 cycle** (`thread_selfcounts` in
+  Execute()), over alternating runs. Wall-clock speed drifts with heat;
+  `ProcessInfo.thermalState` goes from nominal to fair after two or three
+  6x runs, and the CPU clock drops from 2.8 to 1.7 GHz.
+- **Power:** `proc_pid_rusage(RUSAGE_INFO_V6)` (`ri_energy_nj`, `ri_cycles`,
+  `ri_instructions`) sampled twice, 12 s apart.
+
+### GPU
+
+- **One draw is half the frame.** A layered fog draw, ~450 alpha-blended
+  triangles with ~23x overdraw, pixel shader `fog iip tcc blend_mix1 zfloor`
+  (105 instructions, F32 ALU bound). HSR cannot help with blending.
+- **Hardware depth for GEQUAL test-only draws** (`fa38ad2a2`). Apple GPUs
+  set `broken_shader_depth`, and the workaround routed depth through the
+  shader for every draw, which turns off early depth rejection. A draw that
+  only tests GEQUAL and writes no depth does not need it: the stored depth is
+  already floored, so the biased hardware depth is at most one Z unit too
+  lenient, as on the other backends. The fog pass got 20% faster. Needs
+  proper testing on games that stack GEQUAL decals.
+- **Not kept:** full framebuffer-fetch software blending instead of
+  `blend_mix` (no change).
+- **Native scaling downsamples** (`a9ab0d5b6`, `d3151759e`). `nativeScaling:
+  3` makes a box-filtered copy of the 4K target for every draw that samples
+  it: 29 copies of a 512x448 target per frame, about 2.5 ms, and each one
+  also restarted the render pass. Many of them read a target that had not
+  changed since the last copy, some in a loop that draws only a few pixels in
+  between. Metal now keeps up to four downsampled textures, each valid until
+  its source is written. Every texture write bumps a serial, and RenderHW
+  reports its draw area so that a small draw only redoes the texels that read
+  from it. The first version still copied out of the cache for each draw and
+  saved almost nothing (2.46 -> 2.29 ms); handing the cached texture to the
+  draw directly did. Per-frame A/B: -0.5 ms (2.6%) of GPU time per frame,
+  render passes 60 -> 43 per frame.
+- **MetalFX spatial upscaling** (`387e10565`), a display option
+  (`CASMode = 3`). At 3x internal and a 4K display, the scaler costs ~1.7 ms
+  per frame, and the frame is no longer GPU bound.
+
+### CPU
+
+- **IOP idle loops** (`5615c704a`). SotC's IOP sits in `j self; nop`, about
+  16M times a second. The native IOP recompiler left J to the interpreter,
+  and this was 20% of the EE thread. With WaitLoop on, both the interpreter
+  path and a native taken branch back to the same PC now skip ahead to the
+  end of the IOP's time slice or its next event, like the x86 recompiler's
+  `s_nBlockFF`.
+- **The E-bit pair ends a trace** (`fb2c897df`) instead of being refused by
+  the decoder, and **every exit of a profiled block links** (`48b0d3649`).
+- **Divides in deferred regions** (`c2681b5c2`). In the eight hottest VU1
+  blocks, only the DIV/RSQRT pairs were generic, and each one split a
+  deferred region. Region exits were 10.2% of the VU1 thread. Host
+  instructions per VU1 cycle, alternating runs: 44.3 and 45.9 -> 41.0 and
+  41.1. Host cycles per VU1 cycle: about 7.9 -> 7.5.
+- **Link slots with four targets** (`4db5c23da`). About 1.4 exits per
+  microprogram went back to Execute() because the link slot's single target
+  was another caller of the same subroutine. Dispatches per microprogram:
+  2.25 -> 1.26. Host instructions per VU1 cycle moved within noise (~1%).
+- **Where the VU1 thread goes now** (6x, `sample` attributed to generated
+  code): deferred pairs 39%, `dVifUnpack` 11%, region exits 8%, generic pairs
+  7%, prologues and links 5%, Execute() 6%. Half of a deferred pair is MAC
+  and status flag computation that nothing may read.
+
+### Where this leaves 4K
+
+With these changes the scene runs at 100% speed at 6x (VPS average 59.9).
+The VU1 (MTVU) thread is the one that limits it, not the GPU. Compared with
+ARMSX2 in this scene, this backend uses 1.7x the EE thread time, 2.1x the
+VU1 thread time and 2x the power; see the README benchmark. The largest remaining levers
+are lazy VU1 flags (microVU computes them only where they are read) and an
+EE register cache (EE blocks write every guest register back to memory after
+each instruction).

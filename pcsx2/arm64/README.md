@@ -14,9 +14,9 @@ instruction or pair at a time, through the same architectural state:
 | Unit | Files | Setting | Still interpreted |
 | --- | --- | --- | --- |
 | EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, BC2, MMIO/unmapped accesses |
-| IOP | `IopRecompiler.cpp`, `IopCodeGenerator.cpp` | `EnableIOP` | J, GTE, LWL/LWR/SWL/SWR, SYSCALL/BREAK, RFE, code outside the 8 MiB RAM window |
+| IOP | `IopRecompiler.cpp`, `IopCodeGenerator.cpp` | `EnableIOP` | J (idle loops are skipped natively), GTE, LWL/LWR/SWL/SWR, SYSCALL/BREAK, RFE, code outside the 8 MiB RAM window |
 | VU0 micro mode | `VU0Recompiler.cpp`, `VU0Pipeline.cpp` | `EnableVU0` | JR/JALR/BAL, ISWR, MFP, RINIT/RGET/RNEXT/RXOR, the EFU pipe, E/M/D/T-bit pairs |
-| VU1 | `VU1Recompiler.cpp`, `VU1Pipeline.cpp` | `EnableVU1` | ISWR, MFP, RINIT/RGET/RNEXT/RXOR, EATAN*/ESIN/EEXP, nested branches, end-bit delay slots |
+| VU1 | `VU1Recompiler.cpp`, `VU1Pipeline.cpp` | `EnableVU1` | ISWR, RINIT/RGET/RNEXT/RXOR, EATAN*/ESIN/EEXP, nested branches, end-bit delay slots |
 
 VU0 macro mode (COP2 from EE code) still runs the interpreter's handlers,
 called from native EE blocks. MTVU (`THREAD_VU1`) is supported. See
@@ -328,8 +328,14 @@ followed by `_vuTestPipes`. FDIV reads also participate in the FMAC hazard scan.
 Pairs issued while a divide is still in the pipe stay on the precomputed
 schedule. They are marked `fdiv_pending` and retire the FDIV slot inline,
 after their own FMAC writeback, so the two status-flag merges keep
-`VUPipeline::Retire`'s order. Deferred regions still end at these pairs,
-because a region keeps the status flag in a host register. A pair that reads or
+`VUPipeline::Retire`'s order. Deferred regions keep these pairs too, merging
+the retired divide into the status flag the region keeps in w25. A divide
+issue itself (DIV/SQRT/RSQRT) is scheduled, and deferrable, whenever its stall
+on an earlier divide is known: the new entry is stamped with the cycle the
+pair ends on, which is where a scheduled pair has already moved x26. It reads
+the status scratch from memory for the sticky D/I bits it passes on, so a
+region stores the latest flag op's scratch before a divide. Before this, every
+divide split a region, and region exits were ~10% of SotC's VU1 thread. A pair that reads or
 writes Q or P while an FDIV or EFU entry is outstanding stalls until that entry
 retires, so its advance is not the nominal one. `AnalyzeRetirement` treats that
 advance as unknown, and the following pairs use the generic path until their
@@ -346,10 +352,9 @@ that actually settles Q. The interpreter also runs this stall-and-retire step
 before executing the paired upper instruction, so an upper op that broadcasts Q
 in the same pair (a common idiom pairing WAITQ with a Q-broadcast MULq/MADDq/etc.)
 observes the freshly retired value; native emission orders the same-pair FDIV
-stall ahead of the upper instruction to match. On VU1 this is done for WAITQ
-only. DIV/SQRT/RSQRT still stall inside `EmitLower`, after the upper
-instruction, so a same-pair Q broadcast there reads the previous Q. VU0 hoists
-all four (`IsFDIVPipe`). See [Known issues](#known-issues).
+stall ahead of the upper instruction to match. Both VU0 and VU1 do this for
+all four FDIV-pipe ops (`IsFDIVPipe`), so a `MULq` + `DIV` pair reads the Q the
+previous divide retires.
 
 ESADD, ERSADD, ELENG, ERLENG, ESUM, ERCPR, ESQRT, ERSQRT and WAITP use a second,
 structurally identical single-slot pipe (EFU, retiring into P instead of Q).
@@ -371,8 +376,8 @@ flush when arithmetic will do it anyway) does not hold for ERCPR/ESQRT/ERSQRT's
 "leave the operand unchanged" branch, since no further arithmetic touches that
 value there; `ClampInputAlways` covers that case explicitly. EATAN, EATANxy,
 EATANxz, ESIN and EEXP (all evaluate a polynomial approximation, several of
-them in `double` precision in the interpreter before narrowing to `float`) and
-MFP still fall back.
+them in `double` precision in the interpreter before narrowing to `float`)
+still fall back. MFP is native.
 
 IBLTZ, IBLEZ and IBGEZ reuse the existing integer-branch path, including the VI
 backup lookup and the combined FMAC/IALU waits, and differ only in the condition
@@ -535,8 +540,31 @@ TPC/code updates from those regions. It shares pair emission and metadata encodi
 with the general path. EmitPair must preserve q28..q31 and x25..x28. There are no
 C++ callbacks or unsupported instructions inside a deferred region; expanding supported
 operations must preserve that invariant. Wider gameplay still needs proper testing.
-This is an internal block-state contract, not yet cross-block linking.
 Runtime profiles should distinguish these management costs from arithmetic throughput.
+
+### Entry profiles and block linking
+
+A block can be compiled for the exact pipeline state it is entered with (the
+FMAC entries in flight and their ages, a pending divide, pending ILW results).
+Such a *profiled* block knows its whole schedule from the first pair, so all of
+it can be deferred. Execute() keeps up to several variants per entry PC and
+picks the one whose profile matches. A loop whose back edge arrives in a
+different state leaves through its end exit and links to the variant for that
+state.
+
+Every exit whose next PC is known links to the next block in generated code,
+without returning to Execute(). A link slot is filled the first time its exit
+returns to Execute(), and is taken only while the target is from the current
+code generation, passed source validation since the last micro-memory write,
+and Execute() would enter a block there (budget left, the program still
+running, no pending branch, E-bit or XGKICK). An exit of a profiled block only
+links to a profiled target, since its state follows from its own profile. A
+slot keeps four targets, keyed by the TPC at the exit: a subroutine's JR returns
+to each of its callers through the same exit. In SotC this took the returns to
+Execute() from 2.25 to 1.26 per microprogram (the one left is the start).
+
+The E-bit pair ends a trace. Execute() sees `VU1.ebit` and steps the delay slot
+and the end of the program.
 
 ## Validation
 
@@ -580,25 +608,16 @@ well.
 
 ## Known issues
 
-As of 2026-09-26, `core_test` has 256 tests; 253 pass.
+As of 2026-09-29, `core_test` has 286 tests; 285 pass.
 
-- **VU1 same-pair DIV/SQRT/RSQRT with a Q broadcast.** VU1 hoists the FDIV stall
-  above the upper instruction only for WAITQ (`EmitPair`); for DIV/SQRT/RSQRT
-  it stays in `EmitLower`, after the upper op. Take a pair such as `MULq` +
-  `DIV`, issued while an earlier divide is still pending. Native code
-  multiplies by Q from before that divide retires; the interpreter uses the
-  retired value. A temporary differential test confirmed the mismatch. This
-  is the same ordering bug VU0 had, and the same fix (`IsFDIVPipe`) applies.
-  Not fixed yet.
 - **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
-  has failed since `4293623d6` (OPMULA/OPMSUB). The cause is a cross-block FMAC
-  hazard gap, not those opcodes; see "OPMULA/OPMSUB" in PERFORMANCE.md.
-- **Two EE tests crash (SIGSEGV):** `BranchAndDelayMustFitBlockAndPage` and
-  `MemoryExitsBeforeBranchDoNotExecuteLinkOrDelay`. They call `TryExecute`
-  directly on a block that branches to its own entry. Since `887bbc493` that
-  path can call `intEventTest()`, and the test fixture has no event system;
-  the crash is inside `_cpuEventTest_Shared`. The tests' one-block-per-call
-  assumption needs updating, or the fixture needs to keep the event deadline
-  out of reach. Exclude them with
-  `--gtest_filter=-EERecompilerTest.BranchAndDelayMustFitBlockAndPage:EERecompilerTest.MemoryExitsBeforeBranchDoNotExecuteLinkOrDelay`.
-- Game coverage is narrow: Saru! Get You! 2 and 3 and Ridge Racer V.
+  has failed since `4293623d6` (OPMULA/OPMSUB), with VU1Recompiler.cpp from
+  every commit since. At `options=0 seed=6`, the W lanes of VF1/VF3/VF4 hold
+  the host's default NaN (`7fc00000`/`ffc00000`) where the interpreter keeps
+  the input NaN's payload (`ffc12345`, `7fc12345`). See "OPMULA/OPMSUB" in
+  PERFORMANCE.md.
+- **The GS thread spins for MTVU.** `1dc082a1c` makes MTGS wait for MTVU
+  packets with WFE before it sleeps. That was ~13% more fps in SotC, but the GS
+  thread shows as ~70% busy in `sample` and `top` while it waits.
+- Game coverage is narrow: Saru! Get You! 2 and 3, Ridge Racer V, Burnout 3 and
+  Shadow of the Colossus, mostly from save states. Check a normal boot as well.
