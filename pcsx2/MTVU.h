@@ -23,10 +23,14 @@ class VU_Thread final {
 	// Note: keep atomic on separate cache line to avoid CPU conflict
 	alignas(__cachelinesize) std::atomic<int> m_ato_read_pos; // Only modified by VU thread
 	alignas(__cachelinesize) std::atomic<int> m_ato_write_pos;    // Only modified by EE thread
+	// Each thread's private position gets its own line too: they are updated
+	// for every word written/read, and sharing a line with each other or with
+	// semaEvent made the EE and VU threads fight over it.
 	alignas(__cachelinesize) int  m_read_pos; // temporary read pos (local to the VU thread)
-	int  m_write_pos; // temporary write pos (local to the EE thread)
-	Threading::WorkSema semaEvent;
-	std::atomic_bool m_shutdown_flag{false};
+	alignas(__cachelinesize) int  m_write_pos; // temporary write pos (local to the EE thread)
+	int  m_cached_read_pos; // last m_ato_read_pos the EE thread loaded (local to the EE thread)
+	alignas(__cachelinesize) Threading::WorkSema semaEvent;
+	alignas(__cachelinesize) std::atomic_bool m_shutdown_flag{false};
 
 	Threading::Thread m_thread;
 

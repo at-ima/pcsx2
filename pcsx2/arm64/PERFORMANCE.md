@@ -19,6 +19,7 @@ sections unless a section says so.
 | 09-28..29 | Shadow of the Colossus at 6x | "Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides" |
 | 09-29 | Shadow of the Colossus at 6x | "VU1 flags under the flag hack" |
 | 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
+| 09-30 | Shadow of the Colossus at 6x | "MTVU ring: shared cache lines" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2974,3 +2975,19 @@ Other numbers from the same investigation, for later work:
   host instructions per EE cycle, alternating runs: SotC 27.52, 27.24 ->
   25.04, 24.90; Burnout 3 26.90, 27.01 -> 26.34, 26.24; Saru! Get You! 3
   20.60, 20.58 -> 18.63, 18.61. Frame dumps (four states) were unchanged.
+
+## MTVU ring: shared cache lines
+
+`VU_Thread::VifUnpack` was about 10% of the SotC EE thread, most of it on the
+release store of the write position and the `NotifyOfWork` atomic. The EE
+thread's `m_write_pos`, the VU thread's `m_read_pos` and `semaEvent` shared one
+128-byte line, and the EE thread reloaded `m_ato_read_pos` (written by the VU
+thread after every packet) on every `ReserveSpace`. Each now has its own line,
+and the EE thread keeps the last read position it loaded, reloading only when
+that says the space is not free, and after the writer wraps.
+
+Share of the EE thread in `VifUnpack` itself (`sample`, 6 s,
+`WANDER_TO_KYOZOU_001` at 6x, alternating runs): 7.6%, 10.0% -> 4.0%, 4.3%;
+`ReserveSpace` 1.2%, 1.1% -> 0.8%, 0.9%. Host cycles per EE cycle moved with
+thermals and are not a usable comparison. Frame dumps (four states) and a
+SotC BIOS boot to frame 2400 matched the unchanged build.
