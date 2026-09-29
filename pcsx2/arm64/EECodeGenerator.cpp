@@ -222,6 +222,85 @@ namespace
 		return MemOperand(x0, offsetof(cpuRegisters, GPR) + reg * sizeof(GPR_reg));
 	}
 
+	// Low 64 bits of guest GPRs this block has already loaded or written, kept
+	// in x2-x8 until the end of the block. Write-through: every write still
+	// stores to cpuRegs, so exits need nothing and a value only has to be
+	// forgotten when something else writes its GPR. Needs proper testing across
+	// more games.
+	class GprCache
+	{
+	public:
+		void Reset() { *this = {}; }
+		// Registers handed out for one guest instruction are not evicted by it.
+		void BeginInstruction() { m_pinned = 0; }
+		// The cached register holding `reg`, loading it on a miss.
+		Register Read(MacroAssembler& a, u32 reg)
+		{
+			if (!m_host[reg])
+			{
+				Map(reg, Allocate());
+				a.Ldr(XRegister(m_host[reg]), GPR(reg));
+			}
+			return Use(reg);
+		}
+		// A register to compute `reg`'s new value in; the caller stores it.
+		Register Write(u32 reg)
+		{
+			if (!m_host[reg])
+				Map(reg, Allocate());
+			return Use(reg);
+		}
+		void Invalidate(u32 reg)
+		{
+			if (m_host[reg])
+				m_occupied &= ~(1u << m_host[reg]);
+			m_host[reg] = 0;
+		}
+		void InvalidateAll() { *this = {}; }
+
+	private:
+		static constexpr u32 First = 2, Last = 8;
+		u32 Allocate()
+		{
+			u32 best = 0;
+			for (u32 h = First; h <= Last; h++)
+			{
+				if (!(m_occupied & (1u << h)))
+					return h;
+				if (!(m_pinned & (1u << h)) && (!best || m_used[h] < m_used[best]))
+					best = h;
+			}
+			pxAssert(best);
+			m_host[m_guest[best]] = 0;
+			m_occupied &= ~(1u << best);
+			return best;
+		}
+		void Map(u32 reg, u32 h)
+		{
+			m_host[reg] = static_cast<u8>(h);
+			m_guest[h] = static_cast<u8>(reg);
+			m_occupied |= 1u << h;
+		}
+		Register Use(u32 reg)
+		{
+			const u32 h = m_host[reg];
+			m_used[h] = ++m_clock;
+			m_pinned |= 1u << h;
+			return XRegister(h);
+		}
+		std::array<u8, 32> m_host{}; // host register number, 0 when not cached
+		std::array<u8, Last + 1> m_guest{};
+		std::array<u32, Last + 1> m_used{};
+		u32 m_occupied = 0, m_pinned = 0, m_clock = 0;
+	} s_gpr;
+
+	// A GPR store that does not go through s_gpr.
+	MemOperand GPRWrite(u32 reg)
+	{
+		s_gpr.Invalidate(reg);
+		return GPR(reg);
+	}
+
 	// fpuRegs is not a member of cpuRegisters: it is cpuRegs' sibling inside
 	// cpuRegistersPack (R5900.h). x0 always holds &cpuRegs == &_cpuRegistersPack,
 	// so fpuRegs is reachable at a fixed extra offset from x0 rather than
@@ -395,7 +474,7 @@ namespace
 				pxFailRel("Invalid packed integer instruction");
 				break;
 		}
-		a.Str(q0, GPR(rd));
+		a.Str(q0, GPRWrite(rd));
 	}
 
 	void EmitHiLo(MacroAssembler& a, u32 code)
@@ -416,7 +495,7 @@ namespace
 			else if (rd) // MFHI/MFLO copy all 64 bits without extending again.
 			{
 				a.Ldr(x9, special);
-				a.Str(x9, GPR(rd));
+				a.Str(x9, GPRWrite(rd));
 			}
 			return;
 		}
@@ -468,7 +547,7 @@ namespace
 		a.Str(x11, lo);
 		a.Str(x12, hi);
 		if (!divide && rd)
-			a.Str(x11, GPR(rd));
+			a.Str(x11, GPRWrite(rd));
 	}
 
 	void EmitTrapping(MacroAssembler& a, u32 code, Label* before)
@@ -500,7 +579,7 @@ namespace
 			a.Sxtw(x9, w9);
 		}
 		if (dest)
-			a.Str(x9, GPR(dest));
+			a.Str(x9, GPRWrite(dest));
 	}
 
 	MemOperand SA()
@@ -522,7 +601,7 @@ namespace
 				if (rd)
 				{
 					a.Ldr(w9, SA());
-					a.Str(x9, GPR(rd));
+					a.Str(x9, GPRWrite(rd));
 				}
 				return;
 			case MiscOp::MoveToSA:
@@ -564,7 +643,7 @@ namespace
 				if (rt && rd != 24)
 				{
 					a.Sxtw(x11, w11);
-					a.Str(x11, GPR(rt));
+					a.Str(x11, GPRWrite(rt));
 				}
 				return;
 			default:
@@ -608,7 +687,7 @@ namespace
 				pxFailRel("Invalid EE instruction");
 				break;
 		}
-		a.Str(q0, GPR(rd));
+		a.Str(q0, GPRWrite(rd));
 	}
 
 	// PMULTH: eight signed halfword products. LO gets products 0, 1, 4, 5,
@@ -627,7 +706,7 @@ namespace
 		if (rd)
 		{
 			a.Uzp1(v7.V4S(), v3.V4S(), v4.V4S());
-			a.Str(q7, GPR(rd));
+			a.Str(q7, GPRWrite(rd));
 		}
 	}
 
@@ -647,7 +726,7 @@ namespace
 		a.Str(q2, MemOperand(sp, 16));
 		a.Ldr(q0, MemOperand(sp, x9));
 		a.Add(sp, sp, 32);
-		a.Str(q0, GPR(rd));
+		a.Str(q0, GPRWrite(rd));
 	}
 
 	void Emit(MacroAssembler& a, u32 code)
@@ -678,133 +757,137 @@ namespace
 		const u32 dest = op ? rt : rd;
 		if (!dest)
 			return;
-		a.Ldr(x9, GPR(rs));
+		s_gpr.BeginInstruction();
+		const u32 function = code & 63;
+		// LUI and the constant shifts do not read rs.
+		const bool shift_by_sa = !op && (function == 0 || function == 2 || function == 3 || function >= 56);
+		const Register rs_value = op == 15 || shift_by_sa ? Register(xzr) : s_gpr.Read(a, rs);
+		const Register rt_value = op ? Register(xzr) : s_gpr.Read(a, rt);
+		const Register rd_value = !op && (function == 10 || function == 11) ? s_gpr.Read(a, rd) : Register(xzr);
+		const Register r = s_gpr.Write(dest);
 		if (op)
 		{
 			a.Mov(x10, static_cast<u64>(static_cast<s64>(static_cast<int16_t>(code))));
 			switch (op)
 			{
 				case 9: // ADDIU wraps at 32 bits, then sign extends to 64 bits.
-					a.Add(w9, w9, w10);
-					a.Sxtw(x9, w9);
+					a.Add(r.W(), rs_value.W(), w10);
+					a.Sxtw(r, r.W());
 					break;
 				case 25:
-					a.Add(x9, x9, x10);
+					a.Add(r, rs_value, x10);
 					break;
 				case 10:
 				case 11:
-					a.Cmp(x9, x10);
-					a.Cset(x9, op == 10 ? lt : lo);
+					a.Cmp(rs_value, x10);
+					a.Cset(r, op == 10 ? lt : lo);
 					break;
 				case 12:
 				case 13:
 				case 14:
 					a.Mov(x10, code & 0xffff);
 					if (op == 12)
-						a.And(x9, x9, x10);
+						a.And(r, rs_value, x10);
 					else if (op == 13)
-						a.Orr(x9, x9, x10);
+						a.Orr(r, rs_value, x10);
 					else
-						a.Eor(x9, x9, x10);
+						a.Eor(r, rs_value, x10);
 					break;
 				case 15:
-					a.Mov(x9, static_cast<u64>(static_cast<s64>(static_cast<s32>(code << 16))));
+					a.Mov(r, static_cast<u64>(static_cast<s64>(static_cast<s32>(code << 16))));
 					break;
 			}
 		}
 		else
 		{
-			a.Ldr(x10, GPR(rt));
-			const u32 function = code & 63;
 			switch (function)
 			{
 				case 0:
-					a.Lsl(w9, w10, sa);
-					a.Sxtw(x9, w9);
+					a.Lsl(r.W(), rt_value.W(), sa);
+					a.Sxtw(r, r.W());
 					break;
 				case 2:
-					a.Lsr(w9, w10, sa);
-					a.Sxtw(x9, w9);
+					a.Lsr(r.W(), rt_value.W(), sa);
+					a.Sxtw(r, r.W());
 					break;
 				case 3:
-					a.Asr(w9, w10, sa);
-					a.Sxtw(x9, w9);
+					a.Asr(r.W(), rt_value.W(), sa);
+					a.Sxtw(r, r.W());
 					break;
 				case 4:
-					a.Lsl(w9, w10, w9);
-					a.Sxtw(x9, w9);
+					a.Lsl(r.W(), rt_value.W(), rs_value.W());
+					a.Sxtw(r, r.W());
 					break;
 				case 6:
-					a.Lsr(w9, w10, w9);
-					a.Sxtw(x9, w9);
+					a.Lsr(r.W(), rt_value.W(), rs_value.W());
+					a.Sxtw(r, r.W());
 					break;
 				case 7:
-					a.Asr(w9, w10, w9);
-					a.Sxtw(x9, w9);
+					a.Asr(r.W(), rt_value.W(), rs_value.W());
+					a.Sxtw(r, r.W());
 					break;
 				case 20:
-					a.Lsl(x9, x10, x9);
+					a.Lsl(r, rt_value, rs_value);
 					break;
 				case 22:
-					a.Lsr(x9, x10, x9);
+					a.Lsr(r, rt_value, rs_value);
 					break;
 				case 23:
-					a.Asr(x9, x10, x9);
+					a.Asr(r, rt_value, rs_value);
 					break;
 				case 10:
 				case 11:
-					a.Ldr(x11, GPR(rd));
-					a.Cmp(x10, 0);
-					a.Csel(x9, x9, x11, function == 10 ? eq : ne);
+					a.Cmp(rt_value, 0);
+					a.Csel(r, rs_value, rd_value, function == 10 ? eq : ne);
 					break;
 				case 33:
-					a.Add(w9, w9, w10);
-					a.Sxtw(x9, w9);
+					a.Add(r.W(), rs_value.W(), rt_value.W());
+					a.Sxtw(r, r.W());
 					break;
 				case 35:
-					a.Sub(w9, w9, w10);
-					a.Sxtw(x9, w9);
+					a.Sub(r.W(), rs_value.W(), rt_value.W());
+					a.Sxtw(r, r.W());
 					break;
 				case 36:
-					a.And(x9, x9, x10);
+					a.And(r, rs_value, rt_value);
 					break;
 				case 37:
-					a.Orr(x9, x9, x10);
+					a.Orr(r, rs_value, rt_value);
 					break;
 				case 38:
-					a.Eor(x9, x9, x10);
+					a.Eor(r, rs_value, rt_value);
 					break;
 				case 39:
-					a.Orr(x9, x9, x10);
-					a.Mvn(x9, x9);
+					a.Orr(r, rs_value, rt_value);
+					a.Mvn(r, r);
 					break;
 				case 42:
 				case 43:
-					a.Cmp(x9, x10);
-					a.Cset(x9, function == 42 ? lt : lo);
+					a.Cmp(rs_value, rt_value);
+					a.Cset(r, function == 42 ? lt : lo);
 					break;
 				case 45:
-					a.Add(x9, x9, x10);
+					a.Add(r, rs_value, rt_value);
 					break;
 				case 47:
-					a.Sub(x9, x9, x10);
+					a.Sub(r, rs_value, rt_value);
 					break;
 				case 56:
 				case 60:
-					a.Lsl(x9, x10, sa + (function == 60 ? 32 : 0));
+					a.Lsl(r, rt_value, sa + (function == 60 ? 32 : 0));
 					break;
 				case 58:
 				case 62:
-					a.Lsr(x9, x10, sa + (function == 62 ? 32 : 0));
+					a.Lsr(r, rt_value, sa + (function == 62 ? 32 : 0));
 					break;
 				case 59:
 				case 63:
-					a.Asr(x9, x10, sa + (function == 63 ? 32 : 0));
+					a.Asr(r, rt_value, sa + (function == 63 ? 32 : 0));
 					break;
 			}
 		}
 		// EE integer instructions preserve the high 64 bits of each 128-bit GPR.
-		a.Str(x9, GPR(dest));
+		a.Str(r, GPR(dest));
 	}
 
 	void EmitPosition(MacroAssembler& a, u32 pc, u32 code)
@@ -898,6 +981,8 @@ namespace
 		a.Mov(x0, reinterpret_cast<uintptr_t>(&cpuRegs));
 		a.Mov(x1, reinterpret_cast<uintptr_t>(&Arm64EE::CodeGenerator::g_link_state));
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
+		// The call clobbered x2-x8, and the handlers write GPRs.
+		s_gpr.InvalidateAll();
 	}
 
 	// Natively compiles the COP1 (FPU) instructions accepted by SupportsCOP1().
@@ -920,7 +1005,7 @@ namespace
 			if (ft)
 			{
 				a.Ldrsw(x9, FPR(fs));
-				a.Str(x9, GPR(ft));
+				a.Str(x9, GPRWrite(ft));
 			}
 			return;
 		}
@@ -932,7 +1017,7 @@ namespace
 				a.Ldrsw(x9, FCR31());
 			else
 				a.Mov(x9, fs == 0 ? 0x2E00 : 0);
-			a.Str(x9, GPR(ft));
+			a.Str(x9, GPRWrite(ft));
 			return;
 		}
 		if (rs == 4) // MTC1
@@ -1213,8 +1298,8 @@ namespace
 			a.Ldr(w10, MemOperand(x10));
 			a.Tbnz(w10, 0, before);
 		}
-		a.Ldr(w9, GPR(rs));
-		a.Add(w9, w9, static_cast<int16_t>(code));
+		s_gpr.BeginInstruction();
+		a.Add(w9, s_gpr.Read(a, rs).W(), static_cast<int16_t>(code));
 		// LQ/SQ ignore the low address bits. LQC2/SQC2 pass them on to the
 		// memory handlers, so the interpreter keeps the unaligned ones.
 		if (size == 16 && !IsVU0Transfer(code))
@@ -1270,15 +1355,16 @@ namespace
 			}
 			else
 			{
-				a.Ldr(x10, GPR(rt));
+				// EmitAddress pinned rs for this instruction, so rt cannot evict it.
+				const Register value = s_gpr.Read(a, rt);
 				if (size == 8)
-					a.Str(x10, MemOperand(x12));
+					a.Str(value, MemOperand(x12));
 				else if (size == 4)
-					a.Str(w10, MemOperand(x12));
+					a.Str(value.W(), MemOperand(x12));
 				else if (size == 2)
-					a.Strh(w10, MemOperand(x12));
+					a.Strh(value.W(), MemOperand(x12));
 				else
-					a.Strb(w10, MemOperand(x12));
+					a.Strb(value.W(), MemOperand(x12));
 			}
 			if (after)
 			{
@@ -1337,9 +1423,9 @@ namespace
 			else if (rt)
 			{
 				if (size == 16)
-					a.Str(q0, GPR(rt));
+					a.Str(q0, GPRWrite(rt));
 				else
-					a.Str(x10, GPR(rt));
+					a.Str(x10, GPRWrite(rt));
 			}
 		}
 	}
@@ -1537,8 +1623,9 @@ namespace
 			EmitAddress(a, delay, before); // x12 stays live until EmitAccess below
 		// Capture register targets before either the link or delay slot overwrites
 		// their source. x15 is preserved by the nontrapping integer emitter.
+		s_gpr.BeginInstruction();
 		if (op == 0)
-			a.Ldr(w15, GPR(rs));
+			a.Mov(w15, s_gpr.Read(a, rs).W());
 		else if (op == 2 || op == 3)
 			a.Mov(w15, ((pc + 4) & 0xf0000000u) | ((code & 0x03ffffffu) << 2));
 		else
@@ -1546,7 +1633,7 @@ namespace
 		if (link)
 		{
 			a.Mov(w9, pc + 8);
-			a.Str(x9, GPR(link));
+			a.Str(x9, GPRWrite(link));
 		}
 		Label untaken;
 		if (conditional)
@@ -1573,16 +1660,16 @@ namespace
 			{
 				// REGIMM links are unconditional and precede the rs comparison in
 				// the reference interpreter, including the rs == ra alias.
-				a.Ldr(x9, GPR(rs));
+				s_gpr.BeginInstruction();
+				const Register rs_value = s_gpr.Read(a, rs);
 				if (op == 4 || op == 5 || op == 20 || op == 21)
 				{
-					a.Ldr(x10, GPR(rt));
-					a.Cmp(x9, x10);
+					a.Cmp(rs_value, s_gpr.Read(a, rt));
 					taken = (op == 4 || op == 20) ? eq : ne;
 				}
 				else
 				{
-					a.Cmp(x9, 0);
+					a.Cmp(rs_value, 0);
 					taken = op == 1 ? ((rt & 1) ? ge : lt) : (op == 6 || op == 22) ? le :
 					                                                                 gt;
 				}
@@ -1671,6 +1758,7 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 {
 	MacroAssembler a(buffer, capacity);
 	s_exit = {linkable, cycles, buffer};
+	s_gpr.Reset();
 	std::array<Label, MaxInstructions + 1> exits;
 	Label stale, copy;
 	if (self_check)

@@ -407,6 +407,56 @@ TEST_F(EERecompilerTest, MixedBlocksAndModifiedCode)
 	}
 }
 
+TEST_F(EERecompilerTest, CachedRegistersFollowEveryWriter)
+{
+	// Four guest registers shared by integer ops (which keep GPRs in host
+	// registers within a block), loads, HI/LO transfers, MULT and packed ops
+	// (which write GPRs directly), so every cached value is reused, evicted
+	// and overwritten behind the cache's back. r5 holds the data address.
+	u32 random = 777;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 256; seed++)
+	{
+		SCOPED_TRACE(seed);
+		InitHiLo(seed);
+		for (u32 reg = 1; reg <= 4; reg++)
+			cpuRegs.GPR.r[reg].UD[0] = (u64(next()) << 40) ^ (u64(next()) << 16) ^ next();
+		cpuRegs.GPR.r[5].UD[0] = Data;
+		for (u32 i = 0; i < 32; i++)
+		{
+			const u32 rs = 1 + next() % 4, rt = 1 + next() % 4, rd = 1 + next() % 4, sa = next() % 32;
+			const u32 offset = (next() % 16) * 16, imm = next() & 0xffff;
+			const u32 r = (rs << 21) | (rt << 16) | (rd << 11);
+			const u32 choices[] = {
+				r | 33, // ADDU
+				r | 37, // OR
+				(rt << 16) | (rd << 11) | (sa << 6), // SLL
+				r | 45, // DADDU
+				r | 10, // MOVZ
+				r | 11, // MOVN
+				r | 42, // SLT
+				(9u << 26) | (rs << 21) | (rt << 16) | imm, // ADDIU
+				(15u << 26) | (rt << 16) | imm, // LUI
+				(13u << 26) | (rs << 21) | (rt << 16) | imm, // ORI
+				(35u << 26) | (5 << 21) | (rt << 16) | offset, // LW
+				(55u << 26) | (5 << 21) | (rt << 16) | offset, // LD
+				(43u << 26) | (5 << 21) | (rt << 16) | offset, // SW
+				(63u << 26) | (5 << 21) | (rt << 16) | offset, // SD
+				(30u << 26) | (5 << 21) | (rt << 16) | offset, // LQ
+				(31u << 26) | (5 << 21) | (rt << 16) | offset, // SQ
+				r | 24, // MULT rd
+				(rd << 11) | 18, // MFLO
+				(rs << 21) | 19, // MTLO
+				r | PackedCode(8, 0), // PADDW
+			};
+			program[i] = choices[next() % std::size(choices)];
+		}
+		Compare(32);
+		if (HasFailure())
+			return;
+	}
+}
+
 TEST_F(EERecompilerTest, MappingChangesAndPageBoundaries)
 {
 	program[0] = (9 << 26) | (1 << 16) | 17;
