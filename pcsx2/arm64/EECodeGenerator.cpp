@@ -1442,6 +1442,9 @@ namespace
 		bool linkable = false;
 		std::span<const u32> cycles;
 		u8* buffer = nullptr;
+		// 2 - CP0.Config bit 18 when the block was compiled; the dispatcher drops
+		// every block when that bit changes.
+		u32 cycle_scale = 2;
 	} s_exit;
 
 	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
@@ -1455,13 +1458,8 @@ namespace
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
 		a.Cbz(w9, off);
 		a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
-		a.Ldr(w10, MemOperand(x0, offsetof(cpuRegisters, CP0) + 16 * sizeof(u32))); // Config
-		a.Ubfx(w10, w10, 18, 1);
-		// cycles * (2 - bit) == (cycles * 2) >> bit
-		a.Mov(w12, s_exit.cycles[completed] * 2);
-		a.Lsr(w10, w12, w10);
 		a.Ldr(w11, MemOperand(x13));
-		a.Add(w11, w11, w10);
+		a.Add(w11, w11, s_exit.cycles[completed] * s_exit.cycle_scale);
 	}
 
 	// A returning exit: w0 = value, plus x15 (already shifted) as the target
@@ -1499,19 +1497,30 @@ namespace
 		Continue, // nothing
 	};
 
-	// The chaining path of an exit whose next pc is known at compile time. pc
-	// and code must already describe the completed prefix. Jumps to `classic`
-	// when chaining is off; otherwise does the driver's work for this exit and
-	// either jumps to the linked block or returns to C++.
-	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, Label* classic)
+	// cpuRegs.code is decoding scratch: the interpreter and the COP2 handlers
+	// set it before they read it. Exits store it only when they return to C++,
+	// so it still names the last completed instruction there; a jump to the
+	// next block leaves it for that block's own exits.
+	void EmitCode(MacroAssembler& a, u32 code)
+	{
+		a.Mov(w9, code);
+		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, code)));
+	}
+
+	// The chaining path of an exit whose next pc is known at compile time.
+	// `code` is the last completed instruction. Jumps to `classic`, having
+	// stored nothing, when chaining is off; otherwise stores pc, does the
+	// driver's work for this exit and either jumps to the linked block or
+	// returns to C++.
+	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, u32 code, Label* classic)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		Label request, due;
 		EmitAddCycles(a, completed, classic);
+		a.Mov(w9, next);
+		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
 		if (kind == LinkKind::Taken)
 		{
-			a.Mov(w9, next);
-			a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
 			// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
 			// cycle += max(block_cycles >> 3, 1); block_cycles &= 7.
 			a.Lsr(w10, w11, 3);
@@ -1549,11 +1558,13 @@ namespace
 			a.dc32(0); // generation of the link; 0 is never current
 		}
 		a.Bind(&request);
+		EmitCode(a, code);
 		a.Mov(x0, (slot << 32) | LinkRequest | CyclesCommitted);
 		a.Ret();
 		if (kind != LinkKind::Continue)
 		{
 			a.Bind(&due);
+			EmitCode(a, code);
 			a.Mov(x0, EventDue | CyclesCommitted);
 			a.Ret();
 		}
@@ -1562,7 +1573,7 @@ namespace
 	// The chaining path of a JR/JALR, whose target is in w15: the driver's
 	// work for a taken branch, then a jump through g_indirect when the target
 	// block is there, or a return asking ExecuteChained() to look it up.
-	void EmitIndirectExit(MacroAssembler& a, u32 completed, Label* classic)
+	void EmitIndirectExit(MacroAssembler& a, u32 completed, u32 code, Label* classic)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		static_assert(sizeof(IndirectEntry) == 16);
@@ -1592,9 +1603,11 @@ namespace
 		a.Ldr(x16, MemOperand(x10, 8));
 		a.Br(x16);
 		a.Bind(&miss);
+		EmitCode(a, code);
 		a.Mov(x0, NextBlock | CyclesCommitted);
 		a.Ret();
 		a.Bind(&due);
+		EmitCode(a, code);
 		a.Mov(x0, EventDue | CyclesCommitted);
 		a.Ret();
 	}
@@ -1684,37 +1697,37 @@ namespace
 			EmitCOP1(a, delay);
 		else
 			Emit(a, delay);
-		EmitPosition(a, pc + 8, delay);
 		if (s_exit.linkable && op != 0)
 		{
 			const u32 target = (op == 2 || op == 3) ? (((pc + 4) & 0xf0000000u) | ((code & 0x03ffffffu) << 2)) :
 			                                          pc + 4 + static_cast<int16_t>(code) * 4;
 			Label classic;
-			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, &classic);
+			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, delay, &classic);
 			a.Bind(&classic);
 		}
 		else if (s_exit.linkable)
 		{
 			// JR/JALR targets are only known at run time.
 			Label classic;
-			EmitIndirectExit(a, preceding + 2, &classic);
+			EmitIndirectExit(a, preceding + 2, delay, &classic);
 			a.Bind(&classic);
 		}
+		EmitPosition(a, pc + 8, delay);
 		a.Lsl(x15, x15, 32);
 		EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
 		if (conditional)
 		{
 			a.Bind(&untaken);
-			EmitPosition(a, pc + (likely ? 8 : 4), code);
 			// BEQ/BNE and annulled likely branches test events without committing
 			// cycles. Other untaken branches simply continue at the delay slot.
 			const bool event_test = likely || op == 4 || op == 5;
 			if (s_exit.linkable)
 			{
 				Label classic;
-				EmitLinkedExit(a, event_test ? LinkKind::EventTest : LinkKind::Continue, preceding + 1, pc + (likely ? 8 : 4), &classic);
+				EmitLinkedExit(a, event_test ? LinkKind::EventTest : LinkKind::Continue, preceding + 1, pc + (likely ? 8 : 4), code, &classic);
 				a.Bind(&classic);
 			}
+			EmitPosition(a, pc + (likely ? 8 : 4), code);
 			EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
 		}
 	}
@@ -1757,7 +1770,7 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	std::span<const u32> cycles, bool linkable, bool self_check)
 {
 	MacroAssembler a(buffer, capacity);
-	s_exit = {linkable, cycles, buffer};
+	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1)};
 	s_gpr.Reset();
 	std::array<Label, MaxInstructions + 1> exits;
 	Label stale, copy;
@@ -1812,18 +1825,16 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	for (u32 completed = words.size();; completed--)
 	{
 		a.Bind(&exits[completed]);
-		if (completed)
-		{
-			EmitPosition(a, pc + completed * 4, words[completed - 1]);
-		}
 		// The end of the block falls through to the next pc. Earlier exits stop
 		// before an access the interpreter has to perform, so they still return.
 		if (linkable && completed && completed == words.size())
 		{
 			Label classic;
-			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, &classic);
+			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, words[completed - 1], &classic);
 			a.Bind(&classic);
 		}
+		if (completed)
+			EmitPosition(a, pc + completed * 4, words[completed - 1]);
 		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)
 			break;
