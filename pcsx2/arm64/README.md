@@ -512,7 +512,8 @@ and breaks the static schedule. Other supported integer operations have zero
 pipeline latency. Unknown timing keeps the
 generic preparation path. Every queue entry is materialized
 at observable exits; sticky flags include all retired entries even when
-only the final MAC/non-sticky result is stored. This is a limited first step
+only the final MAC/non-sticky result is stored, unless the VU flag hack is on
+(see "VU flag hack" below). This is a limited first step
 toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
 The generated block retains the current cycle in x26. Scheduled preparation
 updates it directly; queue insertion and budget checks consume it without
@@ -572,6 +573,22 @@ Execute() from 2.25 to 1.26 per microprogram (the one left is the start).
 The E-bit pair ends a trace. Execute() sees `VU1.ebit` and steps the delay slot
 and the end of the program.
 
+### VU flag hack
+
+With `[EmuCore/Speedhacks] vuFlagHack` on (the default), a deferred region
+computes no flags for an FMAC op whose MAC and status values nothing observes
+(the `Dead` entry kind in `EmitDeferredRegion`). StoreMAC then only flushes
+and clamps the result. Its sticky status bits (ZS/SS/US/OS) are dropped,
+unless a status reader (FSAND/FSOR/FSEQ) later in the same region could see
+them; those ops keep the exact `Raw` path. microVU's flag hack drops them the
+same way (`sHackCond` in `mVUsetFlags`). Everything C++ or the guest can
+otherwise observe is unchanged: the latest retired entry, the entries live at
+a region exit, the flag scratch a later FSSET or divide reads, and the clip
+flag. With the hack off, the region keeps every sticky bit and matches the
+interpreter exactly. The setting is part of `Options()`, so changing it
+recompiles. Needs proper testing in games that read sticky flags across
+microprograms.
+
 ## Validation
 
 `ee_recompiler_tests.cpp` compares complete CPU state, RAM, modified instruction
@@ -614,7 +631,7 @@ well.
 
 ## Known issues
 
-As of 2026-09-29, `core_test` has 286 tests; 285 pass.
+As of 2026-09-30, `core_test` has 289 tests; 288 pass.
 
 - **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
   has failed since `4293623d6` (OPMULA/OPMSUB), with VU1Recompiler.cpp from

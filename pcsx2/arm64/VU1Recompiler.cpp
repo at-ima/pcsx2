@@ -214,7 +214,7 @@ namespace
 		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (CHECK_VU_OVERFLOW(1) ? 2 : 0) | (CHECK_VUADDSUBHACK ? 4 : 0) |
 		       (EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero() ? 8 : 0) |
 		       (CpuVU1 == &CpuArm64VU1 && !CHECK_XGKICKHACK ? 16 : 0) |
-		       (THREAD_VU1 ? 32 : 0);
+		       (THREAD_VU1 ? 32 : 0) | (EmuConfig.Speedhacks.vuFlagHack ? 64 : 0);
 	}
 
 	void InvalidateAll()
@@ -704,6 +704,10 @@ namespace
 	// then leaves the weighted per-lane MAC bits in v(28 + slot) for the region's
 	// sticky accumulator, instead of publishing the MAC/status scratch.
 	int s_raw_flag_slot = -1;
+	// Set instead under the VU flag hack (Speedhacks.vuFlagHack, on by default):
+	// StoreMAC computes no flags at all, and the pair's sticky status bits are
+	// dropped, as microVU does for status flags nothing reads (mVUsetFlags).
+	bool s_discard_flags = false;
 	// The current pair's Block::clamp_skip.
 	u8 s_clamp_skip = 0;
 	u32 s_store_mac_count = 0;
@@ -715,6 +719,28 @@ namespace
 		// position, which are not a destination mask for those two opcodes.
 		const u32 mask = mask_override >= 0 ? static_cast<u32>(mask_override) : (code >> 21) & 15;
 		const bool flush = EmuConfig.Cpu.VU1FPCR.GetFlushToZero();
+		if (s_discard_flags)
+		{
+			// Only the result's own denormal flush and clamp remain.
+			if (!flush)
+			{
+				a.And(v17.V16B(), v0.V16B(), v24.V16B());
+				a.Cmeq(v19.V4S(), v17.V4S(), 0);
+				a.Movi(v22.V4S(), 0x80000000);
+				a.And(v22.V16B(), v0.V16B(), v22.V16B());
+				a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
+				a.Mov(v0.V16B(), v19.V16B());
+			}
+			if (CHECK_VU_OVERFLOW(1))
+			{
+				a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
+				a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
+			}
+			const u32 fd = (code >> 6) & 31;
+			if (op.acc || fd)
+				StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+			return;
+		}
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
 		// v24 holds the exponent mask for the whole block; see EmitBlockConstants.
 		a.And(v17.V16B(), v0.V16B(), v24.V16B());
@@ -2588,18 +2614,24 @@ namespace
 		// ORs them into v25 when it retires. Other unobserved entries (Skip)
 		// repeat the scratch of an earlier flag instruction, whose own entry
 		// retires first and already contributed the same sticky bits.
+		// Under the VU flag hack, a flag instruction that would be Raw computes no
+		// flags at all (Dead) unless a status reader later in the region can see
+		// its sticky bits. Sticky bits only reach the region's exit through the
+		// entries that computed them, like microVU's.
+		// Needs proper testing across more games.
 		enum class Entry : u8
 		{
 			Normal,
 			Raw,
 			Skip,
+			Dead,
 		};
 		std::array<Entry, MaxInstructions> kinds{};
 		{
 			std::array<int, MaxInstructions> source{};
 			std::array<bool, MaxInstructions> flag_op{}, needed{}, scratch_full{};
 			int scratch = -1, latest = -1;
-			u32 count = 0;
+			u32 count = 0, sticky_seen = 0;
 			const auto observe_latest = [&]() {
 				if (latest >= 0)
 					needed[latest] = true;
@@ -2612,6 +2644,8 @@ namespace
 					latest = static_cast<int>(count - plan.remaining - plan.retired + j);
 				if ((ins.uregs.VIread | ins.lregs.VIread) & ((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG)))
 					observe_latest();
+				if ((ins.uregs.VIread | ins.lregs.VIread) & (1 << REG_STATUS_FLAG))
+					sticky_seen = count;
 				if (HasFmac(ins))
 				{
 					flag_op[count] = UpdatesMacFlags(ins.upper);
@@ -2638,11 +2672,13 @@ namespace
 						scratch_full[scratch] = true;
 				}
 			}
+			const bool flag_hack = EmuConfig.Speedhacks.vuFlagHack;
 			for (u32 k = 0; k < count; k++)
 				if (needed[k] && source[k] >= 0)
 					scratch_full[source[k]] = true;
 			for (u32 k = 0; k < count; k++)
-				kinds[k] = flag_op[k] ? (scratch_full[k] ? Entry::Normal : Entry::Raw) : (needed[k] ? Entry::Normal : Entry::Skip);
+				kinds[k] = flag_op[k] ? (scratch_full[k] ? Entry::Normal : (flag_hack && k >= sticky_seen ? Entry::Dead : Entry::Raw)) :
+				                        (needed[k] ? Entry::Normal : Entry::Skip);
 		}
 		a.Movi(v25.V4S(), 0);
 		RegionSlots state;
@@ -2670,7 +2706,7 @@ namespace
 					state.raw_retired = true;
 					continue;
 				}
-				if (kind == Entry::Skip)
+				if (kind == Entry::Skip || kind == Entry::Dead)
 					continue;
 				if (plan.clip_retires & (1 << j))
 				{
@@ -2717,11 +2753,13 @@ namespace
 			const Entry kind = HasFmac(ins) ? kinds[issued] : Entry::Normal;
 			const u32 macs = s_store_mac_count;
 			s_raw_flag_slot = kind == Entry::Raw ? static_cast<int>(issued & 3) : -1;
+			s_discard_flags = kind == Entry::Dead;
 			s_vi_backup = &state.vi;
 			s_clamp_skip = block.clamp_skip[i];
 			EmitPair(a, block.cache, ins, false);
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;
+			s_discard_flags = false;
 			pxAssertRel((s_store_mac_count != macs) == (HasFmac(ins) && UpdatesMacFlags(ins.upper)),
 				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);

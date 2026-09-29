@@ -87,6 +87,10 @@ namespace
 		void SetUp() override
 		{
 			m_cpu = EmuConfig.Cpu;
+			m_speedhacks = EmuConfig.Speedhacks;
+			// The flag hack drops unread sticky status bits; tests compare exactly
+			// unless they turn it on themselves.
+			EmuConfig.Speedhacks.vuFlagHack = false;
 			m_saved0 = VU0;
 			m_saved1 = VU1;
 			u8* micro = VU1.Micro;
@@ -117,6 +121,7 @@ namespace
 			VU0 = m_saved0;
 			VU1 = m_saved1;
 			EmuConfig.Cpu = m_cpu;
+			EmuConfig.Speedhacks = m_speedhacks;
 		}
 
 		void Put(u32 pc, u32 upper, u32 lower)
@@ -127,7 +132,8 @@ namespace
 			std::memcpy(VU1.Micro + pc + 4, &upper, 4);
 		}
 
-		void Compare(u32 cycles)
+		// `ignored_status`: status flag bits the native result may differ in.
+		void Compare(u32 cycles, u32 ignored_status = 0)
 		{
 			const VURegs initial0 = VU0, initial1 = VU1;
 			const u32 vifstat = vif1Regs.stat._u32;
@@ -146,15 +152,23 @@ namespace
 			ASSERT_EQ(VU1.cycle, expected1.cycle);
 			ASSERT_EQ(VU1.VI[REG_TPC].UL, expected1.VI[REG_TPC].UL);
 			ASSERT_EQ(std::memcmp(VU1.VF, expected1.VF, sizeof(VU1.VF)), 0);
-			ASSERT_EQ(std::memcmp(VU1.VI, expected1.VI, sizeof(VU1.VI)), 0);
-			ASSERT_TRUE(SameObservableState(VU1, expected1));
+			m_status_differed |= ((VU1.VI[REG_STATUS_FLAG].UL ^ expected1.VI[REG_STATUS_FLAG].UL) & ignored_status) != 0;
+			VU1.VI[REG_STATUS_FLAG].UL &= ~ignored_status;
+			VURegs masked1 = expected1;
+			masked1.VI[REG_STATUS_FLAG].UL &= ~ignored_status;
+			const u32 native_status = VU1.VI[REG_STATUS_FLAG].UL;
+			ASSERT_EQ(std::memcmp(VU1.VI, masked1.VI, sizeof(VU1.VI)), 0);
+			ASSERT_TRUE(SameObservableState(VU1, masked1));
+			VU1.VI[REG_STATUS_FLAG].UL = native_status;
 			ASSERT_EQ(std::memcmp(&VU0, &expected0, sizeof(VU0)), 0);
 			ASSERT_EQ(std::memcmp(VU1.Mem, expected_memory.data(), expected_memory.size()), 0);
 			ASSERT_EQ(vif1Regs.stat._u32, expected_vifstat);
 		}
 
 		Pcsx2Config::CpuOptions m_cpu;
+		Pcsx2Config::SpeedhackOptions m_speedhacks;
 		VURegs m_saved0, m_saved1;
+		bool m_status_differed = false;
 	};
 } // namespace
 
@@ -4004,3 +4018,83 @@ TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
 }
 
 #endif
+
+TEST_F(VU1RecompilerTest, FlagHackDropsOnlyUnreadStickyBits)
+{
+	// Under the VU flag hack, deferred regions skip the flags of FMAC ops nothing
+	// reads, sticky status bits included, like microVU. Everything else,
+	// including the non-sticky status bits, MAC flag and flags that FSAND/FMAND
+	// read, still has to match the interpreter.
+	EmuConfig.Speedhacks.vuFlagHack = true;
+	CpuArm64VU1.Reset();
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {0, 0x80000000, 0x3fc00000, 0xc0000000, 0x40400000, 0x00000001, 0x7f7fffff, 0xff7fffff};
+	constexpr u32 length = 40;
+	u32 random = 4242;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		CpuArm64VU1.Reset();
+		for (u32 i = 0; i < length; i++)
+		{
+			const u32 fd = 1 + next() % 8, fs = 1 + next() % 8, ft = 1 + next() % 8, dest = 1 + next() % 15;
+			const u32 kind = next() % 10;
+			constexpr u32 ops[] = {0x28, 0x28, 0x28, 0x2c, 0x2c, 0x2a, 0x2a, 0x2a}; // ADD/SUB/MUL
+			const u32 upper = kind < 8 ? (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | ops[kind] : 0x2ff;
+			u32 lower = 0x8000033c;
+			// Odd seeds read the flags; even seeds leave most flags unread.
+			const u32 op = (seed & 1) ? next() % 16 : 16, it = 1 + next() % 8;
+			if (op == 0)
+				lower = (0x16u << 25) | (it << 16) | (next() & 0x7ff); // FSAND
+			else if (op == 1)
+				lower = (0x1au << 25) | (it << 16) | ((1 + next() % 8) << 11); // FMAND
+			if (i == length - 1)
+				lower = 0x40000000 | ((0 - length) & 0x7ff); // B to the top
+			Put(i * 8, upper, lower);
+		}
+		Put(length * 8, 0x2ff, 0x8000033c); // Delay slot
+		for (u32 budget : {1u, 7u, 23u, 64u, 150u, 400u, 1000u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			for (u32 reg = 1; reg <= 8; reg++)
+				for (u32 lane = 0; lane < 4; lane++)
+					VU1.VF[reg].UL[lane] = values[(reg * 3 + lane + seed) % std::size(values)];
+			Compare(budget, 0x3c0); // ZS/SS/US/OS
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, FlagHackSkipsUnreadFlagsInDeferredRegions)
+{
+	// A microprogram whose only zero result (SUB vf1, vf2, vf2) is never read:
+	// the interpreter sets the sticky ZS bit, the flag hack does not once the
+	// block runs as a deferred region. Without the hack it matches exactly.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (bool hack : {false, true})
+	{
+		EmuConfig.Speedhacks.vuFlagHack = hack;
+		CpuArm64VU1.Reset();
+		Put(0, (15 << 21) | (2 << 16) | (2 << 11) | (1 << 6) | 0x2c, 0x8000033c); // SUB vf1, vf2, vf2
+		for (u32 i = 1; i < 8; i++)
+			Put(i * 8, (15 << 21) | (3 << 16) | (3 << 11) | ((3 + i % 4) << 6) | 0x28, 0x8000033c); // ADD vf3-6, vf3, vf3
+		Put(8 * 8, 0x400002ff, 0x8000033c); // E bit
+		Put(9 * 8, 0x2ff, 0x8000033c);
+		m_status_differed = false;
+		for (u32 run = 0; run < 8; run++)
+		{
+			SCOPED_TRACE(testing::Message() << "hack=" << hack << " run=" << run);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			Compare(1000, hack ? 0x3c0 : 0);
+			if (HasFatalFailure())
+				return;
+		}
+		EXPECT_EQ(m_status_differed, hack);
+	}
+}
