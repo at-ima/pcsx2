@@ -17,6 +17,7 @@ sections unless a section says so.
 | 09-27 | Burnout 3 | "Burnout 3: EE interpreter fallbacks", "Burnout 3: EE register jumps and the remaining fallbacks" |
 | 09-28 | Shadow of the Colossus | "Shadow of the Colossus: per-call VU1 overhead" |
 | 09-28..29 | Shadow of the Colossus at 6x | "Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides" |
+| 09-29 | Shadow of the Colossus at 6x | "VU1 flags under the flag hack" |
 | 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
 
 ## Intro performance investigation (2026-09-18)
@@ -2885,6 +2886,32 @@ VU1 thread time and 2x the power; see the README benchmark. The largest remainin
 are lazy VU1 flags (microVU computes them only where they are read) and an
 EE register cache (EE blocks write every guest register back to memory after
 each instruction).
+
+## VU1 flags under the flag hack
+
+In SotC at 6x, half of every deferred pair was MAC and status flag
+computation that only fed the sticky status bits. With `vuFlagHack` on (the
+default, as for microVU), those ops now compute no flags at all; see "VU flag
+hack" in README.md. Measured with one build and the setting toggled in the
+ini, `WANDER_TO_KYOZOU_001`, 6x, alternating 30 s runs, host instructions per
+VU1 cycle from `thread_selfcounts`:
+
+| Run | Flag hack off | Flag hack on |
+| --- | --- | --- |
+| 1 | 39.61 | 36.17 |
+| 2 | 40.77 | 36.90 |
+
+That is about 9% fewer instructions. Host cycles per VU1 cycle moved with
+thermals (7.5-9.5) and are not a usable comparison here. GS frame dumps
+(`SaveFrame`) at frames 60-600 were pixel-identical with the hack on and off
+in SotC, Burnout 3 (`BURN_OUT_3_004`) and Saru! Get You! 3
+(`SARU_3_SLOW_002`), and identical to the earlier dumps in Ridge Racer V
+(`RIDGE_RACER_V_004`, frames 60-660).
+
+Most flag ops in these regions still compute flags because they are live at
+a region exit, the latest entry before one, or the source of the flag
+scratch. microVU under the hack also skips those unless the next block reads
+the flags; doing the same here would relax what block exits publish.
 
 ## EE: linking blocks on unprotected pages
 
