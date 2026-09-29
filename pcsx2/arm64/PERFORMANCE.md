@@ -2961,7 +2961,8 @@ Other numbers from the same investigation, for later work:
   written only on paths that return to C++. The CP0.Config cycle scaling is
   a compile-time constant, and a change of that bit drops every block. EE
   host instructions per EE cycle, means of alternating runs: SotC 28.07 ->
-  27.14, Burnout 3 28.44 -> 26.78, Saru! Get You! 3 21.10 -> 20.58.
+  27.14, Burnout 3 28.44 -> 26.78, Saru! Get You! 3 21.10 -> 20.58. Frame
+  dumps (four states) were unchanged.
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
