@@ -2957,6 +2957,11 @@ Other numbers from the same investigation, for later work:
   27.83, 27.99; Burnout 3 29.02, 28.85 -> 28.53, 28.33; Saru! Get You! 3
   21.45, 21.37 -> 21.32, 21.13. Frame dumps (four states) and a SotC BIOS
   boot to frame 2400 were unchanged.
+- A linked exit now stores only `pc`; `cpuRegs.code` is decode scratch and is
+  written only on paths that return to C++. The CP0.Config cycle scaling is
+  a compile-time constant, and a change of that bit drops every block. EE
+  host instructions per EE cycle, means of alternating runs: SotC 28.07 ->
+  27.14, Burnout 3 28.44 -> 26.78, Saru! Get You! 3 21.10 -> 20.58.
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
