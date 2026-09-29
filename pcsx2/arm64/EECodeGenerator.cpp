@@ -896,6 +896,7 @@ namespace
 		// compiled function) and x14 (the vtlb map base, cached once per block
 		// when the block needs it at all) must be restored afterward.
 		a.Mov(x0, reinterpret_cast<uintptr_t>(&cpuRegs));
+		a.Mov(x1, reinterpret_cast<uintptr_t>(&Arm64EE::CodeGenerator::g_link_state));
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
 	}
 
@@ -1358,22 +1359,21 @@ namespace
 	} s_exit;
 
 	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
-	// same CP0.Config bit TryExecute uses) into w11, with x13 = block_cycles
-	// and x12 = &g_link_state. Branches to `off` when chaining is off.
-	// Clobbers x9-x13 only, so x0 and a taken branch's x15 survive.
+	// same CP0.Config bit TryExecute uses) into w11, with x13 = block_cycles.
+	// x1 holds &g_link_state for the whole block. Branches to `off` when
+	// chaining is off. Clobbers x9-x13 only, so x0 and a taken branch's x15
+	// survive.
 	void EmitAddCycles(MacroAssembler& a, u32 completed, Label* off)
 	{
 		using namespace Arm64EE::CodeGenerator;
-		a.Mov(x12, reinterpret_cast<uintptr_t>(&g_link_state));
-		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, chaining)));
+		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
 		a.Cbz(w9, off);
-		a.Ldr(x13, MemOperand(x12, offsetof(LinkState, block_cycles)));
+		a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
 		a.Ldr(w10, MemOperand(x0, offsetof(cpuRegisters, CP0) + 16 * sizeof(u32))); // Config
 		a.Ubfx(w10, w10, 18, 1);
-		a.Mov(w11, 2);
-		a.Sub(w10, w11, w10);
-		a.Mov(w11, s_exit.cycles[completed]);
-		a.Mul(w10, w10, w11);
+		// cycles * (2 - bit) == (cycles * 2) >> bit
+		a.Mov(w12, s_exit.cycles[completed] * 2);
+		a.Lsr(w10, w12, w10);
 		a.Ldr(w11, MemOperand(x13));
 		a.Add(w11, w11, w10);
 	}
@@ -1420,7 +1420,7 @@ namespace
 	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, Label* classic)
 	{
 		using namespace Arm64EE::CodeGenerator;
-		Label request, due, literal;
+		Label request, due;
 		EmitAddCycles(a, completed, classic);
 		if (kind == LinkKind::Taken)
 		{
@@ -1439,8 +1439,10 @@ namespace
 		a.Str(w11, MemOperand(x13));
 		if (kind != LinkKind::Continue)
 		{
-			// EEBranchEventDue(): signed 64-bit distance to the deadline.
-			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+			// EEBranchEventDue(): signed 64-bit distance to the deadline. A taken
+			// exit still has the new cycle in x9.
+			if (kind != LinkKind::Taken)
+				a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
 			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
 			a.Sub(x9, x9, x10);
 			a.Tbz(x9, 63, &due);
@@ -1448,18 +1450,16 @@ namespace
 		// A link is only valid in the generation it was made in: any drop of
 		// compiled blocks bumps it, including one from a write fault taken
 		// inside the block that is running now.
-		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, generation)));
-		a.Adr(x10, &literal);
-		a.Ldr(w10, MemOperand(x10));
-		a.Cmp(w9, w10);
-		a.B(ne, &request);
+		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, generation)));
 		u64 slot;
 		{
-			vixl::ExactAssemblyScope scope(&a, 2 * kInstructionSize);
+			vixl::ExactAssemblyScope scope(&a, 5 * kInstructionSize);
+			a.ldr(w10, 4); // the literal below, four instructions on
+			a.cmp(w9, w10);
+			a.b(&request, ne);
 			slot = reinterpret_cast<uintptr_t>(s_exit.buffer + a.GetCursorOffset()) -
 			       reinterpret_cast<uintptr_t>(SysMemory::GetEERec());
 			a.b(&request); // PatchLink() retargets this to the next block
-			a.bind(&literal);
 			a.dc32(0); // generation of the link; 0 is never current
 		}
 		a.Bind(&request);
@@ -1500,7 +1500,7 @@ namespace
 		a.Ldp(w9, w11, MemOperand(x10));
 		a.Cmp(w9, w15);
 		a.B(ne, &miss);
-		a.Ldr(w9, MemOperand(x12, offsetof(LinkState, generation)));
+		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, generation)));
 		a.Cmp(w11, w9);
 		a.B(ne, &miss);
 		a.Ldr(x16, MemOperand(x10, 8));

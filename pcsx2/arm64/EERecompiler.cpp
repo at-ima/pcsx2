@@ -18,7 +18,8 @@ namespace
 
 	struct Block
 	{
-		using Function = u64 (*)(cpuRegisters*);
+		// x1 = &CodeGenerator::g_link_state, which links pass on unchanged.
+		using Function = u64 (*)(cpuRegisters*, Arm64EE::CodeGenerator::LinkState*);
 		std::array<u32, MaxInstructions> words{};
 		u32 word_count = 0;
 		std::array<u32, MaxInstructions + 1> cycles{};
@@ -329,7 +330,7 @@ namespace
 	// cycles the generated code did not already add.
 	u64 RunBlock(const Block* block, u32& block_cycles)
 	{
-		const u64 result = block->function(&cpuRegs);
+		const u64 result = block->function(&cpuRegs, &Arm64EE::CodeGenerator::g_link_state);
 		if (!(result & Arm64EE::CodeGenerator::CyclesCommitted))
 		{
 			const u32 completed = static_cast<u32>(result) & Arm64EE::CodeGenerator::CompletedMask;
