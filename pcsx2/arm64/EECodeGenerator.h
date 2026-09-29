@@ -90,6 +90,9 @@ namespace Arm64EE::CodeGenerator
 	// Stores overlapping this block's source exit immediately for revalidation.
 	// `cycles[n]` is the fixed-point cost of the first n instructions; a
 	// linkable block needs it to commit cycles itself while chaining.
+	// `self_check` makes the block compare its source with `words` on entry
+	// and return NextBlock | CyclesCommitted, having run nothing, when they
+	// differ, so a block on a page that is not write-protected can be linked.
 	size_t Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
-		std::span<const u32> cycles, bool linkable);
+		std::span<const u32> cycles, bool linkable, bool self_check);
 } // namespace Arm64EE::CodeGenerator

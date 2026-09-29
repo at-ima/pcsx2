@@ -1904,4 +1904,71 @@ TEST_F(EERecompilerTest, LinkedAndRegisterJumpsMatchSteppedExecution)
 		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
 	}
 }
+
+TEST_F(EERecompilerTest, UntrustedBlocksLinkAndCatchChangedSource)
+{
+	// The same kind of loop on a page that is not write-protected (untracked,
+	// as in every test here): its blocks check their own source on entry, so
+	// they link too. Then the called function changes without any Reset() or
+	// Clear(); the links already made lead to the old code, whose check has to
+	// send execution back to the dispatcher to recompile it.
+	constexpr u32 iterations = 3000;
+	program.fill(Stop);
+	program[0] = (3u << 26) | ((Base + 64) >> 2); // JAL f
+	program[1] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // delay: ADDIU $1, $1, -1
+	program[2] = (5u << 26) | (1 << 21) | 0xfffdu; // BNE $1, $0, Base
+	program[3] = (9u << 26) | (4 << 21) | (4 << 16) | 1u; // delay: ADDIU $4, $4, 1
+	program[16] = (9u << 26) | (2 << 21) | (2 << 16) | 7u; // f: ADDIU $2, $2, 7
+	program[17] = (9u << 26) | (3 << 21) | (3 << 16) | 3u; // ADDIU $3, $3, 3
+	program[18] = (31 << 21) | 8; // JR ra
+	program[19] = 0; // delay: NOP
+	Arm64EE::Reset();
+	auto prepare = [&]() {
+		Init(0);
+		cpuRegs.GPR.r[1].UD[0] = iterations;
+		cpuRegs.nextEventCycle = u64(1) << 40;
+	};
+	auto run = [&](bool chained, u32& cycles) {
+		cycles = 0;
+		EEBlockResult result;
+		u32 calls = 0;
+		do
+		{
+			result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
+			if (result.exit == EEBlockExit::TakenBranch)
+			{
+				cpuRegs.branch = 1;
+				cpuRegs.pc = result.target;
+				cpuRegs.branch = 0;
+				cpuRegs.cycle += std::max(cycles >> 3, 1u);
+				cycles &= 7;
+			}
+			ASSERT_LT(++calls, 100000u);
+		} while (result);
+	};
+	for (u32 round = 0; round < 2; round++)
+	{
+		SCOPED_TRACE(testing::Message() << "round=" << round);
+		if (round)
+			program[16] = (9u << 26) | (2 << 21) | (2 << 16) | 11u; // f: ADDIU $2, $2, 11
+		// Chained first, so the second round runs through the first round's links.
+		prepare();
+		const u32 initial_r2 = cpuRegs.GPR.r[2].UL[0];
+		const u64 dispatches = Arm64EE::GetDispatchCount();
+		u32 chained_cycles, stepped_cycles;
+		run(true, chained_cycles);
+		if (HasFatalFailure())
+			return;
+		if (!round)
+			EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
+		const cpuRegisters chained = cpuRegs;
+		EXPECT_EQ(chained.GPR.r[2].UL[0], initial_r2 + (round ? 11 : 7) * iterations);
+		prepare();
+		run(false, stepped_cycles);
+		if (HasFatalFailure())
+			return;
+		EXPECT_EQ(chained_cycles, stepped_cycles);
+		EXPECT_EQ(std::memcmp(&cpuRegs, &chained, sizeof(cpuRegisters)), 0);
+	}
+}
 #endif

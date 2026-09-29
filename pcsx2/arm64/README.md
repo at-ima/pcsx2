@@ -164,8 +164,14 @@ existing page tracking (`mmap_MarkCountedRamPage`), the mechanism the x86
 recompiler uses. While the page stays protected (`ProtMode_Write`), or is not
 RAM (`ProtMode_NotRequired`), entries skip comparing source words. A write to a
 protected page faults, and `ClearProvider` drops every cached block. Pages that
-keep self-modifying end up in `ProtMode_Manual` and are compared on every entry,
-as before. The page tracking goes through the physical mapping, so it is used
+keep self-modifying end up in `ProtMode_Manual` and are compared on every entry.
+Such an untrusted block does the comparison itself: its generated code starts
+by XORing its source with a copy of the words it was compiled from (8 bytes at
+a time), and on a mismatch returns `NextBlock` without running anything. So
+untrusted blocks can be linked and entered through `g_indirect` like trusted
+ones; the dispatcher's `memcmp` then recompiles the block, and the recompile
+bumps the link generation so no link leads to the old code. Needs proper
+testing in games that really modify their code. The page tracking goes through the physical mapping, so it is used
 only when that mapping and the virtual mapping resolve to the same byte;
 otherwise the entry falls back to `memcmp`. The unit tests' synthetic code
 buffers take that fallback. The initial implementation uses memory-backed guest

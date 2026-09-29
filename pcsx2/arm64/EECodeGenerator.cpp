@@ -1667,11 +1667,36 @@ void Arm64EE::CodeGenerator::PatchLink(u8* slot, const void* target, u32 generat
 }
 
 size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
-	std::span<const u32> cycles, bool linkable)
+	std::span<const u32> cycles, bool linkable, bool self_check)
 {
 	MacroAssembler a(buffer, capacity);
 	s_exit = {linkable, cycles, buffer};
 	std::array<Label, MaxInstructions + 1> exits;
+	Label stale, copy;
+	if (self_check)
+	{
+		// XOR the source with the copy compiled from, eight bytes at a time.
+		// Links and g_indirect enter here too, so this replaces the dispatcher's
+		// memcmp on every entry.
+		const u32 bytes = static_cast<u32>(words.size_bytes());
+		a.Mov(x16, reinterpret_cast<uintptr_t>(source));
+		a.Adr(x17, &copy);
+		for (u32 offset = 0; offset < bytes; offset += 8)
+		{
+			const bool word = bytes - offset == 4;
+			const Register value = word ? Register(w9) : Register(x9), expected = word ? Register(w10) : Register(x10);
+			a.Ldr(value, MemOperand(x16, offset));
+			a.Ldr(expected, MemOperand(x17, offset));
+			if (offset)
+			{
+				a.Eor(x9, x9, x10);
+				a.Orr(x11, x11, x9);
+			}
+			else
+				a.Eor(x11, x9, x10);
+		}
+		a.Cbnz(x11, &stale);
+	}
 	if (std::any_of(words.begin(), words.end(), [](u32 code) { return MemorySize(code) != 0; }))
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
 	for (u32 i = 0; i < words.size(); i++)
@@ -1714,6 +1739,21 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)
 			break;
+	}
+	if (self_check)
+	{
+		// pc is this block's entry and the exit that got here committed its
+		// cycles, so the dispatcher only has to look the block up again. Outside
+		// chaining the empty exit field reads as NotHandled.
+		a.Bind(&stale);
+		a.Mov(x0, NextBlock | CyclesCommitted);
+		a.Ret();
+		vixl::ExactAssemblyScope scope(&a, (words.size() + 2) * kInstructionSize);
+		if (a.GetCursorOffset() & 7)
+			a.nop();
+		a.bind(&copy);
+		for (u32 word : words)
+			a.dc32(word);
 	}
 	a.FinalizeCode();
 	return a.GetSizeOfCodeGenerated();
