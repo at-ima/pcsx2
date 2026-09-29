@@ -29,6 +29,8 @@ namespace
 		// every way out of that state -- a write fault, a TLB remap, a
 		// tracking reset -- drops all blocks. Decided once in Compile() so
 		// the dispatcher does not query page protection on every entry.
+		// Other blocks compare their own source on entry (self_check), so they
+		// can be linked too; the dispatcher still compares them before a call.
 		bool trusted = false;
 	};
 	// std::deque never invalidates references to existing elements when more
@@ -65,6 +67,9 @@ namespace
 	std::array<BlockTableSlot, BlockTableSize> s_block_table{};
 	u32 s_block_table_count = 0;
 	u32 s_block_table_generation = 1; // 0 is never used, so a default-constructed slot starts "empty"
+	// Also bumped when a block is recompiled in place, which the block table
+	// does not need to know about.
+	u32 s_link_generation = 1;
 	u32 HashBlockPc(u32 pc) { return ((pc >> 2) * 0x9E3779B1u) >> (32 - 19); } // Fibonacci hashing, top 19 bits
 	// Existing entry for pc, or nullptr. Linear-probes from the hashed slot;
 	// bounded by BlockTableSize, though a real miss resolves in O(1) average
@@ -106,7 +111,7 @@ namespace
 	{
 		s_block_table_generation++;
 		// Invalidates every native link made so far (see LinkState).
-		Arm64EE::CodeGenerator::g_link_state.generation = s_block_table_generation;
+		Arm64EE::CodeGenerator::g_link_state.generation = ++s_link_generation;
 		s_block_table_count = 0;
 		std::deque<Block>{}.swap(s_block_storage);
 	}
@@ -206,7 +211,7 @@ namespace
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
 			pc, source, std::span(block.words.data(), block.word_count),
-			std::span(block.cycles.data(), block.word_count + 1), Linkable());
+			std::span(block.cycles.data(), block.word_count + 1), Linkable(), !block.trusted);
 		HostSys::EndCodeWrite();
 		HostSys::FlushInstructionCache(s_write, static_cast<u32>(size));
 		block.function = reinterpret_cast<Block::Function>(s_write);
@@ -303,6 +308,11 @@ namespace
 			// about -- exactly what the recompiler unit tests do to inject synthetic
 			// code buffers). Only use write-protection tracking when the two
 			// mappings actually resolve to the same byte.
+			// Links and g_indirect entries still lead to the block this one
+			// replaces; drop them. Its self-check keeps them from running
+			// stale code, but every entry through them would come back here.
+			if (block)
+				Arm64EE::CodeGenerator::g_link_state.generation = ++s_link_generation;
 			const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
 			const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
 			block = &Compile(pc, source, page_type, tracked);
@@ -372,12 +382,11 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 		const Block* block = LookupBlock();
 		if (!block)
 			return {};
-		if (block->trusted)
-			g_indirect[IndirectIndex(pc)] = {pc, g_link_state.generation, reinterpret_cast<const void*>(block->function)};
+		g_indirect[IndirectIndex(pc)] = {pc, g_link_state.generation, reinterpret_cast<const void*>(block->function)};
 		// Link the exit that asked for it, unless blocks were dropped since (a
 		// write fault in the block, or a Reset() while looking this one up,
 		// which also rewinds the code buffer the slot lives in).
-		if (pending_slot && pending_generation == g_link_state.generation && block->trusted)
+		if (pending_slot && pending_generation == g_link_state.generation)
 			PatchLink(pending_slot, reinterpret_cast<const void*>(block->function), pending_generation);
 		pending_slot = nullptr;
 		const u32 generation = g_link_state.generation;

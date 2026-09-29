@@ -18,6 +18,7 @@ sections unless a section says so.
 | 09-28 | Shadow of the Colossus | "Shadow of the Colossus: per-call VU1 overhead" |
 | 09-28..29 | Shadow of the Colossus at 6x | "Shadow of the Colossus at 4K: GPU, IOP idle loops and VU1 divides" |
 | 09-29 | Shadow of the Colossus at 6x | "VU1 flags under the flag hack" |
+| 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -2911,3 +2912,41 @@ Most flag ops in these regions still compute flags because they are live at
 a region exit, the latest entry before one, or the source of the flag
 scratch. microVU under the hack also skips those unless the next block reads
 the flags; doing the same here would relax what block exits publish.
+
+## EE: linking blocks on unprotected pages
+
+The EE thread in SotC at 6x (`sample`, 6 s): about 40% is event handling
+(29% is `vif1Interrupt` handing unpacks to MTVU), 37% generated code and 8%
+`LookupBlock`. A temporary counter showed about 5.5M lookups a second, 83% of
+them for blocks on `ProtMode_Manual` pages. Those blocks were never linked, so
+every entry came back to C++ and compared the source with `memcmp`; most were
+`LinkRequest` exits that could not be patched.
+
+Untrusted blocks now check their own source on entry (see "EE" in README.md)
+and link like trusted ones. EE host instructions per EE cycle
+(`thread_selfcounts` on the EE thread over `cpuRegs.cycle`), alternating
+runs, one build per column:
+
+| Scene | Before | After |
+| --- | --- | --- |
+| SotC `WANDER_TO_KYOZOU_001` | 31.16, 30.78 | 28.93, 28.74 |
+| Burnout 3 `BURN_OUT_3_004` | 30.32, 30.16 | 30.00, 29.77 |
+| Saru! Get You! 3 `SARU_3_SLOW_002` | 21.58, 21.75 | 21.56, 21.65 |
+
+GS frame dumps at frames 60-600 were pixel-identical to the previous build in
+all four test states, and a BIOS boot of SotC was identical up to frame 2400.
+A BIOS boot of Burnout 3 reached the same screens, with loading-bar timing
+that differed from the first dumped frame on (disc read timing).
+
+Other numbers from the same investigation, for later work:
+
+- SotC runs about 28M EE blocks a second, 7.4 instructions each (Burnout 3:
+  4.3; Saru! Get You! 3: 7.0). Guest GPR loads are 0.9 per instruction, and
+  0.3-0.4 per instruction reload a register the same block already loaded or
+  wrote.
+- A taken branch's linked exit is about 35 host instructions: loading the
+  link state, the cycle scaling, the cycle commit, the event check and the
+  link generation check.
+- The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
+  about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
+  shorter spin would save almost nothing.
