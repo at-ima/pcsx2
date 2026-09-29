@@ -41,7 +41,7 @@ and makes different trade-offs.
 | --- | --- | --- |
 | Reference model | microVU's own timing model: stalls from `mVUincCycles`, pipeline state carried between blocks in `microRegInfo` | The interpreters' architectural state: the VU FMAC/FDIV/EFU/IALU queues and flags in `VURegs` stay exactly as the interpreter would leave them at every point where C++ code can observe them |
 | Unsupported instructions | Every instruction is compiled or called from compiled code; nothing drops back to the interpreter loop | Anything not compiled runs in the interpreter, one instruction (EE/IOP) or pair (VU) at a time, through the same state; the next block continues natively |
-| VU flags | Computed only where a later instruction reads them (`mVUsetFlags`) | Computed for every FMAC op, except inside deferred regions where the compiler proves nothing can observe them |
+| VU flags | Computed only where a later instruction reads them (`mVUsetFlags`); with the VU flag hack, unread sticky bits are dropped | Computed for every FMAC op, except inside deferred regions where nothing observes them. With the VU flag hack (on by default), those ops skip flag computation entirely unless a status reader later in the region can see their sticky bits |
 | VU1 pipeline | Scheduled per block from the incoming `microRegInfo` | Scheduled at compile time from the block's code, plus variants compiled for the exact incoming pipeline state (entry profiles); the queues are materialized only at region and block exits |
 | VU1 blocks | Linked by microVU's block manager | Traces follow static and taken branches up to 256 pairs; exits link to the next block in generated code, with several targets per exit for subroutine returns |
 | XGKICK | Whole-packet transfer after the next pair | Same policy, adopted from microVU |
@@ -58,8 +58,9 @@ What this buys and costs:
   PCSX2 and ARMSX2 but not in this fork (see below). Which difference causes
   it has not been pinned down.
 - **More CPU time.** Keeping flags and queues exact is why this fork uses
-  more CPU time and power than ARMSX2 (see the benchmarks). Lazy flags and
-  an EE register cache are the next steps.
+  more CPU time and power than ARMSX2 (see the benchmarks). Skipping unread
+  VU1 flags under the flag hack was the first step; an EE register cache is
+  next.
 - **Incremental coverage.** Instructions can be added one at a time, each
   checked against the interpreter, and anything missing still runs.
 
