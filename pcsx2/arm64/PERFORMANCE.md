@@ -2944,9 +2944,14 @@ Other numbers from the same investigation, for later work:
   4.3; Saru! Get You! 3: 7.0). Guest GPR loads are 0.9 per instruction, and
   0.3-0.4 per instruction reload a register the same block already loaded or
   wrote.
-- A taken branch's linked exit is about 35 host instructions: loading the
+- A taken branch's linked exit was about 35 host instructions: loading the
   link state, the cycle scaling, the cycle commit, the event check and the
-  link generation check.
+  link generation check. Blocks now get `&g_link_state` in x1 from the
+  dispatcher (links pass it on), the Config scaling is a shift, a taken exit
+  reuses the cycle it stored for the event check, and the generation literal
+  is one PC-relative load. EE host instructions per EE cycle, alternating
+  runs: SotC 29.12, 28.72 -> 28.48, 28.40; Burnout 3 29.95, 29.81 -> 28.96,
+  28.71. Frame dumps (frames 60-600, four states) were unchanged.
 - The GS thread's wait for MTVU (`TryWaitWithLowPowerSpin`) is short (1-5 µs,
   about 300k a second once VU1 is the limiter) and mostly idle in WFE; a
   shorter spin would save almost nothing.
