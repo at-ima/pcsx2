@@ -30,6 +30,46 @@ Design notes and the full investigation log (with measurements for every
 change) are in [pcsx2/arm64/README.md](pcsx2/arm64/README.md) and
 [pcsx2/arm64/PERFORMANCE.md](pcsx2/arm64/PERFORMANCE.md).
 
+## Design differences from upstream PCSX2 and ARMSX2
+
+Upstream PCSX2's recompilers (x86 only, so Rosetta 2 on a Mac) and ARMSX2
+(which ports those recompilers, including microVU, to ARM64) share one
+design. This fork's ARM64 backend was written from the interpreters instead,
+and makes different trade-offs.
+
+| | Upstream x86 / ARMSX2 | This fork |
+| --- | --- | --- |
+| Reference model | microVU's own timing model: stalls from `mVUincCycles`, pipeline state carried between blocks in `microRegInfo` | The interpreters' architectural state: the VU FMAC/FDIV/EFU/IALU queues and flags in `VURegs` stay exactly as the interpreter would leave them at every point where C++ code can observe them |
+| Unsupported instructions | Every instruction is compiled or called from compiled code; nothing drops back to the interpreter loop | Anything not compiled runs in the interpreter, one instruction (EE/IOP) or pair (VU) at a time, through the same state; the next block continues natively |
+| VU flags | Computed only where a later instruction reads them (`mVUsetFlags`) | Computed for every FMAC op, except inside deferred regions where the compiler proves nothing can observe them |
+| VU1 pipeline | Scheduled per block from the incoming `microRegInfo` | Scheduled at compile time from the block's code, plus variants compiled for the exact incoming pipeline state (entry profiles); the queues are materialized only at region and block exits |
+| VU1 blocks | Linked by microVU's block manager | Traces follow static and taken branches up to 256 pairs; exits link to the next block in generated code, with several targets per exit for subroutine returns |
+| XGKICK | Whole-packet transfer after the next pair | Same policy, adopted from microVU |
+| EE | Register allocation across instructions | Every guest register is written back after each instruction; blocks chain and link to each other |
+| Testing | Game testing | Differential unit tests against the interpreters at every cycle budget, plus game testing |
+| Metal renderer | Upstream GS code | Adds the Apple-specific changes above |
+
+What this buys and costs:
+
+- **Accuracy follows the interpreter.** Because the native code reproduces the
+  interpreter's state instead of microVU's model, games that microVU gets
+  wrong can render correctly here. In Ridge Racer V, the cars' lower bodies
+  and rear wings are covered in speckled, noise-like shading in upstream
+  PCSX2 and ARMSX2 but not in this fork (see below). Which difference causes
+  it has not been pinned down.
+- **More CPU time.** Keeping flags and queues exact is why this fork uses
+  more CPU time and power than ARMSX2 (see the benchmarks). Lazy flags and
+  an EE register cache are the next steps.
+- **Incremental coverage.** Instructions can be added one at a time, each
+  checked against the interpreter, and anything missing still runs.
+
+![Ridge Racer V: the same frames in this fork, ARMSX2 and upstream PCSX2](docs/images/ridge-racer-v-car-shading.jpg)
+
+Ridge Racer V, attract-mode replay from the same save state, dumped with the
+GS frame dump (`SaveFrame`) at frames 240 (top two rows) and 360 (bottom row)
+after loading the state, 3x resolution on the Metal renderer. The replay is
+identical in all three until about frame 700, so the frames match exactly.
+
 ## Benchmarks
 
 Measured on 2026-09-29 on an Apple M5 MacBook Air (fanless, 32 GB, macOS 27)
@@ -104,7 +144,10 @@ How to read this:
 ## Building on Apple Silicon
 
 Requirements: macOS 13 or newer (MetalFX), Xcode (for the Metal shader
-compiler), and [Homebrew](https://brew.sh).
+compiler), and [Homebrew](https://brew.sh). The shaders are compiled with
+Xcode's `metal` tool, which the Command Line Tools do not include: if
+`xcode-select -p` points at the Command Line Tools, run the build with
+`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
 1. Install the dependencies:
 
