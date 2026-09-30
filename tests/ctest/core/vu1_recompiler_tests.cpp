@@ -4017,7 +4017,6 @@ TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
 	EXPECT_EQ(dispatches[3], 1u) << "first run " << dispatches[0];
 }
 
-#endif
 
 TEST_F(VU1RecompilerTest, FlagHackDropsOnlyUnreadStickyBits)
 {
@@ -4098,3 +4097,5 @@ TEST_F(VU1RecompilerTest, FlagHackSkipsUnreadFlagsInDeferredRegions)
 		EXPECT_EQ(m_status_differed, hack);
 	}
 }
+
+#endif
