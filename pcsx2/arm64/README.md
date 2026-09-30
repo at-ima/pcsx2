@@ -604,10 +604,19 @@ computes no flags for an FMAC op whose MAC and status values nothing observes
 and clamps the result. Its sticky status bits (ZS/SS/US/OS) are dropped,
 unless a status reader (FSAND/FSOR/FSEQ) later in the same region could see
 them; those ops keep the exact `Raw` path. microVU's flag hack drops them the
-same way (`sHackCond` in `mVUsetFlags`). Everything C++ or the guest can
-otherwise observe is unchanged: the latest retired entry, the entries live at
-a region exit, the flag scratch a later FSSET or divide reads, and the clip
-flag. With the hack off, the region keeps every sticky bit and matches the
+same way (`sHackCond` in `mVUsetFlags`).
+
+A region exit publishes the latest retired entry's flags, the live entries'
+flags and the flag scratch only if the code after it can read them
+(`ExitFlagsObserved`). The lookahead follows static paths from the exit for
+up to 64 pairs. It relaxes the exit once a flag instruction's entry has
+retired there (four pairs after it issued) before any MAC/status read,
+FSSET or divide (these read the scratch), register branch or E/D/T bit.
+Relaxed live entries publish zero flags, so nothing stale reaches the sticky
+bits when they retire. The pairs the lookahead read are kept as guards and
+validated with the block's own source, because they can lie outside the
+trace. The clip flag is always exact. With the hack off, the region keeps
+every sticky bit and publishes exact flags at every exit, matching the
 interpreter exactly. The setting is part of `Options()`, so changing it
 recompiles. Needs proper testing in games that read sticky flags across
 microprograms.

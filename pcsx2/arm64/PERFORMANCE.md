@@ -20,6 +20,7 @@ sections unless a section says so.
 | 09-29 | Shadow of the Colossus at 6x | "VU1 flags under the flag hack" |
 | 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
 | 09-30 | Shadow of the Colossus at 6x | "MTVU ring: shared cache lines" |
+| 09-30 | SotC and Burnout 3 at 6x | "VU1 region exits under the flag hack" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -3015,3 +3016,44 @@ alternating runs: SotC 24.62, 24.62 -> 22.18, 22.21 (-9.9%); Burnout 3 26.26,
 dumps (four states) were unchanged. A SotC BIOS boot matched to frame 1200;
 from about frame 1500 on, two boots of the same build already differ from
 each other (a one-frame shift in the intro), so later frames say nothing.
+
+## VU1 region exits under the flag hack
+
+Follow-up to "VU1 flags under the flag hack": region exits now skip the
+flags that nothing after them reads (see "VU flag hack" in README.md).
+
+A temporary counter on the exit paths (SotC and Burnout 3 at 6x, about 27 s
+each, counted per exit taken) sorted exits by what the lookahead decided:
+
+| Exit | SotC, 16 pairs | SotC, 64 pairs | Burnout 3, 16 pairs |
+| --- | --- | --- | --- |
+| Relaxed | 92.3M | 107.8M | 126.1M |
+| Lookahead budget ran out | 43.8M | 16.9M | 0.9M |
+| Register branch after the exit | 46.0M | 67.9M | 2.7M |
+| The exit is a JR/JALR/BAL or its delay slot | 53.1M | 55.7M | 0.2M |
+| E bit | 8.0M | 8.4M | 0.3M |
+| Other (flag read, scratch reader, D/T bit) | 1.5M | 1.6M | 4.8M |
+
+The lookahead stays at 64 pairs. SotC's VU1 code calls subroutines, so most
+of its remaining exact exits end in, or run into, a register branch.
+
+Measurement: one build that switched the relaxation on and off every 4 s
+(recompiling at each switch, first second of each phase discarded), about
+30 s per mode, `thread_selfcounts` on the VU1 thread per VU1 cycle:
+
+| Workload | Exact exits | Relaxed exits |
+| --- | --- | --- |
+| SotC, host instructions | 36.68 | 34.74 (-5.3%) |
+| SotC, host cycles | 7.18 | 7.01 (-2.4%) |
+| Burnout 3, host instructions | 75.19 | 68.08 (-9.5%) |
+| Burnout 3, host cycles | 16.87 | 15.22 (-9.8%) |
+
+Whole-process energy per frame (separate runs, ABBA, on a hot machine) did not
+resolve a difference in SotC, Burnout 3, Ridge Racer V or Saru! Get You! 3.
+The VU1 thread is one of three busy threads, and run-to-run spread was ±5%.
+
+Frame dumps at frames 60-600 matched master in Burnout 3, Ridge Racer V and
+Saru! Get You! 3. SotC (`WANDER_TO_KYOZOU_001`) is not deterministic from
+that state: master differed from itself at frames 480/600 in one of five MTVU
+runs, and with MTVU off at frames 300-600 in one of three. Frames 60-420
+matched in every MTVU run of both builds.

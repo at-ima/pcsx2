@@ -2675,7 +2675,7 @@ namespace
 	// it as guards. Needs proper testing across more games.
 	bool ExitFlagsObserved(Block& block, u32 i, bool untaken, bool region_end)
 	{
-		constexpr u32 LookaheadPairs = 16;
+		constexpr u32 LookaheadPairs = 64;
 		const auto& ins = block.instructions[i];
 		if (ins.upper & 0x40000000)
 			return true;
