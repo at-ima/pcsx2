@@ -167,6 +167,10 @@ namespace
 			u32 pc, first, count;
 		};
 		std::vector<SourceRange> ranges;
+		// Pairs that relaxed region exits looked ahead at (see ExitFlagsObserved),
+		// validated with the block's own source.
+		std::vector<SourceRange> guard_ranges;
+		std::vector<u32> guard_words;
 		std::array<Instruction, MaxInstructions> instructions{};
 		std::array<RetirementSchedule, MaxInstructions> schedule{};
 		// Per pair: which FMAC inputs (1: fs, 2: ft, 4: ACC) are known to be
@@ -2465,6 +2469,8 @@ namespace
 			int writer = -1;
 			u32 issue_cycle = 0;
 			u32 order = 0;
+			// Whether the slot register holds the entry's flags (Entry::Normal).
+			bool exact = true;
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
@@ -2549,7 +2555,16 @@ namespace
 			a.Sub(x10, x26, state.elapsed - entry.issue_cycle);
 			a.Stp(x9, x10, MemOperand(x0, offsetof(fmacPipe, xyzwlower)));
 			// Cycle = 4, then the MAC/status/clip lanes of the slot register.
-			a.Ext(v16.V16B(), v17.V16B(), VRegister(28 + slot, 128).V16B(), 12);
+			if (entry.exact)
+				a.Ext(v16.V16B(), v17.V16B(), VRegister(28 + slot, 128).V16B(), 12);
+			else
+			{
+				// Only at an exit whose flags nothing reads (ExitFlagsObserved).
+				// Zero flags keep whatever the slot register holds out of the
+				// sticky bits when the entry retires.
+				a.Mov(w9, 4);
+				a.Fmov(vixl::aarch64::s16, w9);
+			}
 			a.Str(q16, MemOperand(x0, offsetof(fmacPipe, Cycle)));
 		}
 		a.Add(w9, w27, state.issued & 3);
@@ -2584,7 +2599,130 @@ namespace
 		u32 index;
 	};
 
-	void EmitDeferredRegion(MacroAssembler& a, const Block& block, u32 first, u32 end,
+	// Whether code starting at `pc` can observe the status/MAC flags a region
+	// exit publishes before a newer flag instruction's entry replaces them.
+	// `pc` may be a delay slot, followed by after[0] (and after[1], for a
+	// conditional branch either way). Every pair takes at least a cycle, so the
+	// entry of a flag instruction four pairs back has retired, after every older
+	// one. Flag reads, the status scratch (which FSSET and divides read and the
+	// latest flag instruction stores), E/D/T bits, register branches and running
+	// out of `budget` pairs count as observed. Appends the pairs it read to
+	// `guards`: the answer holds only while they stay the same.
+	bool FlagsObserved(u32 pc, std::array<u32, 2> after, u32 after_count, int since, u32& budget,
+		std::vector<std::pair<u32, u64>>& guards)
+	{
+		for (;;)
+		{
+			if (since >= 4)
+				return false;
+			if (!budget)
+				return true;
+			budget--;
+			pc &= VU1_PROGMASK;
+			u32 lower, upper;
+			std::memcpy(&lower, VU1.Micro + pc, 4);
+			std::memcpy(&upper, VU1.Micro + pc + 4, 4);
+			guards.emplace_back(pc, lower | (u64(upper) << 32));
+			if (upper & 0x58000000)
+				return true;
+			const bool immediate = upper & 0x80000000;
+			_VURegsNum uregs{}, lregs{};
+			const u32 saved_code = VU1.code;
+			VU1.code = upper;
+			VU1regs_UPPER_OPCODE[upper & 0x3f](&uregs);
+			if (!immediate)
+			{
+				VU1.code = lower;
+				VU1regs_LOWER_OPCODE[lower >> 25](&lregs);
+			}
+			VU1.code = saved_code;
+			if ((uregs.VIread | lregs.VIread) & ((1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG)))
+				return true;
+			if (since < 1 && (((uregs.VIwrite | lregs.VIwrite) & (1 << REG_STATUS_FLAG)) ||
+								 (lregs.pipe == VUPIPE_FDIV && lregs.cycles)))
+				return true;
+			const Lower op = immediate ? Lower::Unsupported : DecodeLower(lower);
+			if (IsRegisterBranch(op))
+				return true;
+			const bool branch = op == Lower::Branch || IsIntegerBranch(op);
+			if (branch && after_count)
+				return true;
+			if (since < 0 && uregs.pipe == VUPIPE_FMAC && UpdatesMacFlags(upper))
+				since = 0;
+			if (since >= 0)
+				since++;
+			if (after_count)
+			{
+				if (after_count == 2 && FlagsObserved(after[1], {}, 0, since, budget, guards))
+					return true;
+				pc = after[0];
+				after_count = 0;
+				continue;
+			}
+			if (branch)
+			{
+				const s32 displacement = (static_cast<s32>(lower << 21) >> 21) * 8;
+				after = {(pc + 8 + displacement) & VU1_PROGMASK, pc + 16};
+				after_count = op == Lower::Branch ? 1 : 2;
+			}
+			pc += 8;
+		}
+	}
+
+	// Under the VU flag hack, whether the exits after pair `i` of a deferred
+	// region have to publish exact flags: its untaken integer branch exit
+	// and/or the region's end. If not, the block keeps the pairs that decided
+	// it as guards. Needs proper testing across more games.
+	bool ExitFlagsObserved(Block& block, u32 i, bool untaken, bool region_end)
+	{
+		constexpr u32 LookaheadPairs = 64;
+		const auto& ins = block.instructions[i];
+		if (ins.upper & 0x40000000)
+			return true;
+		std::vector<std::pair<u32, u64>> guards;
+		u32 budget = LookaheadPairs;
+		if (untaken && FlagsObserved(ins.pc + 8, {}, 0, -1, budget, guards))
+			return true;
+		if (region_end)
+		{
+			const Lower op = (ins.upper & 0x80000000) ? Lower::Unsupported : DecodeLower(ins.lower);
+			std::array<u32, 2> after{};
+			u32 after_count = 0;
+			u32 next = block.next_pc[i];
+			if (block.delay[i])
+			{
+				const auto& branch = block.instructions[i - 1];
+				if (!(branch.upper & 0x80000000) && IsRegisterBranch(DecodeLower(branch.lower)))
+					return true;
+			}
+			else if (IsRegisterBranch(op))
+				return true;
+			else if (op == Lower::Branch || IsIntegerBranch(op))
+			{
+				// The trace follows the taken edge; with no delay pair in the
+				// block, both edges leave through this exit.
+				const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+				after = {(ins.pc + 8 + displacement) & VU1_PROGMASK, ins.pc + 16};
+				after_count = op == Lower::Branch || i + 1 < block.count ? 1 : 2;
+			}
+			budget = LookaheadPairs;
+			if (FlagsObserved(next, after, after_count, -1, budget, guards))
+				return true;
+		}
+		for (const auto& [pc, words] : guards)
+		{
+			auto& ranges = block.guard_ranges;
+			if (!ranges.empty() && ranges.back().pc + ranges.back().count * 8 == pc)
+				ranges.back().count++;
+			else
+				ranges.push_back({pc, static_cast<u32>(block.guard_words.size() / 2), 1});
+			block.guard_words.push_back(static_cast<u32>(words));
+			block.guard_words.push_back(static_cast<u32>(words >> 32));
+		}
+		return false;
+	}
+
+	void EmitDeferredRegion(MacroAssembler& a, Block& block, u32 first, u32 end,
 		std::vector<std::unique_ptr<RegionBranchExit>>& branch_exits)
 	{
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
@@ -2617,7 +2755,10 @@ namespace
 		// Under the VU flag hack, a flag instruction that would be Raw computes no
 		// flags at all (Dead) unless a status reader later in the region can see
 		// its sticky bits. Sticky bits only reach the region's exit through the
-		// entries that computed them, like microVU's.
+		// entries that computed them, like microVU's. It also skips an exit's
+		// flags when nothing after it reads them first (ExitFlagsObserved); live
+		// entries whose sticky bits a status reader in the region still sees
+		// keep them.
 		// Needs proper testing across more games.
 		enum class Entry : u8
 		{
@@ -2632,6 +2773,9 @@ namespace
 			std::array<bool, MaxInstructions> flag_op{}, needed{}, scratch_full{};
 			int scratch = -1, latest = -1;
 			u32 count = 0, sticky_seen = 0;
+			const bool flag_hack = EmuConfig.Speedhacks.vuFlagHack;
+			// [first, count) entries live at exits whose flags nothing reads.
+			std::vector<std::pair<u32, u32>> relaxed_live;
 			const auto observe_latest = [&]() {
 				if (latest >= 0)
 					needed[latest] = true;
@@ -2662,17 +2806,27 @@ namespace
 				if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles && scratch >= 0)
 					scratch_full[scratch] = true;
 				const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
-				if ((integer_branch && i + 1 < block.count) || i + 1 == end)
+				const bool untaken = integer_branch && i + 1 < block.count;
+				if (untaken || i + 1 == end)
 				{
-					observe_latest();
 					const u32 live = plan.remaining + HasFmac(ins);
-					for (u32 k = count >= live ? count - live : 0; k < count; k++)
-						needed[k] = true;
-					if (scratch >= 0)
-						scratch_full[scratch] = true;
+					if (flag_hack && !ExitFlagsObserved(block, i, untaken, i + 1 == end))
+						relaxed_live.emplace_back(count >= live ? count - live : 0, count);
+					else
+					{
+						observe_latest();
+						for (u32 k = count >= live ? count - live : 0; k < count; k++)
+							needed[k] = true;
+						if (scratch >= 0)
+							scratch_full[scratch] = true;
+					}
 				}
 			}
-			const bool flag_hack = EmuConfig.Speedhacks.vuFlagHack;
+			// A Raw entry retiring after the exit would take its sticky bits along.
+			for (const auto& [from, to] : relaxed_live)
+				for (u32 k = from; k < to; k++)
+					if (flag_op[k] && k < sticky_seen)
+						needed[k] = true;
 			for (u32 k = 0; k < count; k++)
 				if (needed[k] && source[k] >= 0)
 					scratch_full[source[k]] = true;
@@ -2773,6 +2927,7 @@ namespace
 				slots[slot].writer = i;
 				slots[slot].issue_cycle = elapsed;
 				slots[slot].order = issued - 1;
+				slots[slot].exact = kind == Entry::Normal;
 			}
 			if (integer_branch && i + 1 < block.count)
 			{
@@ -3405,6 +3560,9 @@ namespace
 	{
 		if (!block.count)
 			return std::memcmp(block.words.data(), VU1.Micro + pc, 8) == 0;
+		for (const auto& range : block.guard_ranges)
+			if (std::memcmp(block.guard_words.data() + range.first * 2, VU1.Micro + range.pc, range.count * 8) != 0)
+				return false;
 		// Every pair advances at least one cycle. A short call cannot reach the
 		// remainder of a connected trace; validate that remainder when it can.
 		for (const auto& range : block.ranges)
