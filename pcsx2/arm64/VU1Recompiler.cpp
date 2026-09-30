@@ -45,6 +45,14 @@ namespace
 		VRegister Host(u32 reg) const { return VRegister(8 + slots[reg], 128); }
 	};
 
+	enum FdivStatic : u8
+	{
+		FdivUnknown, // check at runtime
+		FdivIdle, // nothing in the slot
+		FdivBusy, // in the slot, not due yet
+		FdivRetires, // due at this pair's cycle
+	};
+
 	struct RetirementSchedule
 	{
 		u8 cycles = 0; // Zero means that incoming timing is still unknown.
@@ -57,6 +65,9 @@ namespace
 		// so this pair has to retire it itself instead of leaving that to the
 		// generic per-pair preparation it is replacing.
 		bool fdiv_pending = false;
+		// What the FDIV slot does at this pair's start when the analysis knows
+		// the cycles since the divide issued (FdivStatic). Deferred regions use it.
+		u8 fdiv_static = 0;
 		// Likewise for ILW/ILWR results in the IALU pipe. Only integer branches
 		// stall on them, so every other pair keeps its timing and just drops
 		// the entries that are due (VUPipeline::FlushIALU).
@@ -1122,8 +1133,14 @@ namespace
 	// prepare stub covers. The interpreter retires the pipe (_vuTestPipes)
 	// between that stall and the new op, so the old result must reach Q
 	// before this one replaces it.
+	// Set by EmitDeferredRegion around a pair whose FDIV slot is known to be
+	// empty when its body runs (FdivStatic), so there is no stall to check.
+	bool s_fdiv_idle = false;
+
 	void EmitFDIVStall(MacroAssembler& a)
 	{
+		if (s_fdiv_idle)
+			return;
 		Label not_pending;
 		a.Ldr(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
 		a.Cbz(w9, &not_pending);
@@ -2135,6 +2152,8 @@ namespace
 		// remaining cycles plus one.
 		int elapsed = 0;
 		int fdiv_due = block.profiled && block.incoming.Fdiv() ? static_cast<int>(block.incoming.Fdiv()) - 1 : -1;
+		// Whether the pending divide has come due at a pair with a known cycle.
+		bool fdiv_retired = false;
 		block.known_prefix = block.count;
 		for (u32 i = 0; i < block.count; i++)
 		{
@@ -2238,6 +2257,24 @@ namespace
 			// least one cycle.
 			if (!block.profiled && ((fdiv_op && i < 13) || (efu_op && i < 54)))
 				cycles = -1;
+			// The slot as this pair starts, before its own issue. A scheduled pair
+			// with no divide of the block's (or the profile's) in reach finds it
+			// empty: readiness admitted the schedule only with an idle slot.
+			u8 fdiv_static = FdivUnknown;
+			if (i >= fdiv_ready)
+				fdiv_static = FdivIdle;
+			else if (elapsed >= 0 && fdiv_due >= 0 && cycles > 0)
+			{
+				if (fdiv_retired)
+					fdiv_static = FdivIdle;
+				else if (elapsed + cycles >= fdiv_due)
+				{
+					fdiv_static = FdivRetires;
+					fdiv_retired = true;
+				}
+				else
+					fdiv_static = FdivBusy;
+			}
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
 			// Divides are frequent enough in transform code that excluding their whole
@@ -2246,6 +2283,7 @@ namespace
 			// (see EmitScheduledPrepare and EmitDeferredRegion).
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
 			{
+				fdiv_retired = false;
 				fdiv_ready = i + ins.lregs.cycles + 1;
 				// _vuFDIVAdd stamps the cycle the pair ends on.
 				fdiv_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
@@ -2263,6 +2301,7 @@ namespace
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
+				plan.fdiv_static = fdiv_static;
 				plan.ialu_pending = i < integer_ready;
 				// Deferred regions do not issue into the IALU pipe.
 				if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
@@ -2449,6 +2488,23 @@ namespace
 	// due, which is the common case even inside a divide's latency. `status`
 	// holds the status flag; it is loaded and stored around the merge unless
 	// the caller keeps it in that register (deferred regions keep it in w25).
+	// Retires the FDIV slot, known to be due: Q and the status flag's D/I bits.
+	void EmitFDIVRetire(MacroAssembler& a, const Register& status, bool in_memory)
+	{
+		constexpr size_t offset = offsetof(VURegs, fdiv);
+		a.Str(wzr, Field(offset + offsetof(fdivPipe, enable)));
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, reg)));
+		a.Str(w11, Field(VI(REG_Q)));
+		if (in_memory)
+			a.Ldr(status, Field(VI(REG_STATUS_FLAG)));
+		a.And(status, status, 0xfcf);
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, statusflag)));
+		a.And(w11, w11, 0xc30);
+		a.Orr(status, status, w11);
+		if (in_memory)
+			a.Str(status, Field(VI(REG_STATUS_FLAG)));
+	}
+
 	void EmitFDIVSlotRetire(MacroAssembler& a, const Register& status, bool in_memory)
 	{
 		Label end;
@@ -2979,10 +3035,13 @@ namespace
 			}
 			if (mac_from >= 0)
 				a.Umov(w28, VRegister(28 + mac_from, 128).V4S(), 0);
-			if (plan.fdiv_pending || plan.ialu_pending)
+			const bool fdiv_check = plan.fdiv_pending && plan.fdiv_static == FdivUnknown;
+			if (fdiv_check || plan.ialu_pending)
 				FlushCycles(a, state);
-			if (plan.fdiv_pending)
+			if (fdiv_check)
 				EmitFDIVSlotRetire(a, w25, false);
+			else if (plan.fdiv_pending && plan.fdiv_static == FdivRetires)
+				EmitFDIVRetire(a, w25, false);
 			if (plan.ialu_pending)
 				EmitIALURetire(a);
 			// Only an integer write or branch can inspect/reset the backup
@@ -3018,7 +3077,9 @@ namespace
 			// Divides (and WAITQ) stall on and record the cycle.
 			if (ins.lregs.pipe != VUPIPE_FMAC && ins.lregs.pipe != VUPIPE_NONE && ins.lregs.pipe != VUPIPE_BRANCH)
 				FlushCycles(a, state);
+			s_fdiv_idle = plan.fdiv_static == FdivIdle || plan.fdiv_static == FdivRetires;
 			EmitPair(a, block.cache, ins, false);
+			s_fdiv_idle = false;
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;
 			s_discard_flags = false;
