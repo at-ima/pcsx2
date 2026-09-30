@@ -68,6 +68,11 @@ namespace
 		// What the FDIV slot does at this pair's start when the analysis knows
 		// the cycles since the divide issued (FdivStatic). Deferred regions use it.
 		u8 fdiv_static = 0;
+		// The same for the EFU slot (ESADD..ERSQRT, retiring into P). An EFU op
+		// or WAITP stalls until one cycle before the entry is due and retires
+		// it (_vuTestEFUStalls), so there it goes as soon as it is enabled.
+		bool efu_pending = false;
+		u8 efu_static = 0;
 		// Likewise for ILW/ILWR results in the IALU pipe. Only integer branches
 		// stall on them, so every other pair keeps its timing and just drops
 		// the entries that are due (VUPipeline::FlushIALU).
@@ -91,7 +96,8 @@ namespace
 	};
 	// Packed, since Execute() captures and compares one on every dispatch:
 	// the entry count (3 bits) and the divide (6 bits), then 22 bits for each
-	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56.
+	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56
+	// and the EFU pipe in bits 57-62.
 	struct IncomingProfile
 	{
 		u64 words[2] = {};
@@ -102,8 +108,10 @@ namespace
 		// Pairs an incoming ILW/ILWR result may still be pending; 0 if the IALU
 		// pipe is empty.
 		u32 Ialu() const { return (words[0] >> 53) & 15; }
+		// Pairs the incoming EFU entry may still be pending; 0 if none.
+		u32 Efu() const { return (words[0] >> 57) & 63; }
 		static u32 Shift(u32 k) { return k < 2 ? 9 + 22 * k : 22 * (k - 2); }
-		void Set(u32 count, u32 fdiv, u32 ialu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53); }
+		void Set(u32 count, u32 fdiv, u32 ialu, u32 efu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53) | (u64(efu) << 57); }
 		void SetFmac(u32 k, const IncomingFmac& e)
 		{
 			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) | (e.xyzwlower << 17);
@@ -1216,8 +1224,13 @@ namespace
 	// since every EFU-issuing op immediately overwrites the entry's Cycle right
 	// after anyway (WAITP leaves it disabled instead); mutate efu.Cycle to
 	// match exactly, needs proper testing right at the cycle-wrap boundary.
+	// Set by EmitDeferredRegion: its pairs retire the EFU slot before the body.
+	bool s_efu_idle = false;
+
 	void EmitEFUStall(MacroAssembler& a)
 	{
+		if (s_efu_idle)
+			return;
 		Label not_pending;
 		a.Ldr(w9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
 		a.Cbz(w9, &not_pending);
@@ -2155,7 +2168,10 @@ namespace
 			incoming[k] = block.incoming.Fmac(k);
 			phantom_ages[k] = incoming[k].age;
 		}
-		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0, efu_ready = 0;
+		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0;
+		u32 efu_ready = block.profiled ? block.incoming.Efu() : 0;
+		int efu_due = block.profiled && block.incoming.Efu() ? static_cast<int>(block.incoming.Efu()) - 1 : -1;
+		bool efu_retired = false;
 		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
 		// Cycles from block entry to the current pair, while every advance so
 		// far is known, and the cycle on that scale at which the pending divide
@@ -2262,7 +2278,7 @@ namespace
 			if (fdiv_op && i < fdiv_ready)
 				cycles = (cycles > 0 && elapsed >= 0 && fdiv_due >= 0) ? std::max(cycles, fdiv_due - elapsed) : -1;
 			if (efu_op && i < efu_ready)
-				cycles = -1;
+				cycles = (cycles > 0 && elapsed >= 0 && efu_due >= 0) ? std::max(cycles, efu_due - 1 - elapsed) : -1;
 			// An unprofiled block may be entered with a divide (up to 13 cycles)
 			// or an EFU operation (up to 54) in flight. Each pair advances at
 			// least one cycle.
@@ -2286,6 +2302,21 @@ namespace
 				else
 					fdiv_static = FdivBusy;
 			}
+			u8 efu_static = FdivUnknown;
+			if (i >= efu_ready)
+				efu_static = FdivIdle;
+			else if (elapsed >= 0 && efu_due >= 0 && cycles > 0)
+			{
+				if (efu_retired)
+					efu_static = FdivIdle;
+				else if (elapsed + cycles >= efu_due - (efu_op ? 1 : 0))
+				{
+					efu_static = FdivRetires;
+					efu_retired = true;
+				}
+				else
+					efu_static = FdivBusy;
+			}
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
 				integer_ready = i + 5;
 			// Divides are frequent enough in transform code that excluding their whole
@@ -2299,20 +2330,27 @@ namespace
 				// _vuFDIVAdd stamps the cycle the pair ends on.
 				fdiv_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
 			}
-			// The EFU pipe's single slot (ESADD..EEXP, retiring into P) is rare enough
-			// that it keeps the simpler treatment: stay generic for its full latency.
+			// The EFU slot the same way: Burnout 3's lighting loops keep an EFU op in
+			// flight nearly all the time. Needs proper testing across games.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
+			{
+				efu_retired = false;
 				efu_ready = i + ins.lregs.cycles + 1;
+				efu_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
+			}
 			if (cycles <= 0 && block.known_prefix == block.count)
 				block.known_prefix = i;
 			// Without a profile the first seven pairs stay generic: three whose
 			// stalls depend on the unknown incoming entries, then four for the
 			// ages of their producers to become known.
-			if ((block.profiled || i >= 7) && cycles > 0 && i >= efu_ready)
+			if ((block.profiled || i >= 7) && cycles > 0)
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
 				plan.fdiv_static = fdiv_static;
+				// Before this pair's own issue moved efu_ready.
+				plan.efu_pending = efu_static != FdivIdle;
+				plan.efu_static = efu_static;
 				plan.ialu_pending = i < integer_ready;
 				// Deferred regions do not issue into the IALU pipe.
 				if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
@@ -2370,7 +2408,9 @@ namespace
 				// VU1 thread in region exits. EFU issues stay generic.
 				const bool waitq = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Waitq;
 				const bool fdiv_issue = ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles;
-				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq && !fdiv_issue)
+				// EFU ops and WAITP likewise: the slot retires before the body.
+				const bool efu_issue = ins.lregs.pipe == VUPIPE_EFU;
+				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq && !fdiv_issue && !efu_issue)
 					plan.cycles = 0;
 				// Flag, Q and P readers stay in a region, which publishes the
 				// status and MAC flags it keeps in registers before them. An
@@ -2407,7 +2447,7 @@ namespace
 	// flight there is the block's own or the profiled incoming one: an in-block
 	// divide stalls until any earlier one retires, and every later pair that
 	// does not retire the slot is past that divide's latency.
-	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false, bool ialu_pending = false)
+	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false, bool ialu_pending = false, bool efu_pending = false)
 	{
 		// Bit 0 validates incoming FMAC timing and excludes callbacks. Bit 1
 		// additionally permits scheduled execution once special queues drain.
@@ -2418,6 +2458,7 @@ namespace
 				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount)})
 		{
 			if ((fdiv_pending && offset == offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)) ||
+				(efu_pending && offset == offsetof(VURegs, efu) + offsetof(efuPipe, enable)) ||
 				(ialu_pending && offset == offsetof(VURegs, ialucount)))
 				continue;
 			a.Ldr(w9, Field(offset));
@@ -2499,6 +2540,32 @@ namespace
 	// due, which is the common case even inside a divide's latency. `status`
 	// holds the status flag; it is loaded and stored around the merge unless
 	// the caller keeps it in that register (deferred regions keep it in w25).
+	// Retires the EFU slot into P: when due at x26, or (`stall`) whenever it is
+	// enabled, for the EFU op or WAITP that stalls on it; `known` skips the
+	// checks for a slot known to be due.
+	void EmitEFUSlotRetire(MacroAssembler& a, bool stall, bool known)
+	{
+		Label end;
+		constexpr size_t offset = offsetof(VURegs, efu);
+		if (!known)
+		{
+			a.Ldr(w11, Field(offset + offsetof(efuPipe, enable)));
+			a.Cbz(w11, &end);
+			if (!stall)
+			{
+				a.Ldr(x11, Field(offset + offsetof(efuPipe, sCycle)));
+				a.Ldr(w12, Field(offset + offsetof(efuPipe, Cycle)));
+				a.Sub(x11, x26, x11);
+				a.Cmp(x11, x12);
+				a.B(lo, &end);
+			}
+		}
+		a.Str(wzr, Field(offset + offsetof(efuPipe, enable)));
+		a.Ldr(w11, Field(offset + offsetof(efuPipe, reg)));
+		a.Str(w11, Field(VI(REG_P)));
+		a.Bind(&end);
+	}
+
 	// Retires the FDIV slot, known to be due: Q and the status flag's D/I bits.
 	void EmitFDIVRetire(MacroAssembler& a, const Register& status, bool in_memory)
 	{
@@ -2610,6 +2677,8 @@ namespace
 		// both merge into VI[REG_STATUS_FLAG].
 		if (plan.fdiv_pending)
 			EmitFDIVSlotRetire(a, w10, true);
+		if (plan.efu_pending)
+			EmitEFUSlotRetire(a, block.instructions[index].lregs.pipe == VUPIPE_EFU, false);
 		if (plan.ialu_pending)
 			EmitIALURetire(a);
 		// Needs proper testing across more games.
@@ -3062,12 +3131,16 @@ namespace
 			if (mac_from >= 0)
 				a.Umov(w28, VRegister(28 + mac_from, 128).V4S(), 0);
 			const bool fdiv_check = plan.fdiv_pending && plan.fdiv_static == FdivUnknown;
-			if (fdiv_check || plan.ialu_pending)
+			const bool efu_stall = ins.lregs.pipe == VUPIPE_EFU;
+			const bool efu_check = plan.efu_pending && plan.efu_static == FdivUnknown && !efu_stall;
+			if (fdiv_check || efu_check || plan.ialu_pending)
 				FlushCycles(a, state);
 			if (fdiv_check)
 				EmitFDIVSlotRetire(a, w25, false);
 			else if (plan.fdiv_pending && plan.fdiv_static == FdivRetires)
 				EmitFDIVRetire(a, w25, false);
+			if (plan.efu_pending && plan.efu_static != FdivBusy)
+				EmitEFUSlotRetire(a, efu_stall, plan.efu_static == FdivRetires);
 			if (plan.ialu_pending)
 				EmitIALURetire(a);
 			// Only an integer write or branch can inspect/reset the backup
@@ -3104,10 +3177,13 @@ namespace
 			if (ins.lregs.pipe != VUPIPE_FMAC && ins.lregs.pipe != VUPIPE_NONE && ins.lregs.pipe != VUPIPE_BRANCH)
 				FlushCycles(a, state);
 			s_fdiv_idle = plan.fdiv_static == FdivIdle || plan.fdiv_static == FdivRetires;
+			// An EFU op or WAITP retired the slot above.
+			s_efu_idle = true;
 			s_div_clean_scratch = div_clean[i];
 			EmitPair(a, block.cache, ins, false);
 			s_div_clean_scratch = false;
 			s_fdiv_idle = false;
+			s_efu_idle = false;
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;
 			s_discard_flags = false;
@@ -3450,7 +3526,7 @@ namespace
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || region_start))
 				{
-					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending, block->schedule[i].ialu_pending);
+					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending, block->schedule[i].ialu_pending, block->schedule[i].efu_pending);
 					readiness_checked = true;
 				}
 				if (region_start)
@@ -3690,11 +3766,19 @@ namespace
 	// divide is admitted and described instead. Anything else stays unprofiled.
 	bool CaptureProfile(IncomingProfile& profile)
 	{
-		if (VU1.xgkickenable || VU1.efu.enable)
+		if (VU1.xgkickenable)
 			return false;
 		const u64 cycle = VU1.cycle;
 		if (cycle >= ~u64(0) - (MaxInstructions * 4 + 4))
 			return false;
+		u32 efu = 0;
+		if (VU1.efu.enable)
+		{
+			if (VU1.efu.sCycle > cycle || VU1.efu.Cycle > 60)
+				return false;
+			const u64 ready = VU1.efu.sCycle + VU1.efu.Cycle;
+			efu = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
+		}
 		u32 fdiv = 0;
 		if (VU1.fdiv.enable)
 		{
@@ -3725,7 +3809,7 @@ namespace
 		const u32 count = VU1.fmaccount;
 		if (count > 4 || VU1.fmacreadpos > 3 || VU1.fmacwritepos != ((VU1.fmacreadpos + count) & 3))
 			return false;
-		profile.Set(count, fdiv, ialu);
+		profile.Set(count, fdiv, ialu, efu);
 		u64 previous = 0;
 		for (u32 k = 0; k < count; k++)
 		{

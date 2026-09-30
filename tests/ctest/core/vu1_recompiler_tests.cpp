@@ -4046,6 +4046,69 @@ TEST_F(VU1RecompilerTest, DividesInsideScheduledLoopsMatchEveryBudget)
 }
 
 
+TEST_F(VU1RecompilerTest, EfuOpsInsideScheduledLoopsMatchEveryBudget)
+{
+	// Pairs inside an EFU op's latency are scheduled and retire the slot into P
+	// themselves; an EFU op or WAITP stalls until one cycle before the entry is
+	// due and retires it. A loop keeps EFU ops in flight across its edge
+	// (profiled entries), mixed with MFP readers, divides and flag ops.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {0x3f800000, 0x40800000, 0x3e800000, 0x41200000, 0x3fc00000, 0x40400000, 0x42c80000, 0x3f000000};
+	constexpr u32 length = 40;
+	u32 random = 4711;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		CpuArm64VU1.Reset();
+		for (u32 i = 0; i < length; i++)
+		{
+			u32 upper = 0x2ff;
+			const u32 fd = 1 + next() % 8, fs = 1 + next() % 8, ft = 1 + next() % 8, dest = 1 + next() % 15;
+			const u32 kind = next() % 10;
+			if (kind < 6)
+				upper = (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | (kind < 2 ? 0x28 : kind < 4 ? 0x2c : 0x2a); // ADD/SUB/MUL
+			u32 lower = 0x8000033c;
+			const u32 op = next() % 24, fsf = next() % 4, lfs = 1 + next() % 8, lft = 9 + next() % 4;
+			if (op < 2)
+				lower = 0x800007bd | (fsf << 21) | (lfs << 11); // ERSQRT
+			else if (op < 3)
+				lower = 0x800007bc | (fsf << 21) | (lfs << 11); // ESQRT
+			else if (op < 4)
+				lower = 0x800007be | (fsf << 21) | (lfs << 11); // ERCPR
+			else if (op < 5)
+				lower = 0x8000073c | (lfs << 11); // ESADD
+			else if (op < 6)
+				lower = 0x8000077e | (lfs << 11); // ESUM
+			else if (op < 7)
+				lower = 0x800007bf; // WAITP
+			else if (op < 10)
+				lower = 0x8000067c | (dest << 21) | (lft << 16); // MFP into vf9-12
+			else if (op < 11)
+				lower = 0x800003bc | (fsf << 23) | (lfs << 16) | (lfs << 11); // DIV
+			if (i == length - 1)
+				lower = 0x40000000 | ((0 - length) & 0x7ff); // B to the top
+			Put(i * 8, upper, lower);
+		}
+		Put(length * 8, 0x2ff, 0x8000033c); // Delay slot
+		for (u32 budget : {1u, 7u, 23u, 64u, 150u, 400u, 1000u})
+		{
+			for (u32 run = 0; run < 2; run++)
+			{
+				SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget << " run=" << run);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = 1000;
+				for (u32 reg = 1; reg <= 8; reg++)
+					for (u32 lane = 0; lane < 4; lane++)
+						VU1.VF[reg].UL[lane] = values[(reg * 3 + lane + seed) % std::size(values)];
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, DivideAfterFssetPassesItsStickyBits)
 {
 	// A divide passes on the scratch's sticky D/I bits. After a flag instruction
