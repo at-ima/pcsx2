@@ -41,7 +41,7 @@ namespace
 	constexpr u32 Base = 0x10000;
 	constexpr u32 Data = 0x20000;
 	constexpr u32 Alias = Base + 0x4000;
-	constexpr u32 Stop = 0x0000000c; // SYSCALL ends the block before its side effects.
+	constexpr u32 Stop = 0x0000000d; // BREAK ends the block before its side effects.
 	constexpr u32 Immediate[] = {9, 10, 11, 12, 13, 14, 15, 25, 51}; // 51 = PREF
 	constexpr u32 Special[] = {0, 2, 3, 4, 6, 7, 10, 11, 15, 20, 22, 23, 33, 35, 36,
 		37, 38, 39, 42, 43, 45, 47, 56, 58, 59, 60, 62, 63}; // 15 = SYNC
@@ -1455,6 +1455,55 @@ TEST_F(EERecompilerTest, COP2InterpreterCallsKeepCachedRegisters)
 	program[2] = (33u << 0) | (2u << 21) | (1u << 16) | (4u << 11);
 	program[3] = Stop;
 	CompareWithVU0(3);
+}
+
+TEST_F(EERecompilerTest, InterpreterCallsMatchInterpreter)
+{
+	// SYSCALL, CACHE and COP0's MTC0/ERET/EI/DI call the interpreter handler
+	// from inside the block. MTC0 (except Config), EI and DI let the block go
+	// on with its cached GPRs; the rest end it with the pc the handler left.
+	constexpr u32 addiu_r2 = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5
+	constexpr u32 addu_r4 = (33u << 0) | (2u << 21) | (1u << 16) | (4u << 11); // ADDU r4, r2, r1
+	auto mtc0 = [](u32 rt, u32 rd) { return (16u << 26) | (4u << 21) | (rt << 16) | (rd << 11); };
+	constexpr u32 eret = 0x42000018, ei = 0x42000038, di = 0x42000039, syscall = 0x0000000c;
+	constexpr u32 cache = (47u << 26) | (1u << 21) | (0x1a << 16) | 0x40; // CACHE DHIN, 0x40(r1)
+	struct Case
+	{
+		std::array<u32, 6> words;
+		u32 count;
+	};
+	const Case cases[] = {
+		{{addiu_r2, mtc0(2, 14), ei, di, mtc0(3, 9), addu_r4}, 6}, // EPC, EI, DI, Count
+		{{addiu_r2, mtc0(2, 12), addu_r4, mtc0(5, 12), addu_r4, Stop}, 5}, // Status
+		{{addiu_r2, mtc0(2, 16), addu_r4, Stop}, 2}, // Config ends the block
+		{{addiu_r2, syscall, addu_r4, Stop}, 2},
+		{{addiu_r2, eret, addu_r4, Stop}, 2},
+		{{addiu_r2, cache, addu_r4, Stop}, 2},
+		{{mtc0(0, 25), mtc0(6, 25) | 1, mtc0(6, 25) | 3, addu_r4, Stop}, 4}, // MTPS, MTPC0, MTPC1
+	};
+	for (u32 index = 0; index < std::size(cases); index++)
+	{
+		for (u32 seed = 0; seed < 8; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "case=" << index << " seed=" << seed);
+			Init(seed);
+			cpuRegs.GPR.r[1].UD[0] = Data;
+			cpuRegs.GPR.n.v1.UD[0] = seed & 1 ? 0x05 : 0x7e; // RFU005 or an unknown call: plain exceptions
+			cpuRegs.CP0.n.Status.val = (seed & 2) ? 0x70030c13 : 0x00000002; // EXL set; ERL too for odd pairs
+			if (seed & 4)
+				cpuRegs.CP0.n.Status.val |= 4; // ERL
+			cpuRegs.CP0.n.EPC = Base + 0x40;
+			cpuRegs.CP0.n.ErrorEPC = Base + 0x80;
+			cpuRegs.CP0.n.Config = (seed & 1) << 18;
+			cpuRegs.GPR.r[5].UD[0] = 0x70030c13 ^ seed;
+			cpuRegs.GPR.r[6].UD[0] = 0x80000000 | seed;
+			std::copy(cases[index].words.begin(), cases[index].words.end(), program.begin());
+			Compare(cases[index].count);
+			if (HasFailure())
+				return;
+			program.fill(Stop);
+		}
+	}
 }
 
 TEST_F(EERecompilerTest, COP2SurroundingIntegerCodeStaysNative)

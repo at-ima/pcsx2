@@ -13,7 +13,7 @@ instruction or pair at a time, through the same architectural state:
 
 | Unit | Files | Setting | Still interpreted |
 | --- | --- | --- | --- |
-| EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, COP2 ops other than FMAC (called from blocks), BC2, MMIO/unmapped accesses |
+| EE | `EERecompiler.cpp`, `EECodeGenerator.cpp` | `EnableEE` | saturating and other MMI, COP1 DIV/SQRT/RSQRT and the ACC family, BC2, MMIO/unmapped accesses; COP2 ops other than FMAC, SYSCALL, CACHE and MTC0/ERET/EI/DI are interpreter handlers called from blocks |
 | IOP | `IopRecompiler.cpp`, `IopCodeGenerator.cpp` | `EnableIOP` | J (idle loops are skipped natively), GTE, LWL/LWR/SWL/SWR, SYSCALL/BREAK, RFE, code outside the 8 MiB RAM window |
 | VU0 micro mode | `VU0Recompiler.cpp`, `VU0Pipeline.cpp` | `EnableVU0` | JR/JALR/BAL, ISWR, MFP, RINIT/RGET/RNEXT/RXOR, the EFU pipe, E/M/D/T-bit pairs |
 | VU1 | `VU1Recompiler.cpp`, `VU1Pipeline.cpp` | `EnableVU1` | ISWR, RINIT/RGET/RNEXT/RXOR, EATAN*/ESIN/EEXP, nested branches, end-bit delay slots |
@@ -133,6 +133,18 @@ block's live registers: `x0`, `x1`, the GPR cache in `x2`-`x8`, `x14` and `lr`
 Only QMFC2/CFC2 write a GPR, and they drop just that one from the cache. BC2
 (rs == 8) is not modeled and still ends the block. A VU0 micro-mode program started from macro mode runs on the VU0
 provider described below.
+
+SYSCALL, CACHE and COP0's MTC0/ERET/EI/DI call their interpreter handlers
+from inside the block the same way, as `execI()` would: set `pc`/`code`, call,
+charge the instruction's cycles with the rest of the block. This replaces a
+dispatcher round trip, a failed block lookup and `execI()` per instruction;
+SotC's kernel runs SYSCALL, MTC0 and ERET about 200k times a second each.
+MTC0 (except Config), EI and DI only change COP0 state and schedule an event
+test, so the block goes on with its cached GPRs. SYSCALL and ERET change `pc`,
+MTC0 Config changes the cycle scale and CACHE can write memory back, so the
+block ends after them and returns with the `pc` the handler left. Cycles are
+charged at the scale the block was compiled with, which is what the
+interpreter uses for an MTC0 Config itself.
 
 Supported integer branches and jumps terminate the block. Their delay slot must
 be a supported, nontrapping integer instruction in the same page and block.
@@ -644,7 +656,7 @@ well.
 
 ## Known issues
 
-As of 2026-09-30, all 292 `core_test` tests pass.
+As of 2026-09-30, all 293 `core_test` tests pass.
 
 - **Fused multiply-adds are pinned in the interpreter.** The recompilers emit
   FMADD/FMSUB/FMLA/FMLS for VU MADD/MSUB/OPMSUB and the ESADD family, and for
