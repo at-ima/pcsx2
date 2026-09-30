@@ -2303,6 +2303,17 @@ void VMManager::Internal::Throttle(bool vsync_start)
 		return;
 	}
 
+#ifdef __APPLE__
+	// macOS lets a timer fire late by a share of its interval to coalesce
+	// wakeups: about a quarter in the foreground (2+ ms for a whole frame),
+	// more in the background. So sleeping to the deadline, or to 1 ms before
+	// it as below, overshoots or spins for up to ~2 ms on a full-power core.
+	// Instead sleep 60% of what is left, which lands short of the deadline,
+	// until under 100 us remain, and spin only that.
+	const u64 spin_ticks = GetTickFrequency() / 10000;
+	for (u64 now = GetCPUTicks(); now + spin_ticks < uExpectedEnd; now = GetCPUTicks())
+		Threading::SleepUntil(now + (uExpectedEnd - now) * 3 / 5);
+#else
 	// Conversion of delta from CPU ticks (microseconds) to milliseconds
 	const s32 msec = static_cast<s32>((sDeltaTime * -1000) / static_cast<s64>(GetTickFrequency()));
 
@@ -2313,6 +2324,7 @@ void VMManager::Internal::Throttle(bool vsync_start)
 	{
 		Threading::Sleep(msec - 1);
 	}
+#endif
 
 	// Conversion to milliseconds loses some precision; after sleeping off whole milliseconds,
 	// spin the thread without sleeping until we finally reach our expected end time.

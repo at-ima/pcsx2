@@ -222,19 +222,10 @@ void Threading::Sleep(int ms)
 
 void Threading::SleepUntil(u64 ticks)
 {
-	// This is definitely sub-optimal, but apparently clock_nanosleep() doesn't exist.
-	const s64 diff = static_cast<s64>(ticks - GetCPUTicks());
-	if (diff <= 0)
-		return;
-
-	const u64 nanos = (static_cast<u64>(diff) * static_cast<u64>(s_timebase_info.denom)) / static_cast<u64>(s_timebase_info.numer);
-	if (nanos == 0)
-		return;
-
-	struct timespec ts;
-	ts.tv_sec = nanos / 1000000000ULL;
-	ts.tv_nsec = nanos % 1000000000ULL;
-	nanosleep(&ts, nullptr);
+	// Ticks are mach_absolute_time() units, which mach_wait_until() takes
+	// directly, and it returns at once for a deadline in the past. Like
+	// nanosleep(), it can wake late by a share of the interval.
+	mach_wait_until(ticks);
 }
 
 std::vector<DarwinMisc::CPUClass> DarwinMisc::GetCPUClasses()
