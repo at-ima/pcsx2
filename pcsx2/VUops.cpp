@@ -357,6 +357,29 @@ static __fi float vuDouble(u32 f)
 }
 #endif
 
+// c + a*b and c - a*b. The ARM64 recompilers emit FMADD/FMSUB (FMLA/FMLS)
+// with a as the first multiplicand, which is what clang's -ffp-contract=fast
+// usually makes of the plain expressions too, but not always: the CI toolchain
+// did not fuse, and std::fma leaves the compiler free to negate b instead,
+// which flips the sign of a NaN propagated from a. Pin the instructions.
+#if defined(ARCH_ARM64)
+static __fi float vuMulAdd(float a, float b, float c)
+{
+	float r;
+	asm("fmadd %s0, %s1, %s2, %s3" : "=w"(r) : "w"(a), "w"(b), "w"(c));
+	return r;
+}
+static __fi float vuMulSub(float a, float b, float c)
+{
+	float r;
+	asm("fmsub %s0, %s1, %s2, %s3" : "=w"(r) : "w"(a), "w"(b), "w"(c));
+	return r;
+}
+#else
+static __fi float vuMulAdd(float a, float b, float c) { return c + a * b; }
+static __fi float vuMulSub(float a, float b, float c) { return c - a * b; }
+#endif
+
 static __fi float vuADD_TriAceHack(u32 a, u32 b)
 {
 	// On VU0 TriAce Games use ADDi and expects these bit-perfect results:
@@ -477,13 +500,13 @@ static __fi void ternaryMACNEON(VURegs* VU, VECTOR* dst, uint32x4_t rhs)
 	const float32x4_t acc = vuDoubleNEON(vld1q_u32(VU->ACC.UL));
 	const float32x4_t a = vuDoubleNEON(vld1q_u32(VU->VF[_Fs_].UL));
 	const float32x4_t b = vuDoubleNEON(rhs);
-	// Use the scalar expression's multiply and add/subtract operations, with the
-	// same compiler contraction policy (do not explicitly introduce fused intrinsics).
-	const float32x4_t product = vmulq_f32(a, b);
+	// Pinned like vuMulAdd()/vuMulSub() in the scalar path.
+	float32x4_t result = acc;
 	if constexpr (Fn == _vuOpMADD)
-		storeMACNEON(VU, dst, vaddq_f32(acc, product));
+		asm("fmla %0.4s, %1.4s, %2.4s" : "+w"(result) : "w"(a), "w"(b));
 	else
-		storeMACNEON(VU, dst, vsubq_f32(acc, product));
+		asm("fmls %0.4s, %1.4s, %2.4s" : "+w"(result) : "w"(a), "w"(b));
+	storeMACNEON(VU, dst, result);
 }
 #endif
 
@@ -705,7 +728,7 @@ static __fi void applyTernaryMACOpBroadcast(VURegs* VU, u32 bc)
 
 static __fi float _vuOpMADD(u32 acc, u32 fs, u32 ft)
 {
-	return vuDouble(acc) + vuDouble(fs) * vuDouble(ft);
+	return vuMulAdd(vuDouble(fs), vuDouble(ft), vuDouble(acc));
 }
 
 static __fi void _vuMADD(VURegs* VU)
@@ -744,7 +767,7 @@ static __fi void _vuMADDAw(VURegs* VU) { vuMADDAbc(VU, VU->VF[_Ft_].i.w); }
 
 static __fi float _vuOpMSUB(u32 acc, u32 fs, u32 ft)
 {
-	return vuDouble(acc) - vuDouble(fs) * vuDouble(ft);
+	return vuMulSub(vuDouble(fs), vuDouble(ft), vuDouble(acc));
 }
 
 static __fi void _vuMSUB(VURegs* VU)
@@ -865,9 +888,9 @@ static __fi void _vuOPMSUB(VURegs* VU)
 	fsy = vuDouble(VU->VF[_Fs_].i.y);
 	fsz = vuDouble(VU->VF[_Fs_].i.z);
 
-	dst->i.x = VU_MACx_UPDATE(VU, vuDouble(VU->ACC.i.x) - fsy * ftz);
-	dst->i.y = VU_MACy_UPDATE(VU, vuDouble(VU->ACC.i.y) - fsz * ftx);
-	dst->i.z = VU_MACz_UPDATE(VU, vuDouble(VU->ACC.i.z) - fsx * fty);
+	dst->i.x = VU_MACx_UPDATE(VU, vuMulSub(fsy, ftz, vuDouble(VU->ACC.i.x)));
+	dst->i.y = VU_MACy_UPDATE(VU, vuMulSub(fsz, ftx, vuDouble(VU->ACC.i.y)));
+	dst->i.z = VU_MACz_UPDATE(VU, vuMulSub(fsx, fty, vuDouble(VU->ACC.i.z)));
 	VU_STAT_UPDATE(VU);
 }
 
@@ -1651,16 +1674,23 @@ static __ri void _vuWAITP(VURegs* VU)
 {
 }
 
+// fs.x^2 + fs.y^2 + fs.z^2, evaluated left to right.
+static __fi float vuSquareSum(VURegs* VU)
+{
+	const float x = vuDouble(VU->VF[_Fs_].i.x), y = vuDouble(VU->VF[_Fs_].i.y), z = vuDouble(VU->VF[_Fs_].i.z);
+	return vuMulAdd(z, z, vuMulAdd(y, y, x * x));
+}
+
 static __ri void _vuESADD(VURegs* VU)
 {
-	float p = vuDouble(VU->VF[_Fs_].i.x) * vuDouble(VU->VF[_Fs_].i.x) + vuDouble(VU->VF[_Fs_].i.y) * vuDouble(VU->VF[_Fs_].i.y) + vuDouble(VU->VF[_Fs_].i.z) * vuDouble(VU->VF[_Fs_].i.z);
+	float p = vuSquareSum(VU);
 
 	VU->p.F = p;
 }
 
 static __ri void _vuERSADD(VURegs* VU)
 {
-	float p = (vuDouble(VU->VF[_Fs_].i.x) * vuDouble(VU->VF[_Fs_].i.x)) + (vuDouble(VU->VF[_Fs_].i.y) * vuDouble(VU->VF[_Fs_].i.y)) + (vuDouble(VU->VF[_Fs_].i.z) * vuDouble(VU->VF[_Fs_].i.z));
+	float p = vuSquareSum(VU);
 
 	if (p != 0.0)
 		p = 1.0f / p;
@@ -1670,7 +1700,7 @@ static __ri void _vuERSADD(VURegs* VU)
 
 static __ri void _vuELENG(VURegs* VU)
 {
-	float p = vuDouble(VU->VF[_Fs_].i.x) * vuDouble(VU->VF[_Fs_].i.x) + vuDouble(VU->VF[_Fs_].i.y) * vuDouble(VU->VF[_Fs_].i.y) + vuDouble(VU->VF[_Fs_].i.z) * vuDouble(VU->VF[_Fs_].i.z);
+	float p = vuSquareSum(VU);
 
 	if (p >= 0)
 	{
@@ -1681,7 +1711,7 @@ static __ri void _vuELENG(VURegs* VU)
 
 static __ri void _vuERLENG(VURegs* VU)
 {
-	float p = vuDouble(VU->VF[_Fs_].i.x) * vuDouble(VU->VF[_Fs_].i.x) + vuDouble(VU->VF[_Fs_].i.y) * vuDouble(VU->VF[_Fs_].i.y) + vuDouble(VU->VF[_Fs_].i.z) * vuDouble(VU->VF[_Fs_].i.z);
+	float p = vuSquareSum(VU);
 
 	if (p >= 0)
 	{

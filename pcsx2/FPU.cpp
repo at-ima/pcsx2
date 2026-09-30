@@ -277,7 +277,14 @@ void MADD_S() {
 }
 
 void MADDA_S() {
+#if defined(ARCH_ARM64)
+	// Fused with fs first, as the ARM64 recompiler emits it, whatever the
+	// compiler would contract (see vuMulAdd() in VUops.cpp).
+	const float fs = fpuDouble( _FsValUl_ ), ft = fpuDouble( _FtValUl_ );
+	asm("fmadd %s0, %s1, %s2, %s0" : "+w"(_FAValf_) : "w"(fs), "w"(ft));
+#else
 	_FAValf_ += fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+#endif
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
@@ -310,7 +317,12 @@ void MSUB_S() {
 }
 
 void MSUBA_S() {
+#if defined(ARCH_ARM64)
+	const float fs = fpuDouble( _FsValUl_ ), ft = fpuDouble( _FtValUl_ );
+	asm("fmsub %s0, %s1, %s2, %s0" : "+w"(_FAValf_) : "w"(fs), "w"(ft));
+#else
 	_FAValf_ -= fpuDouble( _FsValUl_ ) * fpuDouble( _FtValUl_ );
+#endif
 	if (checkOverflow( _FAValUl_, FPUflagO | FPUflagSO)) return;
 	checkUnderflow( _FAValUl_, FPUflagU | FPUflagSU);
 }
