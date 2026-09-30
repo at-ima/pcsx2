@@ -133,13 +133,18 @@ namespace
 		}
 
 		// `ignored_status`: status flag bits the native result may differ in.
-		void Compare(u32 cycles, u32 ignored_status = 0)
+		// `runs`: Execute() calls of `cycles` each. `loose_flags`: the status and MAC
+		// flags (and the FMAC entries' copies) may differ, as the flag hack allows
+		// at exits where nothing reads them. What programs read through them, and
+		// the clip flag, still has to match.
+		void Compare(u32 cycles, u32 ignored_status = 0, u32 runs = 1, bool loose_flags = false)
 		{
 			const VURegs initial0 = VU0, initial1 = VU1;
 			const u32 vifstat = vif1Regs.stat._u32;
 			std::array<u8, VU1_MEMSIZE> initial_memory;
 			std::memcpy(initial_memory.data(), VU1.Mem, initial_memory.size());
-			CpuIntVU1.Execute(cycles);
+			for (u32 run = 0; run < runs; run++)
+				CpuIntVU1.Execute(cycles);
 			const VURegs expected0 = VU0, expected1 = VU1;
 			const u32 expected_vifstat = vif1Regs.stat._u32;
 			std::array<u8, VU1_MEMSIZE> expected_memory;
@@ -148,7 +153,24 @@ namespace
 			VU1 = initial1;
 			vif1Regs.stat._u32 = vifstat;
 			std::memcpy(VU1.Mem, initial_memory.data(), initial_memory.size());
-			CpuArm64VU1.Execute(cycles);
+			for (u32 run = 0; run < runs; run++)
+				CpuArm64VU1.Execute(cycles);
+			if (loose_flags)
+			{
+				VU1.VI[REG_STATUS_FLAG] = expected1.VI[REG_STATUS_FLAG];
+				VU1.VI[REG_MAC_FLAG] = expected1.VI[REG_MAC_FLAG];
+				VU1.statusflag = expected1.statusflag;
+				VU1.macflag = expected1.macflag;
+				for (u32 k = 0; k < std::min(VU1.fmaccount, expected1.fmaccount); k++)
+				{
+					fmacPipe& entry = VU1.fmac[(VU1.fmacreadpos + k) & 3];
+					const fmacPipe& reference = expected1.fmac[(expected1.fmacreadpos + k) & 3];
+					entry.statusflag = reference.statusflag;
+					entry.macflag = reference.macflag;
+					if (!(entry.flagreg & (1 << REG_CLIP_FLAG)))
+						entry.clipflag = reference.clipflag;
+				}
+			}
 			ASSERT_EQ(VU1.cycle, expected1.cycle);
 			ASSERT_EQ(VU1.VI[REG_TPC].UL, expected1.VI[REG_TPC].UL);
 			ASSERT_EQ(std::memcmp(VU1.VF, expected1.VF, sizeof(VU1.VF)), 0);
@@ -4021,9 +4043,10 @@ TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
 TEST_F(VU1RecompilerTest, FlagHackDropsOnlyUnreadStickyBits)
 {
 	// Under the VU flag hack, deferred regions skip the flags of FMAC ops nothing
-	// reads, sticky status bits included, like microVU. Everything else,
-	// including the non-sticky status bits, MAC flag and flags that FSAND/FMAND
-	// read, still has to match the interpreter.
+	// reads, sticky status bits included, like microVU, and an exit publishes
+	// flags only if the code after it can read them. Everything else, including
+	// the flags that FSAND/FMAND read after several exits, still has to match
+	// the interpreter.
 	EmuConfig.Speedhacks.vuFlagHack = true;
 	CpuArm64VU1.Reset();
 	const VURegs initial = VU1, initial0 = VU0;
@@ -4061,10 +4084,44 @@ TEST_F(VU1RecompilerTest, FlagHackDropsOnlyUnreadStickyBits)
 			for (u32 reg = 1; reg <= 8; reg++)
 				for (u32 lane = 0; lane < 4; lane++)
 					VU1.VF[reg].UL[lane] = values[(reg * 3 + lane + seed) % std::size(values)];
-			Compare(budget, 0x3c0); // ZS/SS/US/OS
+			Compare(budget, 0x3c0, 4, true); // ZS/SS/US/OS
 			if (HasFatalFailure())
 				return;
 		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, FlagHackExitLookaheadRevalidatesSource)
+{
+	// A region's never-taken IBNE exits to code outside the trace, which only
+	// overwrites the flags, so the exit skips publishing them. Writing an FMAND
+	// there has to invalidate that decision even though the trace is unchanged.
+	EmuConfig.Speedhacks.vuFlagHack = true;
+	CpuArm64VU1.Reset();
+	constexpr u32 nop = 0x8000033c;
+	for (u32 i = 0; i < 12; i++)
+		Put(i * 8, (15 << 21) | (2 << 16) | (1 << 11) | ((3 + i % 4) << 6) | 0x2c, nop); // SUB vf3-6, vf1, vf2
+	Put(12 * 8, 0x2ff, 0x52000000 | 27); // IBNE vi0, vi0 -> 40, never taken
+	Put(13 * 8, 0x2ff, nop);
+	Put(18 * 8, (15 << 21) | (1 << 16) | (1 << 11) | (7 << 6) | 0x28, nop); // ADD vf7, vf1, vf1
+	Put(23 * 8, 0x400002ff, nop); // E bit
+	Put(24 * 8, 0x2ff, nop);
+	// The taken path's own flags replace the region's before it ends.
+	Put(40 * 8, (15 << 21) | (1 << 16) | (1 << 11) | (7 << 6) | 0x28, nop); // ADD vf7, vf1, vf1
+	Put(45 * 8, 0x400002ff, nop);
+	Put(46 * 8, 0x2ff, nop);
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 run = 0; run < 4; run++)
+	{
+		SCOPED_TRACE(run);
+		if (run == 2)
+			Put(14 * 8, 0x2ff, (0x1au << 25) | (5 << 16) | (6 << 11)); // FMAND vi5, vi6
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 1000;
+		Compare(1000, 0x3c0);
+		if (HasFatalFailure())
+			return;
 	}
 }
 
