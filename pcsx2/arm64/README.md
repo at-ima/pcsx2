@@ -644,14 +644,17 @@ well.
 
 ## Known issues
 
-As of 2026-09-30, `core_test` has 292 tests; 291 pass.
+As of 2026-09-30, all 292 `core_test` tests pass.
 
-- **`VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions` fails.** It
-  has failed since `4293623d6` (OPMULA/OPMSUB), with VU1Recompiler.cpp from
-  every commit since. At `options=0 seed=6`, the W lanes of VF1/VF3/VF4 hold
-  the host's default NaN (`7fc00000`/`ffc00000`) where the interpreter keeps
-  the input NaN's payload (`ffc12345`, `7fc12345`). See "OPMULA/OPMSUB" in
-  PERFORMANCE.md.
+- **Fused multiply-adds are pinned in the interpreter.** The recompilers emit
+  FMADD/FMSUB/FMLA/FMLS for VU MADD/MSUB/OPMSUB and the ESADD family, and for
+  COP1 MADDA/MSUBA, with fs as the (negated) first multiplicand. The
+  interpreter used to rely on clang contracting `acc - fs * ft` the same way;
+  the CI toolchain did not always, and even `std::fma` lets the compiler
+  negate ft instead, which flips the sign of a NaN taken from fs. On ARM64,
+  `VUops.cpp` and `FPU.cpp` now spell these out with inline assembly. This
+  also fixed `SpecialFloatsAndChangedFloatingPointOptions`, which had failed
+  since `4293623d6` on such NaN lanes.
 - **The GS thread spins for MTVU.** `1dc082a1c` makes MTGS wait for MTVU
   packets with WFE before it sleeps. That was ~13% more fps in SotC, but the GS
   thread shows as ~70% busy in `sample` and `top` while it waits.
