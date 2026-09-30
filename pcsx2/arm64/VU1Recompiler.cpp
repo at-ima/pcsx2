@@ -1133,6 +1133,17 @@ namespace
 	// prepare stub covers. The interpreter retires the pipe (_vuTestPipes)
 	// between that stall and the new op, so the old result must reach Q
 	// before this one replaces it.
+	// Set by EmitDeferredRegion around a divide whose status scratch was last
+	// written by a flag instruction in the region: that leaves only Z/S/U/O
+	// (VU_STAT_UPDATE), so FSSET's D/I sticky bits there are known clear.
+	bool s_div_clean_scratch = false;
+
+	// The status scratch bits a divide keeps: all but its own I/D.
+	u32 DivScratchMask()
+	{
+		return s_div_clean_scratch ? 0xfffff3cf : 0xffffffcf;
+	}
+
 	// Set by EmitDeferredRegion around a pair whose FDIV slot is known to be
 	// empty when its body runs (FdivStatic), so there is no stall to check.
 	bool s_fdiv_idle = false;
@@ -1354,12 +1365,12 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			a.B(&have_result);
 			a.Bind(&is_zero);
 			{
 				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-				a.And(w1, w1, 0xffffffcf);
+				a.And(w1, w1, DivScratchMask());
 				a.Fcmp(s2, 0.0);
 				Label fs_nonzero;
 				a.B(ne, &fs_nonzero);
@@ -1394,7 +1405,7 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			// "pl" (N==0) matches a plain "ft < 0.0" comparison, including the
 			// false-for-NaN case; "lt"/"ge" treat unordered operands as taken.
 			a.Fcmp(s3, 0.0);
@@ -1430,7 +1441,7 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			// See the SQRT case: "pl" is the correct false-for-NaN "ft < 0.0" test.
 			a.Fcmp(s3, 0.0);
 			a.B(pl, &have_result);
@@ -1439,7 +1450,7 @@ namespace
 			a.Bind(&ft_zero);
 			{
 				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-				a.And(w1, w1, 0xffffffcf);
+				a.And(w1, w1, DivScratchMask());
 				a.Orr(w1, w1, 0x20); // D flag, always: division by zero
 				a.Eor(w0, w2, w3);
 				a.And(w0, w0, 0x80000000);
@@ -2927,10 +2938,13 @@ namespace
 			Dead,
 		};
 		std::array<Entry, MaxInstructions> kinds{};
+		std::array<bool, MaxInstructions> div_clean{};
 		{
 			std::array<int, MaxInstructions> source{};
 			std::array<bool, MaxInstructions> flag_op{}, needed{}, scratch_full{};
 			int scratch = -1, latest = -1;
+			// Whether a flag instruction wrote the scratch after any FSSET.
+			bool scratch_clean = false;
 			u32 count = 0, sticky_seen = 0;
 			const bool flag_hack = EmuConfig.Speedhacks.vuFlagHack;
 			// [first, count) entries live at exits whose flags nothing reads.
@@ -2953,17 +2967,29 @@ namespace
 				{
 					flag_op[count] = UpdatesMacFlags(ins.upper);
 					if (flag_op[count])
+					{
 						scratch = static_cast<int>(count);
+						scratch_clean = true;
+					}
 					source[count] = scratch;
 					// CLIP/FCSET retire the clip flag, FSSET reads the scratch.
 					if ((ins.uregs.VIwrite | ins.lregs.VIwrite) & ((1 << REG_CLIP_FLAG) | (1 << REG_STATUS_FLAG)))
 						needed[count] = true;
 					count++;
 				}
-				// A divide reads the status scratch (for the sticky D/I bits it
-				// passes on) from memory, so the latest flag op has to store it.
+				if (!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Fsset)
+					scratch_clean = false;
+				// A divide passes on the scratch's sticky D/I bits and keeps the
+				// rest. After a flag instruction in the region those bits are
+				// clear, so it needs nothing from that instruction; otherwise the
+				// latest one has to store the scratch.
 				if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles && scratch >= 0)
-					scratch_full[scratch] = true;
+				{
+					if (scratch_clean)
+						div_clean[i] = true;
+					else
+						scratch_full[scratch] = true;
+				}
 				const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 				const bool untaken = integer_branch && i + 1 < block.count;
 				if (untaken || i + 1 == end)
@@ -3078,7 +3104,9 @@ namespace
 			if (ins.lregs.pipe != VUPIPE_FMAC && ins.lregs.pipe != VUPIPE_NONE && ins.lregs.pipe != VUPIPE_BRANCH)
 				FlushCycles(a, state);
 			s_fdiv_idle = plan.fdiv_static == FdivIdle || plan.fdiv_static == FdivRetires;
+			s_div_clean_scratch = div_clean[i];
 			EmitPair(a, block.cache, ins, false);
+			s_div_clean_scratch = false;
 			s_fdiv_idle = false;
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;

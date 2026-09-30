@@ -63,6 +63,9 @@ namespace
 		compact(regs.ialu, regs.ialureadpos, regs.ialuwritepos, regs.ialucount);
 		if (!regs.fdiv.enable)
 			std::memset(&regs.fdiv, 0, sizeof(regs.fdiv));
+		// Retiring a divide takes only its D/I bits (0xC30) from this copy of
+		// the status scratch; a region may leave the rest stale.
+		regs.fdiv.statusflag &= 0xc30;
 		if (!regs.efu.enable)
 			std::memset(&regs.efu, 0, sizeof(regs.efu));
 		return regs;
@@ -157,7 +160,8 @@ namespace
 				CpuArm64VU1.Execute(cycles);
 			if (loose_flags)
 			{
-				VU1.VI[REG_STATUS_FLAG] = expected1.VI[REG_STATUS_FLAG];
+				// D/I (0xC30) come from divides and FSSET, never from relaxed flags.
+				VU1.VI[REG_STATUS_FLAG].UL = (expected1.VI[REG_STATUS_FLAG].UL & ~0xc30u) | (VU1.VI[REG_STATUS_FLAG].UL & 0xc30);
 				VU1.VI[REG_MAC_FLAG] = expected1.VI[REG_MAC_FLAG];
 				VU1.statusflag = expected1.statusflag;
 				VU1.macflag = expected1.macflag;
@@ -4041,6 +4045,48 @@ TEST_F(VU1RecompilerTest, DividesInsideScheduledLoopsMatchEveryBudget)
 	}
 }
 
+
+TEST_F(VU1RecompilerTest, DivideAfterFssetPassesItsStickyBits)
+{
+	// A divide passes on the scratch's sticky D/I bits. After a flag instruction
+	// they are clear, so a region's divide does not need that instruction's
+	// flags; an FSSET in between sets them again and has to be seen.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 add = (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28; // ADD vf3, vf1, vf2
+	constexpr u32 nop = 0x8000033c;
+	constexpr u32 div = 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11); // DIV Q, vf1x, vf1y
+	for (bool fsset : {false, true})
+	{
+		for (bool hack : {false, true})
+		{
+			EmuConfig.Speedhacks.vuFlagHack = hack;
+			CpuArm64VU1.Reset();
+			for (u32 i = 0; i < 24; i++)
+				Put(i * 8, add, nop);
+			if (fsset)
+				Put(10 * 8, 0x2ff, (0x15u << 25) | (1 << 21) | 0x400); // FSSET DS|IS
+			Put(11 * 8, 0x2ff, div); // no flag instruction between FSSET and the divide
+			Put(24 * 8, 0x400002ff, nop); // E bit
+			Put(25 * 8, 0x2ff, nop);
+			for (u32 budget : {1u, 9u, 12u, 15u, 20u, 1000u})
+			{
+				for (u32 run = 0; run < 3; run++)
+				{
+					SCOPED_TRACE(testing::Message() << "fsset=" << fsset << " hack=" << hack << " budget=" << budget << " run=" << run);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 1000;
+					VU1.VF[1].F[0] = 0.0f;
+					VU1.VF[1].F[1] = 0.0f;
+					// Exits may relax the Z/S/U/O flags under the hack; D/I stay exact.
+					Compare(budget, hack ? 0x3c0 : 0, 1, hack);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
 
 TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
 {
