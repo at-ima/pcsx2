@@ -2991,3 +2991,21 @@ Share of the EE thread in `VifUnpack` itself (`sample`, 6 s,
 `ReserveSpace` 1.2%, 1.1% -> 0.8%, 0.9%. Host cycles per EE cycle moved with
 thermals and are not a usable comparison. Frame dumps (four states) and a
 SotC BIOS boot to frame 2400 matched the unchanged build.
+
+## EE: interpreter handlers called from blocks
+
+A temporary counter in `ExecuteChained` (SotC at 6x) showed about 4.7M block
+lookups a second, 1.9M of which found no block: the next instruction had to
+run through `execI()`. Nearly all of those were the EE kernel's syscall path:
+SYSCALL, MTC0 (EPC, Status) and ERET, about 200k a second each, each one a
+return to `intExecuteWithBackend`, a failed lookup, `execI()` and another
+lookup. Burnout 3 had 154k a second (CACHE, BEQL delay slots, EI/DI) and
+Saru! Get You! 3 524k (branches whose delay slot is not supported, MMI ops).
+
+SYSCALL, CACHE and MTC0/ERET/EI/DI now call their interpreter handler from
+inside the block (see "EE" in README.md). EE host instructions per EE cycle,
+alternating runs: SotC 24.62, 24.62 -> 22.18, 22.21 (-9.9%); Burnout 3 26.26,
+26.22 -> 25.95, 26.07; Saru! Get You! 3 18.48, 18.51 -> 18.34, 18.36. Frame
+dumps (four states) were unchanged. A SotC BIOS boot matched to frame 1200;
+from about frame 1500 on, two boots of the same build already differ from
+each other (a one-frame shift in the intro), so later frames say nothing.

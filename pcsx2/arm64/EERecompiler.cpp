@@ -196,6 +196,9 @@ namespace
 			}
 			if (count == 2)
 				break;
+			const u32 last = block.words[block.word_count - 1];
+			if (Arm64EE::CodeGenerator::IsInterpreterCall(last) && Arm64EE::CodeGenerator::EndsBlockAfterCall(last))
+				break;
 		}
 		if (!block.word_count)
 		{
@@ -343,7 +346,10 @@ namespace
 		if (!(result & Arm64EE::CodeGenerator::CyclesCommitted))
 		{
 			const u32 completed = static_cast<u32>(result) & Arm64EE::CodeGenerator::CompletedMask;
-			block_cycles += block->cycles[completed] * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+			// The scale the block was compiled with: an MTC0 Config it ends with
+			// has already changed the register, but the interpreter charges its
+			// cycles at the old rate, as generated exits do.
+			block_cycles += block->cycles[completed] * (2 - s_config_cycle_bit);
 		}
 		return result;
 	}

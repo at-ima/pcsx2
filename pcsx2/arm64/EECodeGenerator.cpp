@@ -1133,13 +1133,14 @@ namespace
 		a.Str(w13, MemOperand(x9, offsetof(VURegs, code)));
 	}
 
-	// Calls a COP2 interpreter handler. Handlers are ordinary AAPCS64 functions
-	// that may clobber every caller-saved register, so the block's live ones
-	// are saved around the call: x0 (cpuRegs), x1 (link state), the GPR cache
-	// in x2-x8, x14 (vtlb map) and lr, which the block's own Ret() still needs.
-	// None of these handlers change cpuRegs.GPR except QMFC2/CFC2's rt, which
-	// the caller invalidates.
-	void EmitCOP2Call(MacroAssembler& a, u32 code, u32 pc, void (*handler)())
+	// Calls an interpreter handler the way execI() does, after setting pc/code.
+	// Handlers are ordinary AAPCS64 functions that may clobber every
+	// caller-saved register, so the block's live ones are saved around the
+	// call: x0 (cpuRegs), x1 (link state), the GPR cache in x2-x8, x14 (vtlb
+	// map) and lr, which the block's own Ret() still needs. None of the
+	// handlers called this way change cpuRegs.GPR except QMFC2/CFC2's rt,
+	// which the caller invalidates; SYSCALL may, but it ends the block.
+	void EmitInterpreterCall(MacroAssembler& a, u32 code, u32 pc, void (*handler)())
 	{
 		EmitPosition(a, pc + 4, code);
 		a.Stp(x0, x1, MemOperand(sp, -96, PreIndex));
@@ -1170,7 +1171,7 @@ namespace
 			const MacroArithmetic m = DecodeMacroArithmetic(code);
 			if (m.op == MacroOp::None)
 			{
-				EmitCOP2Call(a, code, pc, &COP2_SPECIAL);
+				EmitInterpreterCall(a, code, pc, &COP2_SPECIAL);
 				return;
 			}
 			Label slow, done;
@@ -1180,11 +1181,11 @@ namespace
 			EmitMacroArithmetic(a, code, m);
 			a.B(&done);
 			a.Bind(&slow);
-			EmitCOP2Call(a, code, pc, &COP2_SPECIAL);
+			EmitInterpreterCall(a, code, pc, &COP2_SPECIAL);
 			a.Bind(&done);
 			return;
 		}
-		EmitCOP2Call(a, code, pc, rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2);
+		EmitInterpreterCall(a, code, pc, rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2);
 		if (rs == 1 || rs == 2)
 			s_gpr.Invalidate((code >> 16) & 31);
 	}
@@ -1941,6 +1942,7 @@ namespace
 bool Arm64EE::CodeGenerator::Supports(u32 code)
 {
 	return SupportsInteger(code) || IsTrapping(code) || IsQuadFunnelShift(code) || MemorySize(code) != 0 || IsBranch(code) ||
+	       IsInterpreterCall(code) ||
 	       ((code >> 26) == 18 && SupportsCOP2(code)) || ((code >> 26) == 17 && SupportsCOP1(code));
 }
 
@@ -2017,6 +2019,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 			EmitTrapping(a, words[i], &exits[i]);
 		else if (IsQuadFunnelShift(words[i]))
 			EmitQuadFunnelShift(a, words[i], &exits[i]);
+		else if (IsInterpreterCall(words[i]))
+			EmitInterpreterCall(a, words[i], pc + i * 4, R5900::GetInstruction(words[i]).interpret);
 		else if ((words[i] >> 26) == 18)
 			EmitCOP2(a, words[i], pc + i * 4);
 		else if ((words[i] >> 26) == 17)
@@ -2031,13 +2035,16 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		a.Bind(&exits[completed]);
 		// The end of the block falls through to the next pc. Earlier exits stop
 		// before an access the interpreter has to perform, so they still return.
-		if (linkable && completed && completed == words.size())
+		// A block ending in an interpreter call returns with the pc the handler
+		// left, and Continue sends the dispatcher to look it up.
+		const bool handler_pc = completed && completed == words.size() && IsInterpreterCall(words[completed - 1]);
+		if (linkable && completed && completed == words.size() && !handler_pc)
 		{
 			Label classic;
 			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, words[completed - 1], &classic);
 			a.Bind(&classic);
 		}
-		if (completed)
+		if (completed && !handler_pc)
 			EmitPosition(a, pc + completed * 4, words[completed - 1]);
 		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)

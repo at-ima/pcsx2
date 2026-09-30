@@ -42,6 +42,38 @@ namespace Arm64EE::CodeGenerator
 			return ((code >> 21) & 31) == 8 && ((code >> 16) & 31) < 4;
 		return (op >= 2 && op <= 7) || (op >= 20 && op <= 23);
 	}
+	// Run by calling the interpreter's handler from inside the block, which
+	// saves the dispatcher round trip, block lookup and execI() that a
+	// fallback costs: SYSCALL, CACHE and COP0's MTC0/ERET/EI/DI. SotC's kernel
+	// runs SYSCALL/MTC0/ERET about 200k times a second each.
+	constexpr bool IsInterpreterCall(u32 code)
+	{
+		const u32 op = code >> 26;
+		if (op == 0)
+			return (code & 63) == 12; // SYSCALL
+		if (op == 47)
+			return true; // CACHE
+		if (op == 16)
+		{
+			const u32 rs = (code >> 21) & 31;
+			const u32 function = code & 63;
+			return rs == 4 || (rs == 16 && (function == 0x18 || function == 0x38 || function == 0x39));
+		}
+		return false;
+	}
+	// The block ends after an interpreter call that can change pc (SYSCALL,
+	// ERET), the cycle scale (MTC0 Config) or memory (CACHE write-backs).
+	// MTC0 of other registers, EI and DI change only COP0 state; like execI()
+	// they only schedule an event test, so the block goes on.
+	constexpr bool EndsBlockAfterCall(u32 code)
+	{
+		const u32 op = code >> 26;
+		if (op != 16)
+			return true;
+		if (((code >> 21) & 31) == 16)
+			return (code & 63) == 0x18;
+		return ((code >> 11) & 31) == 16;
+	}
 	bool SupportsDelaySlot(u32 branch, u32 code);
 	// Packed native return value: completed prefix in bits 0-7, exit action in
 	// bits 8-9 and the taken target in bits 32-63. No events run in generated code.
