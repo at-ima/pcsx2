@@ -2987,7 +2987,13 @@ and the EE thread keeps the last read position it loaded, reloading only when
 that says the space is not free, and after the writer wraps.
 
 Share of the EE thread in `VifUnpack` itself (`sample`, 6 s,
-`WANDER_TO_KYOZOU_001` at 6x, alternating runs): 7.6%, 10.0% -> 4.0%, 4.3%;
-`ReserveSpace` 1.2%, 1.1% -> 0.8%, 0.9%. Host cycles per EE cycle moved with
-thermals and are not a usable comparison. Frame dumps (four states) and a
-SotC BIOS boot to frame 2400 matched the unchanged build.
+`WANDER_TO_KYOZOU_001` at 6x, alternating runs), against the master before
+the leaner-exit and COP2 changes: 7.6%, 10.0% -> 4.0%, 4.3%. That did not
+hold up. Re-measured on a cooled machine against master with those changes,
+`VifUnpack` was already 2.6%, 2.6% without this change and 2.7%, 3.6% with
+it, so there is no measurable benefit; the first comparison was most likely
+thermal or timing noise. The change is kept because it is correct and cheap.
+Moving `mtvuInterrupts` off the line that `vuCycles` and `vuFBRST` share (the
+VU thread writes those for every microprogram) also measured as noise
+(`Get_MTVUChanges` 1.7%, 2.7% -> 2.2%, 1.8%) and was not kept. Frame dumps
+(four states) and a SotC BIOS boot to frame 2400 matched the unchanged build.
