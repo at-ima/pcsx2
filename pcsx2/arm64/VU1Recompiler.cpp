@@ -2566,10 +2566,20 @@ namespace
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+		// Cycles not yet added to x26, which only divides, IALU retirement and
+		// exits read inside a region.
+		u32 pending_cycles = 0;
 		StaticViBackup vi;
 		// Whether v25 may hold sticky status bits not yet in w25.
 		bool raw_retired = false;
 	};
+
+	void FlushCycles(MacroAssembler& a, RegionSlots& state)
+	{
+		if (state.pending_cycles)
+			a.Add(x26, x26, state.pending_cycles);
+		state.pending_cycles = 0;
+	}
 
 	// Fold the sticky bits of retired unobserved entries (v25) into w25.
 	void EmitStickyFold(MacroAssembler& a, const RegionSlots& state)
@@ -2606,8 +2616,9 @@ namespace
 	// Publish what a deferred region keeps in registers, as of the end of pair
 	// `last`: the live FMAC entries, queue positions, status/MAC flags, the
 	// batched backup countdown and TPC.
-	void EmitRegionExit(MacroAssembler& a, const Block& block, const RegionSlots& state, u32 last_index)
+	void EmitRegionExit(MacroAssembler& a, const Block& block, RegionSlots state, u32 last_index)
 	{
+		FlushCycles(a, state);
 		if (state.vi.known)
 		{
 			a.Mov(w9, state.vi.left);
@@ -2938,7 +2949,7 @@ namespace
 			const auto& ins = block.instructions[i];
 			const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 			elapsed += plan.cycles;
-			a.Add(x26, x26, plan.cycles);
+			state.pending_cycles += plan.cycles;
 			int mac_from = -1;
 			for (u32 j = 0; j < plan.retired; j++)
 			{
@@ -2968,6 +2979,8 @@ namespace
 			}
 			if (mac_from >= 0)
 				a.Umov(w28, VRegister(28 + mac_from, 128).V4S(), 0);
+			if (plan.fdiv_pending || plan.ialu_pending)
+				FlushCycles(a, state);
 			if (plan.fdiv_pending)
 				EmitFDIVSlotRetire(a, w25, false);
 			if (plan.ialu_pending)
@@ -3002,6 +3015,9 @@ namespace
 			s_discard_flags = kind == Entry::Dead;
 			s_vi_backup = &state.vi;
 			s_clamp_skip = block.clamp_skip[i];
+			// Divides (and WAITQ) stall on and record the cycle.
+			if (ins.lregs.pipe != VUPIPE_FMAC && ins.lregs.pipe != VUPIPE_NONE && ins.lregs.pipe != VUPIPE_BRANCH)
+				FlushCycles(a, state);
 			EmitPair(a, block.cache, ins, false);
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;

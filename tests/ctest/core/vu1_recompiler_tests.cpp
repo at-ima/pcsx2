@@ -2777,6 +2777,41 @@ TEST_F(VU1RecompilerTest, PairsInsideADivideLatencyStayScheduled)
 	}
 }
 
+TEST_F(VU1RecompilerTest, DivideInsideDeferredRegionRecordsItsIssueCycle)
+{
+	// Deferred regions add their pairs' cycles to the cycle register lazily. A
+	// divide inside one records its issue cycle and retires by it, so repeated
+	// runs (profiled variants, whole regions) must match the interpreter's Q,
+	// status flag and FDIV pipe at every budget.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 kMadd = (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28; // ADD vf3, vf1, vf2
+	constexpr u32 kMulQ = (15 << 21) | (1 << 11) | (4 << 6) | 0x1c; // MULq vf4, vf1, Q
+	constexpr u32 nop = 0x8000033c;
+	for (u32 i = 0; i < 24; i++)
+		Put(i * 8, kMadd, nop);
+	Put(12 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y
+	Put(16 * 8, kMulQ, nop); // reads Q before the divide is due: stalls
+	Put(18 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV again
+	Put(22 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // still pending at the E bit
+	Put(24 * 8, 0x400002ff, nop); // E bit
+	Put(25 * 8, 0x2ff, nop);
+	for (u32 budget : {1u, 5u, 12u, 13u, 14u, 17u, 19u, 21u, 26u, 30u, 1000u})
+	{
+		for (u32 run = 0; run < 3; run++)
+		{
+			SCOPED_TRACE(testing::Message() << "budget=" << budget << " run=" << run);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			VU1.VF[1].F[0] = 5.0f;
+			VU1.VF[1].F[1] = 2.0f;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ProloguePairsWithoutVFReadsKeepProducerAgesKnown)
 {
 	const VURegs initial = VU1, initial0 = VU0;
