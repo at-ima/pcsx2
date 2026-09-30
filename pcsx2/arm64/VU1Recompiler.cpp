@@ -555,19 +555,38 @@ namespace
 		a.Str(w9, Field(offset));
 	}
 
+	// Stores the `mask` lanes (x = 8) of `value`: xy and zw as doublewords,
+	// other lanes singly. v3 is scratch.
 	void StoreMasked(MacroAssembler& a, VRegister value, MemOperand address, u32 mask)
 	{
 		if (!mask)
 			return;
 		if (mask == 15)
-			a.Str(value.Q(), address);
-		else
 		{
-			a.Ldr(q3, address);
-			for (u32 i = 0; i < 4; i++)
-				if (mask & (8 >> i))
-					a.Ins(v3.V4S(), i, value.V4S(), i);
-			a.Str(q3, address);
+			a.Str(value.Q(), address);
+			return;
+		}
+		const Register base = address.GetBaseRegister();
+		const s64 offset = address.GetOffset();
+		for (u32 half = 0; half < 2; half++)
+		{
+			const u32 lanes = (mask >> (2 - half * 2)) & 3; // bit 1: the half's first lane
+			if (lanes == 3)
+			{
+				if (half)
+					a.Mov(d3, value.V2D(), 1);
+				a.Str(half ? d3 : value.D(), MemOperand(base, offset + half * 8));
+				continue;
+			}
+			for (u32 k = 0; k < 2; k++)
+			{
+				if (!(lanes & (2 >> k)))
+					continue;
+				const u32 lane = half * 2 + k;
+				if (lane)
+					a.Mov(s3, value.V4S(), lane);
+				a.Str(lane ? s3 : value.S(), MemOperand(base, offset + lane * 4));
+			}
 		}
 	}
 
@@ -579,20 +598,56 @@ namespace
 			a.Ldr(value.Q(), Field(VectorOffset(reg)));
 	}
 
+	// The cache register of `reg`, or `temp` loaded from memory. Read only.
+	VRegister SourceVector(MacroAssembler& a, const VectorCache& cache, VRegister temp, u32 reg)
+	{
+		if (cache.slots[reg] >= 0)
+			return cache.Host(reg);
+		a.Ldr(temp.Q(), Field(VectorOffset(reg)));
+		return temp;
+	}
+
+	// Copies the `mask` lanes of `value` into `dest`, xy and zw as doublewords.
+	void MergeLanes(MacroAssembler& a, VRegister dest, VRegister value, u32 mask)
+	{
+		if (mask == 15)
+		{
+			if (!dest.Is(value))
+				a.Mov(dest.V16B(), value.V16B());
+			return;
+		}
+		for (u32 half = 0; half < 2; half++)
+		{
+			const u32 lanes = (mask >> (2 - half * 2)) & 3;
+			if (lanes == 3)
+				a.Ins(dest.V2D(), half, value.V2D(), half);
+			else
+				for (u32 k = 0; k < 2; k++)
+					if (lanes & (2 >> k))
+						a.Ins(dest.V4S(), half * 2 + k, value.V4S(), half * 2 + k);
+		}
+	}
+
 	void StoreVector(MacroAssembler& a, const VectorCache& cache, VRegister value, u32 reg, u32 mask = 15)
 	{
 		if (cache.slots[reg] < 0)
-		{
 			StoreMasked(a, value, Field(VectorOffset(reg)), mask);
+		else
+			MergeLanes(a, cache.Host(reg), value, mask);
+	}
+
+	// LQ and friends: loads the quadword at x1 + x0 * 16 into the `mask` lanes
+	// of `reg`, straight into a fully written cache register.
+	void LoadQuad(MacroAssembler& a, const VectorCache& cache, u32 reg, u32 mask)
+	{
+		const MemOperand address(x1, x0, LSL, 4);
+		if (mask == 15 && cache.slots[reg] >= 0)
+		{
+			a.Ldr(cache.Host(reg).Q(), address);
 			return;
 		}
-		const VRegister dest = cache.Host(reg);
-		if (mask == 15)
-			a.Mov(dest.V16B(), value.V16B());
-		else
-			for (u32 lane = 0; lane < 4; lane++)
-				if (mask & (8 >> lane))
-					a.Ins(dest.V4S(), lane, value.V4S(), lane);
+		a.Ldr(q0, address);
+		StoreVector(a, cache, v0, reg, mask);
 	}
 
 	void AssignVectorCache(Block& block)
@@ -679,6 +734,34 @@ namespace
 		ClampInputAlways(a, reg);
 	}
 
+	// An FMAC input: VF `reg` (or ACC) with `lane` broadcast (-1: none), clamped
+	// like ClampInput unless `clamped`. Returns the cache register itself when
+	// nothing has to change, else `temp`; `copy` forces `temp`.
+	VRegister FetchInput(MacroAssembler& a, const VectorCache& cache, VRegister temp, u32 reg, int lane, bool clamped, bool copy = false)
+	{
+		VRegister value = SourceVector(a, cache, temp, reg);
+		if (lane >= 0)
+		{
+			a.Dup(temp.V4S(), value.V4S(), lane);
+			value = temp;
+		}
+		const bool daz = EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero();
+		if (!clamped && daz && CHECK_VU_OVERFLOW(0))
+		{
+			a.Smin(temp.V4S(), value.V4S(), v6.V4S());
+			a.Umin(temp.V4S(), temp.V4S(), v7.V4S());
+			return temp;
+		}
+		if (!value.Is(temp) && (copy || (!clamped && !daz)))
+		{
+			a.Mov(temp.V16B(), value.V16B());
+			value = temp;
+		}
+		if (!clamped && !daz)
+			ClampInputAlways(a, temp);
+		return value;
+	}
+
 	// Loads the shared per-block constants: the overflow-clamp bounds into
 	// v6/v7 when this block's options actually need them, and the FP
 	// exponent mask into v24 unconditionally (StoreMAC's MAC/status flag
@@ -716,6 +799,25 @@ namespace
 	u8 s_clamp_skip = 0;
 	u32 s_store_mac_count = 0;
 
+	// Clamps the result in v0 (v6/v7 hold the bounds for the whole block; see
+	// EmitBlockConstants) and writes its `mask` lanes to `reg`, unless that is
+	// VF0. A fully written cache register takes the last clamp step directly.
+	void StoreResult(MacroAssembler& a, const VectorCache& cache, u32 reg, u32 mask)
+	{
+		if (CHECK_VU_OVERFLOW(1))
+		{
+			a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
+			if (reg && mask == 15 && cache.slots[reg] >= 0)
+			{
+				a.Umin(cache.Host(reg).V4S(), v0.V4S(), v7.V4S());
+				return;
+			}
+			a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
+		}
+		if (reg)
+			StoreVector(a, cache, v0, reg, mask);
+	}
+
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
 	{
 		s_store_mac_count++;
@@ -735,14 +837,7 @@ namespace
 				a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
 				a.Mov(v0.V16B(), v19.V16B());
 			}
-			if (CHECK_VU_OVERFLOW(1))
-			{
-				a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
-				a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
-			}
-			const u32 fd = (code >> 6) & 31;
-			if (op.acc || fd)
-				StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+			StoreResult(a, cache, op.acc ? 32 : (code >> 6) & 31, mask);
 			return;
 		}
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
@@ -796,16 +891,7 @@ namespace
 			a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
 			a.Mov(v0.V16B(), v19.V16B());
 		}
-		if (CHECK_VU_OVERFLOW(1))
-		{
-			// v6/v7 hold the clamp bounds for the whole block; see
-			// EmitBlockConstants.
-			a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
-			a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
-		}
-		const u32 fd = (code >> 6) & 31;
-		if (op.acc || fd)
-			StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+		StoreResult(a, cache, op.acc ? 32 : (code >> 6) & 31, mask);
 	}
 
 	void EmitUpper(MacroAssembler& a, const VectorCache& cache, u32 code)
@@ -815,6 +901,46 @@ namespace
 			return;
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, fd = (code >> 6) & 31;
 		const u32 mask = (code >> 21) & 15;
+		if (op.op == Op::Add || op.op == Op::Sub || op.op == Op::Mul || op.op == Op::Madd || op.op == Op::Msub)
+		{
+			// Inputs are read from the vector cache in place where possible; the
+			// result is computed into v0 (see StoreMAC).
+			const bool fused = op.op == Op::Madd || op.op == Op::Msub;
+			VRegister t;
+			if (op.broadcast >= 4)
+			{
+				a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
+				a.Dup(v1.V4S(), v1.V4S(), 0);
+				t = v1;
+				if (!(s_clamp_skip & 2))
+					ClampInput(a, v1);
+			}
+			else
+				t = FetchInput(a, cache, v1, ft, op.broadcast, s_clamp_skip & 2);
+			const VRegister s = FetchInput(a, cache, fused ? v2 : v0, fs, -1, s_clamp_skip & 1);
+			switch (op.op)
+			{
+				case Op::Add:
+					a.Fadd(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				case Op::Sub:
+					a.Fsub(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				case Op::Mul:
+					a.Fmul(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				default:
+					// Match the ARM64 interpreter's contracted multiply/add operations.
+					FetchInput(a, cache, v0, 32, -1, s_clamp_skip & 4, true);
+					if (op.op == Op::Madd)
+						a.Fmla(v0.V4S(), s.V4S(), t.V4S());
+					else
+						a.Fmls(v0.V4S(), s.V4S(), t.V4S());
+					break;
+			}
+			StoreMAC(a, cache, op, code);
+			return;
+		}
 		LoadVector(a, cache, q0, fs);
 		if (op.op == Op::Clip)
 		{
@@ -942,39 +1068,7 @@ namespace
 				a.Mov(v0.V16B(), v2.V16B());
 			}
 			StoreMAC(a, cache, op, code, 0xE);
-			return;
 		}
-		if (!(s_clamp_skip & 1))
-			ClampInput(a, v0);
-		if (!(s_clamp_skip & 2))
-			ClampInput(a, v1);
-		switch (op.op)
-		{
-			case Op::Add:
-				a.Fadd(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Sub:
-				a.Fsub(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Mul:
-				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Madd:
-			case Op::Msub:
-				LoadVector(a, cache, q2, 32);
-				if (!(s_clamp_skip & 4))
-					ClampInput(a, v2);
-				// Match the ARM64 interpreter's contracted multiply/add operations.
-				if (op.op == Op::Madd)
-					a.Fmla(v2.V4S(), v0.V4S(), v1.V4S());
-				else
-					a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
-				a.Mov(v0.V16B(), v2.V16B());
-				break;
-			default:
-				break;
-		}
-		StoreMAC(a, cache, op, code);
 	}
 
 	// The VI backup (_vuBackupVI) as a deferred region knows it at compile time.
@@ -1563,9 +1657,15 @@ namespace
 			}
 			else
 			{
-				LoadVector(a, cache, q0, fs);
+				const VRegister value = SourceVector(a, cache, v0, fs);
 				if (op == Lower::Mr32)
-					a.Ext(v0.V16B(), v0.V16B(), v0.V16B(), 4);
+					a.Ext(v0.V16B(), value.V16B(), value.V16B(), 4);
+				else if (!value.Is(v0))
+				{
+					// MOVE between cached registers or out to memory: no copy.
+					StoreVector(a, cache, value, ft, mask);
+					return;
+				}
 			}
 			StoreVector(a, cache, v0, ft, mask);
 			return;
@@ -1586,16 +1686,12 @@ namespace
 			{
 				a.And(w0, w2, 0x3ff);
 				a.Ldr(x1, Field(offsetof(VURegs, Mem)));
-				a.Add(x1, x1, Operand(x0, LSL, 4));
 				if (load)
-				{
-					a.Ldr(q0, MemOperand(x1));
-					StoreVector(a, cache, v0, ft, mask);
-				}
+					LoadQuad(a, cache, ft, mask);
 				else
 				{
-					LoadVector(a, cache, q0, fs);
-					StoreMasked(a, v0, MemOperand(x1), mask);
+					a.Add(x1, x1, Operand(x0, LSL, 4));
+					StoreMasked(a, SourceVector(a, cache, v0, fs), MemOperand(x1), mask);
 				}
 			}
 			if (update)
@@ -1615,16 +1711,12 @@ namespace
 			a.Add(w0, w0, imm);
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
-			a.Add(x1, x1, Operand(x0, LSL, 4));
 			if (op == Lower::Lq)
-			{
-				a.Ldr(q0, MemOperand(x1));
-				StoreVector(a, cache, v0, ft, mask);
-			}
+				LoadQuad(a, cache, ft, mask);
 			else
 			{
-				LoadVector(a, cache, q0, fs);
-				StoreMasked(a, v0, MemOperand(x1), mask);
+				a.Add(x1, x1, Operand(x0, LSL, 4));
+				StoreMasked(a, SourceVector(a, cache, v0, fs), MemOperand(x1), mask);
 			}
 			return;
 		}
