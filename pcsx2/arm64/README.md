@@ -283,7 +283,11 @@ edges (IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ) also connect their supported delay
 pair and destination, including integer-load waits and VI backup selection.
 Not-taken edges exit with complete architectural state. JR/JALR (target from
 a VI register) and BAL execute natively together with their delay pair. The
-trace then ends and the next dispatch resolves the target. A deferred region
+trace follows BAL to its static target, and a JR/JALR whose register still
+holds the return address a BAL/JALR in the same trace linked (no other VI
+write to it since), so a subroutine call and its return stay in one block.
+Any other register branch ends the trace and the next dispatch resolves the
+target. EmitControlFlow resolves branchpc at runtime either way. A deferred region
 ending in such a delay slot must not overwrite TPC with a compile-time value;
 a version that did broke rendering. XTOP/XITOP read VIF1's TOP/ITOP, or the
 MTVU thread's `vu1Thread.vifRegs` copy under MTVU, as `_vuXTOP`/`_vuXITOP`
@@ -351,7 +355,10 @@ use the N-flag-only ARM64 condition codes so an unordered compare stays
 false-for-NaN like the plain C comparisons they mirror. Each result also lands in
 the staging Q field the interpreter writes. Issue stages Q into the shared
 single-slot FDIV pipe for its 7 (DIV/SQRT) or 13 (RSQRT) cycle latency, where the
-existing generic retirement publishes it. An outstanding entry stalls the next
+existing generic retirement publishes it. Inside a deferred region whose divide
+due cycle is known, each pair knows at compile time whether the slot is idle,
+still busy, or retires during it (`FdivStatic`), and only the retiring pair
+emits the retirement. An outstanding entry stalls the next
 FDIV issue and is retired before being replaced, mirroring `_vuTestFDIVStalls`
 followed by `_vuTestPipes`. FDIV reads also participate in the FMAC hazard scan.
 Pairs issued while a divide is still in the pipe stay on the precomputed
@@ -363,13 +370,15 @@ issue itself (DIV/SQRT/RSQRT) is scheduled, and deferrable, whenever its stall
 on an earlier divide is known: the new entry is stamped with the cycle the
 pair ends on, which is where a scheduled pair has already moved x26. It reads
 the status scratch from memory for the sticky D/I bits it passes on, so a
-region stores the latest flag op's scratch before a divide. Before this, every
+region stores the latest flag op's scratch before a divide, unless a flag op
+in the region (with no FSSET after it) already left those bits clear. Before this, every
 divide split a region, and region exits were ~10% of SotC's VU1 thread. A pair that reads or
 writes Q or P while an FDIV or EFU entry is outstanding stalls until that entry
 retires, so its advance is not the nominal one. `AnalyzeRetirement` treats that
 advance as unknown, and the following pairs use the generic path until their
-producers' ages are known again. The EFU pipe's latency window is still
-excluded from the schedule, as ILW's is for the IALU pipe. This needs proper
+producers' ages are known again. The EFU pipe is scheduled the same way: an
+EFU op or WAITP stalls until the pending entry's known due cycle, and pairs
+inside its latency retire the slot inline (`efu_pending`). This needs proper
 testing across games rather than only the differential tests.
 
 WAITQ shares DIV/SQRT/RSQRT's pending-entry stall but issues nothing of its own,
@@ -429,8 +438,12 @@ StoreMasked helper.
 ILW reads the low halfword of the final selected component, wraps VU1 data memory,
 and preserves the upper half of the VI register. It issues the same four-cycle
 IALU entry even for a masked-out or VI0 destination, without creating an arithmetic
-VI backup. ILW clears schedule readiness and keeps the following four pairs on
-generic retirement; readiness is checked again when static scheduling resumes.
+VI backup. Deferred regions issue the entry to memory like the generic path, and
+pairs inside its latency drop due entries at runtime (`ialu_pending`). An
+integer branch reading a load the block issued at a known cycle stalls by a
+known amount (`_vuTestALUStalls`: to the load's stamp plus its latency), so it
+stays scheduled; a profiled entry also records the registers of a single
+pending incoming load for the same purpose.
 Each sufficiently long region with a known schedule can defer queue construction.
 It publishes its queues and checks the remaining budget before returning to the
 ordinary generated path, keeping VF/ACC cached across branch preparation. Branch
@@ -441,8 +454,10 @@ and resumes static retirement only when subsequent pairs establish known timing.
 
 Each block assigns up to eight frequently accessed VF/ACC registers to q8..q15.
 The assignment is fixed for the block, including every budget exit. Entry loads
-these values; exit publishes them before returning to the shared driver or
-interpreter. Host d8..d15 preservation saves only the used cache registers,
+these values; exits publish the ones the block writes before returning to the
+shared driver or interpreter. FMAC inputs, MOVE/SQ sources and the operands of
+CLIP, ABS, ITOF/FTOI, MAX/MINI and OPMULA/OPMSUB are read from the cache
+registers in place; MUL/MADD/MSUB read a broadcast lane by element. Host d8..d15 preservation saves only the used cache registers,
 rounded up to an even count for paired stores and stack alignment. Unused host
 registers remain untouched; guest VF/ACC publication is unchanged. The generated preparation routine preserves full cached vectors
 through its private ABI. Actual XGKICK transfers publish the cache, call the
@@ -530,9 +545,9 @@ packet completion, the full guard runs again against the current
 state; the generic prefix still drains incoming work before scheduled execution. Pending FDIV,
 EFU and IALU work initially keeps the generic path, but readiness is checked again
 at the first scheduled pair and at the deferred region boundary. Once these
-queues drain, the validated block may use scheduled execution. ILW issues integer work and clears readiness; integer branches wait for matching loads
-and breaks the static schedule. Other supported integer operations have zero
-pipeline latency. Unknown timing keeps the
+queues drain, the validated block may use scheduled execution. ILW issues integer work; an integer branch waiting for a matching load
+keeps the static schedule only when the load's issue cycle is known (see ILW
+above). Other supported integer operations have zero pipeline latency. Unknown timing keeps the
 generic preparation path. Every queue entry is materialized
 at observable exits; sticky flags include all retired entries even when
 only the final MAC/non-sticky result is stored, unless the VU flag hack is on
@@ -540,7 +555,9 @@ only the final MAC/non-sticky result is stored, unless the VU flag hack is on
 toward compiler scheduling, not cross-block pipeline or flag-liveness analysis.
 The generated block retains the current cycle in x26. Scheduled preparation
 updates it directly; queue insertion and budget checks consume it without
-reloading architectural memory. Before generic preparation after a scheduled
+reloading architectural memory. A deferred region adds its pairs' cycles to
+x26 only before the code that reads it (divides, pipe retirement, IALU issue,
+exits). Before generic preparation after a scheduled
 pair, and at every block exit, it is published to VURegs. Generic preparation
 reloads it afterwards so callback changes remain visible. x26 is saved/restored
 by the block and preserved by the private pipeline ABI.
@@ -575,7 +592,10 @@ Runtime profiles should distinguish these management costs from arithmetic throu
 ### Entry profiles and block linking
 
 A block can be compiled for the exact pipeline state it is entered with (the
-FMAC entries in flight and their ages, a pending divide, pending ILW results).
+FMAC entries in flight, their ages and whether they write the status or the
+clip flag, a pending divide or EFU op, pending ILW results and, for a single
+pending one, its registers). A scheduled pair retires an incoming CLIP like
+one issued in the block; an incoming FSSET still keeps the generic path.
 Such a *profiled* block knows its whole schedule from the first pair, so all of
 it can be deferred. Execute() keeps up to several variants per entry PC and
 picks the one whose profile matches. A loop whose back edge arrives in a
@@ -592,6 +612,13 @@ links to a profiled target, since its state follows from its own profile. A
 slot keeps four targets, keyed by the TPC at the exit: a subroutine's JR returns
 to each of its callers through the same exit. In SotC this took the returns to
 Execute() from 2.25 to 1.26 per microprogram (the one left is the start).
+
+A linked entry keeps x19, x26 and the block constants the exiting block left
+in place. An end exit that continues at its own block's entry (a loop whose
+closing branch has the entry pair as its delay slot, and every profiled loop)
+checks whether its first link way is this block and then jumps to
+`loop_entry` directly, keeping the vector cache instead of spilling and
+reloading it.
 
 The E-bit pair ends a trace. Execute() sees `VU1.ebit` and steps the delay slot
 and the end of the program.
