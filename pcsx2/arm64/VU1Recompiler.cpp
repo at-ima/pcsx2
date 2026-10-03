@@ -2206,6 +2206,13 @@ namespace
 			phantom_ages[k] = incoming[k].age;
 		}
 		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0;
+		// The block's own ILW/ILWR results: per VI register, the cycle (on the
+		// `elapsed` scale) at which the latest one stops stalling integer
+		// branches, or -1. Before `ialu_unknown`, incoming ones may be pending.
+		// (Once `elapsed` is unknown it stays so, along with these.)
+		std::array<int, 16> ialu_due;
+		ialu_due.fill(-1);
+		const u32 ialu_unknown = block.profiled ? block.incoming.Ialu() : 4;
 		u32 efu_ready = block.profiled ? block.incoming.Efu() : 0;
 		int efu_due = block.profiled && block.incoming.Efu() ? static_cast<int>(block.incoming.Efu()) - 1 : -1;
 		bool efu_retired = false;
@@ -2292,7 +2299,18 @@ namespace
 			// unprofiled one's have retired after four pairs (ILW latency is four,
 			// and every pair advances at least one cycle).
 			const bool integer_branch = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread;
-			const bool integer_wait = integer_branch && !(i >= integer_ready && (block.profiled || i >= 4));
+			bool integer_wait = integer_branch && !(i >= integer_ready && (block.profiled || i >= 4));
+			// Within the latency of the block's own loads, the stall is known like
+			// a divide's: _vuTestALUStalls advances the branch to the load's
+			// stamp (the end of its pair) plus its latency, if that is later.
+			int ialu_target = -1;
+			if (integer_wait && i >= ialu_unknown && elapsed >= 0)
+			{
+				integer_wait = false;
+				for (u32 reg = 0; reg < 16; reg++)
+					if (ins.lregs.VIread & (1 << reg))
+						ialu_target = std::max(ialu_target, ialu_due[reg]);
+			}
 			if (integer_wait || ins.lregs.pipe == VUPIPE_XGKICK ||
 				(i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
@@ -2316,6 +2334,8 @@ namespace
 				cycles = (cycles > 0 && elapsed >= 0 && fdiv_due >= 0) ? std::max(cycles, fdiv_due - elapsed) : -1;
 			if (efu_op && i < efu_ready)
 				cycles = (cycles > 0 && elapsed >= 0 && efu_due >= 0) ? std::max(cycles, efu_due - 1 - elapsed) : -1;
+			if (cycles > 0 && ialu_target >= 0)
+				cycles = std::max(cycles, ialu_target - elapsed);
 			// An unprofiled block may be entered with a divide (up to 13 cycles)
 			// or an EFU operation (up to 54) in flight. Each pair advances at
 			// least one cycle.
@@ -2355,7 +2375,13 @@ namespace
 					efu_static = FdivBusy;
 			}
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
+			{
 				integer_ready = i + 5;
+				const int due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
+				for (u32 reg = 0; reg < 16; reg++)
+					if (ins.lregs.VIwrite & (1 << reg))
+						ialu_due[reg] = due;
+			}
 			// Divides are frequent enough in transform code that excluding their whole
 			// latency from scheduling costs far more than retiring the pipe's single
 			// slot inline: those pairs carry fdiv_pending instead and do it themselves
