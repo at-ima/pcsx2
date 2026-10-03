@@ -93,7 +93,8 @@ namespace
 	struct IncomingFmac
 	{
 		u32 regupper = 0, reglower = 0, xyzwupper = 0, xyzwlower = 0;
-		bool flags = false; // writes the status or clip flag, which scheduling must not retire
+		bool flags = false; // writes the status flag (FSSET), which scheduling must not retire
+		bool clip = false; // writes the clip flag (CLIP, FCSET), which a scheduled pair retires
 		u32 age = 0; // cycles since issue, 3 meaning ready before the first pair
 	};
 	// Packed, since Execute() captures and compares one on every dispatch:
@@ -116,7 +117,8 @@ namespace
 		void Set(u32 count, u32 fdiv, u32 ialu, u32 efu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53) | (u64(efu) << 57); }
 		void SetFmac(u32 k, const IncomingFmac& e)
 		{
-			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) | (e.xyzwlower << 17);
+			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) |
+			                 (e.xyzwlower << 17) | (u64(e.clip) << 21);
 			words[k / 2] |= bits << Shift(k);
 		}
 		IncomingFmac Fmac(u32 k) const
@@ -129,6 +131,7 @@ namespace
 			e.reglower = (bits >> 8) & 31;
 			e.xyzwupper = (bits >> 13) & 15;
 			e.xyzwlower = (bits >> 17) & 15;
+			e.clip = (bits >> 21) & 1;
 			return e;
 		}
 	};
@@ -2405,6 +2408,9 @@ namespace
 					{
 						if (incoming[k].flags)
 							plan.cycles = 0;
+						// Like a CLIP issued in the block (see below).
+						if (incoming[k].clip)
+							plan.clip_retires |= 1 << plan.retired;
 						plan.retired++;
 					}
 				}
@@ -3939,7 +3945,8 @@ namespace
 				return false;
 			previous = entry.sCycle;
 			IncomingFmac fmac;
-			fmac.flags = (entry.flagreg & ((1 << REG_STATUS_FLAG) | (1 << REG_CLIP_FLAG))) != 0;
+			fmac.flags = (entry.flagreg & (1 << REG_STATUS_FLAG)) != 0;
+			fmac.clip = (entry.flagreg & (1 << REG_CLIP_FLAG)) != 0;
 			// Three cycles old is ready at the first pair's cycle and cannot stall
 			// it; the registers of such an entry no longer matter.
 			fmac.age = static_cast<u32>(std::min<u64>(cycle - entry.sCycle, 3));
