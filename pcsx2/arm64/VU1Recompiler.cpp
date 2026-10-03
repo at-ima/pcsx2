@@ -3498,7 +3498,9 @@ namespace
 				return &link_sites[link_count++];
 			};
 			// Entered from another block's exit: the frame, start and budget are
-			// already in place, and a linked exit never has a packet pending.
+			// already in place, and a linked exit never has a packet pending. So
+			// are x19, the block constants (every block uses the same options, and
+			// code that calls C++ reloads them) and x26, which the exit stored.
 			a.Bind(&linked_entry);
 			a.Str(wzr, MemOperand(sp, 72));
 			a.B(&common_entry);
@@ -3514,8 +3516,11 @@ namespace
 				a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
-			a.Bind(&common_entry);
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
+			// Keep queue insertion and budget checks off the cycle store/load chain.
+			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+			EmitBlockConstants(a);
+			a.Bind(&common_entry);
 			u32 scheduled_pairs = 0;
 			for (u32 i = first_scheduled; i < block->count; i++)
 				scheduled_pairs += block->schedule[i].cycles != 0;
@@ -3530,12 +3535,9 @@ namespace
 				a.Mov(w25, block->incoming.Ialu() ? 1 : 3);
 			else if (scheduled)
 				EmitScheduleGuard(a);
-			// Keep queue insertion and budget checks off the cycle store/load chain.
-			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Ldr(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
-			EmitBlockConstants(a);
 			// Share the most frequent helper address in x22; keep preparation code
 			// outside the emitted instruction stream to avoid instruction-cache growth.
 			const auto& prepare = s_pipeline.prepare;
@@ -3693,6 +3695,57 @@ namespace
 					EmitScheduleGuard(a);
 				a.Mov(w9, block->instructions[block->count - 1].lregs.pipe == VUPIPE_XGKICK ? 1 : 0);
 				a.Str(w9, MemOperand(sp, 72));
+				a.B(&loop_entry);
+			}
+			else if (block->next_pc[block->count - 1] == block->instructions[0].pc)
+			{
+				// The end exit continues at this block's own entry, typically a
+				// loop whose closing branch has the entry pair as its delay slot
+				// (profiled loops always leave this way). Once Execute() linked it
+				// back to this very block, its first way enters it, and a running
+				// block is current: re-enter at loop_entry with the cache, x22-x24
+				// and the frame as they are, skipping the spill, the reload and
+				// the way search. The other checks match link_exit's; failing one
+				// leaves through `exit`, which spills. Needs proper testing.
+				Label* site = add_link(block->count - 1);
+				const LinkSlot& slot = block->links[link_count - 1];
+				a.Mov(x0, reinterpret_cast<uintptr_t>(&slot));
+				a.Ldr(x11, MemOperand(x0, offsetof(LinkSlot, ways) + offsetof(LinkSlot::Way, entry)));
+				a.Adr(x10, &linked_entry);
+				a.Cmp(x11, x10);
+				a.B(ne, site);
+				a.Ldr(w9, Field(VI(REG_TPC)));
+				a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, ways) + offsetof(LinkSlot::Way, pc)));
+				a.Cmp(w9, w10);
+				a.B(ne, site);
+				a.Sub(x9, x26, x20);
+				a.Cmp(x9, x21);
+				a.B(hs, &exit);
+				if (s_options & 32)
+				{
+					a.Ldr(w9, Field(offsetof(VURegs, flags)));
+					a.Tbz(w9, __builtin_ctz(VUFLAG_MTVURUNNING), &exit);
+				}
+				else
+				{
+					a.Mov(x16, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+					a.Ldr(w9, MemOperand(x16));
+					a.Tbz(w9, 8, &exit);
+				}
+				a.Ldr(w9, Field(offsetof(VURegs, branch)));
+				a.Ldr(w10, Field(offsetof(VURegs, ebit)));
+				a.Orr(w9, w9, w10);
+				a.Ldrb(w10, Field(offsetof(VURegs, takedelaybranch)));
+				a.Orr(w9, w9, w10);
+				a.Ldr(w10, Field(offsetof(VURegs, xgkickenable)));
+				a.Orr(w9, w9, w10);
+				a.Cbnz(w9, &exit);
+				a.Str(x26, Field(offsetof(VURegs, cycle)));
+				a.Str(wzr, MemOperand(sp, 72));
+				if (block->profiled && scheduled)
+					a.Mov(w25, block->incoming.Ialu() ? 1 : 3);
+				else if (scheduled)
+					EmitScheduleGuard(a);
 				a.B(&loop_entry);
 			}
 			else
