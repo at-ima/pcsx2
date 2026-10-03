@@ -439,6 +439,47 @@ TEST_F(VU1RecompilerTest, IntegerLoadsIssueInsideDeferredRegions)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ProfiledEntriesStallOnTheirPendingLoadOnly)
+{
+	// A JR (to a register the trace did not link) ends the block with one or
+	// two ILWs in flight; the target's first pair branches on the earlier one.
+	// With one pending load the profile knows its register and due cycle, so
+	// the branch stalls for exactly that; with two it must not stall for the
+	// later one.
+	const VURegs initial = VU1, initial0 = VU0;
+	const u32 fill = 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28; // ADD vf3, vf3, vf2 + I
+	auto ilw = [](u32 it, u32 imm) { return 0x08000000u | (8u << 21) | (it << 16) | (1u << 11) | imm; }; // ILW.x vi_it, imm(vi1)
+	for (u32 second : {0u, 1u})
+	{
+		for (u32 i = 0; i < 24; i++)
+			Put(i * 8, fill, 0x3f800000);
+		Put(5 * 8, 0x2ff, ilw(2, 2));
+		Put(6 * 8, 0x2ff, 0x48000000 | (5 << 11)); // JR vi5 -> 80
+		Put(7 * 8, 0x2ff, second ? ilw(3, 3) : 0x8000033c);
+		Put(10 * 8, 0x2ff, 0x52000000 | (2 << 11) | 4); // IBNE vi2, vi0, +4
+		Put(24 * 8, 0xc00002ff, 0x3f800000);
+		Put(25 * 8, 0x800002ff, 0x3f800000);
+		for (u32 value : {0u, 7u})
+		{
+			for (u32 runs : {1u, 2u})
+			{
+				for (u32 budget = 1; budget <= 40; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << second << "/" << value << "/" << runs << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0;
+					VU1.VI[5].UL = 10;
+					std::memcpy(VU1.Mem + 32, &value, sizeof(value));
+					Compare(budget, 0, runs);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ConditionalTailPreservesEveryBudgetExit)
 {
 	const VURegs initial = VU1, initial0 = VU0;

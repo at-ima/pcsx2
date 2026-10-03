@@ -96,7 +96,8 @@ namespace
 	// Packed, since Execute() captures and compares one on every dispatch:
 	// the entry count (3 bits) and the divide (6 bits), then 22 bits for each
 	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56
-	// and the EFU pipe in bits 57-62.
+	// and the EFU pipe in bits 57-62; the IALU registers in bits 44-59 of the
+	// second word.
 	struct IncomingProfile
 	{
 		u64 words[2] = {};
@@ -109,6 +110,12 @@ namespace
 		u32 Ialu() const { return (words[0] >> 53) & 15; }
 		// Pairs the incoming EFU entry may still be pending; 0 if none.
 		u32 Efu() const { return (words[0] >> 57) & 63; }
+		// The VI registers (bit n: VIn) the one ILW/ILWR still pending writes,
+		// which stalls integer branches reading them until Ialu() - 1 cycles
+		// after entry; AnyIaluRegs if more than one is pending.
+		static constexpr u32 AnyIaluRegs = 0xffff;
+		u32 IaluRegs() const { return (words[1] >> 44) & 0xffff; }
+		void SetIaluRegs(u32 regs) { words[1] |= u64(regs & 0xffff) << 44; }
 		static u32 Shift(u32 k) { return k < 2 ? 9 + 22 * k : 22 * (k - 2); }
 		void Set(u32 count, u32 fdiv, u32 ialu, u32 efu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53) | (u64(efu) << 57); }
 		void SetFmac(u32 k, const IncomingFmac& e)
@@ -2212,7 +2219,14 @@ namespace
 		// (Once `elapsed` is unknown it stays so, along with these.)
 		std::array<int, 16> ialu_due;
 		ialu_due.fill(-1);
-		const u32 ialu_unknown = block.profiled ? block.incoming.Ialu() : 4;
+		const u32 incoming_ialu_regs = block.profiled ? block.incoming.IaluRegs() : 0;
+		const u32 ialu_unknown = !block.profiled ? 4 :
+		                         incoming_ialu_regs == IncomingProfile::AnyIaluRegs ? block.incoming.Ialu() :
+		                                                                              0;
+		if (incoming_ialu_regs != IncomingProfile::AnyIaluRegs)
+			for (u32 reg = 0; reg < 16; reg++)
+				if (incoming_ialu_regs & (1 << reg))
+					ialu_due[reg] = static_cast<int>(block.incoming.Ialu()) - 1;
 		u32 efu_ready = block.profiled ? block.incoming.Efu() : 0;
 		int efu_due = block.profiled && block.incoming.Efu() ? static_cast<int>(block.incoming.Efu()) - 1 : -1;
 		bool efu_retired = false;
@@ -3939,7 +3953,7 @@ namespace
 		}
 		// ILW/ILWR results only delay integer branches, and the generic
 		// preparation drains the pipe; the schedule stays off until it has.
-		u32 ialu = 0;
+		u32 ialu = 0, ialu_regs = 0;
 		if (VU1.ialucount)
 		{
 			if (VU1.ialucount > 4 || VU1.ialureadpos > 3 || VU1.ialuwritepos != ((VU1.ialureadpos + VU1.ialucount) & 3))
@@ -3951,6 +3965,9 @@ namespace
 				if (entry.sCycle > cycle || entry.Cycle > 8)
 					return false;
 				ready = std::max<u64>(ready, entry.sCycle + entry.Cycle);
+				// Due entries stall nothing.
+				if (entry.sCycle + entry.Cycle > cycle)
+					ialu_regs = ialu_regs ? IncomingProfile::AnyIaluRegs : (entry.reg & 0xffff);
 			}
 			ialu = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
 		}
@@ -3958,6 +3975,7 @@ namespace
 		if (count > 4 || VU1.fmacreadpos > 3 || VU1.fmacwritepos != ((VU1.fmacreadpos + count) & 3))
 			return false;
 		profile.Set(count, fdiv, ialu, efu);
+		profile.SetIaluRegs(ialu_regs);
 		u64 previous = 0;
 		for (u32 k = 0; k < count; k++)
 		{
