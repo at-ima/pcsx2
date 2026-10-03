@@ -940,14 +940,27 @@ namespace
 			// Inputs are read from the vector cache in place where possible; the
 			// result is computed into v0 (see StoreMAC).
 			const bool fused = op.op == Op::Madd || op.op == Op::Msub;
+			// FMUL/FMLA/FMLS read a broadcast operand's lane in place (`lane`);
+			// only ADD/SUB need it duplicated first. Same per-lane arithmetic.
+			const bool by_element = op.broadcast >= 0 && op.op != Op::Add && op.op != Op::Sub;
+			int lane = -1;
 			VRegister t;
 			if (op.broadcast >= 4)
 			{
 				a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
-				a.Dup(v1.V4S(), v1.V4S(), 0);
+				if (by_element)
+					lane = 0;
+				else
+					a.Dup(v1.V4S(), v1.V4S(), 0);
 				t = v1;
 				if (!(s_clamp_skip & 2))
 					ClampInput(a, v1);
+			}
+			else if (by_element)
+			{
+				// clamp_skip's ft bit covers just the broadcast lane.
+				t = FetchInput(a, cache, v1, ft, -1, s_clamp_skip & 2);
+				lane = op.broadcast;
 			}
 			else
 				t = FetchInput(a, cache, v1, ft, op.broadcast, s_clamp_skip & 2);
@@ -961,13 +974,23 @@ namespace
 					a.Fsub(v0.V4S(), s.V4S(), t.V4S());
 					break;
 				case Op::Mul:
-					a.Fmul(v0.V4S(), s.V4S(), t.V4S());
+					if (lane >= 0)
+						a.Fmul(v0.V4S(), s.V4S(), t.S(), lane);
+					else
+						a.Fmul(v0.V4S(), s.V4S(), t.V4S());
 					break;
 				default:
 					// Match the ARM64 interpreter's contracted multiply/add operations.
 					FetchInput(a, cache, v0, 32, -1, s_clamp_skip & 4, true);
 					if (op.op == Op::Madd)
-						a.Fmla(v0.V4S(), s.V4S(), t.V4S());
+					{
+						if (lane >= 0)
+							a.Fmla(v0.V4S(), s.V4S(), t.S(), lane);
+						else
+							a.Fmla(v0.V4S(), s.V4S(), t.V4S());
+					}
+					else if (lane >= 0)
+						a.Fmls(v0.V4S(), s.V4S(), t.S(), lane);
 					else
 						a.Fmls(v0.V4S(), s.V4S(), t.V4S());
 					break;
@@ -975,21 +998,22 @@ namespace
 			StoreMAC(a, cache, op, code);
 			return;
 		}
-		LoadVector(a, cache, q0, fs);
+		// The other ops read fs (and ft) from the cache registers in place.
 		if (op.op == Op::Clip)
 		{
 			// CLIP compares signed bit patterns, including non-finite inputs.
 			// A denormal W uses the largest denormal threshold; FP compares differ.
-			LoadVector(a, cache, q1, ft);
-			a.Umov(w0, v1.V4S(), 3);
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			const VRegister ftv = SourceVector(a, cache, v1, ft);
+			a.Umov(w0, ftv.V4S(), 3);
 			a.And(w1, w0, 0x7fffffff);
 			a.Mov(w2, 0x007fffff);
 			a.Tst(w0, 0x7f800000);
 			a.Csel(w1, w1, w2, ne);
 			a.Dup(v1.V4S(), w1);
 			a.Movi(v2.V4S(), 0x80000000);
-			a.Eor(v2.V16B(), v0.V16B(), v2.V16B());
-			a.Cmgt(v0.V4S(), v0.V4S(), v1.V4S());
+			a.Eor(v2.V16B(), fsv.V16B(), v2.V16B());
+			a.Cmgt(v0.V4S(), fsv.V4S(), v1.V4S());
 			a.Cmgt(v2.V4S(), v2.V4S(), v1.V4S());
 			// Pack +X/-X/+Y/-Y/+Z/-Z into the next six history bits.
 			a.Mov(x0, 0x0000000400000001ull);
@@ -1012,14 +1036,16 @@ namespace
 		{
 			if (!ft)
 				return;
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			VRegister result = v0;
 			if (op.op == Op::Abs)
 			{
 				a.Movi(v1.V4S(), 0x7fffffff);
-				a.And(v0.V16B(), v0.V16B(), v1.V16B());
+				a.And(v0.V16B(), fsv.V16B(), v1.V16B());
 			}
 			else if (op.op == Op::Itof)
 			{
-				a.Scvtf(v0.V4S(), v0.V4S());
+				a.Scvtf(v0.V4S(), fsv.V4S());
 				if (op.scale)
 				{
 					a.Movi(v1.V4S(), 0x3f800000 - (op.scale << 23));
@@ -1028,44 +1054,46 @@ namespace
 			}
 			else
 			{
+				VRegister x = fsv;
 				if (op.scale)
 				{
 					a.Movi(v1.V4S(), 0x3f800000 + (op.scale << 23));
-					a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
+					a.Fmul(v0.V4S(), fsv.V4S(), v1.V4S());
+					x = v0;
 				}
 				a.Movi(v1.V4S(), 0x7f800000);
-				a.And(v2.V16B(), v0.V16B(), v1.V16B());
+				a.And(v2.V16B(), x.V16B(), v1.V16B());
 				a.Movi(v1.V4S(), 0x4f000000);
 				a.Cmhs(v2.V4S(), v2.V4S(), v1.V4S());
-				a.Sshr(v4.V4S(), v0.V4S(), 31);
+				a.Sshr(v4.V4S(), x.V4S(), 31);
 				a.Movi(v1.V4S(), 0x7fffffff);
 				a.Eor(v4.V16B(), v4.V16B(), v1.V16B());
-				a.Fcvtzs(v0.V4S(), v0.V4S());
+				a.Fcvtzs(v0.V4S(), x.V4S());
 				a.Bsl(v2.V16B(), v4.V16B(), v0.V16B());
-				a.Mov(v0.V16B(), v2.V16B());
+				result = v2;
 			}
-			StoreVector(a, cache, v0, ft, mask);
+			StoreVector(a, cache, result, ft, mask);
 			return;
-		}
-		if (op.broadcast < 4)
-		{
-			LoadVector(a, cache, q1, ft);
-			if (op.broadcast >= 0)
-				a.Dup(v1.V4S(), v1.V4S(), op.broadcast);
-		}
-		else
-		{
-			a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
-			a.Dup(v1.V4S(), v1.V4S(), 0);
 		}
 		if (op.op == Op::Max || op.op == Op::Min)
 		{
 			if (!fd)
 				return;
-			a.And(v2.V16B(), v0.V16B(), v1.V16B());
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			VRegister tv = v1;
+			if (op.broadcast < 0)
+				tv = SourceVector(a, cache, v1, ft);
+			else if (op.broadcast < 4)
+				a.Dup(v1.V4S(), SourceVector(a, cache, v1, ft).V4S(), op.broadcast);
+			else
+			{
+				a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
+				a.Dup(v1.V4S(), v1.V4S(), 0);
+			}
+			a.And(v2.V16B(), fsv.V16B(), tv.V16B());
 			a.Cmlt(v2.V4S(), v2.V4S(), 0);
-			a.Smax(v4.V4S(), v0.V4S(), v1.V4S());
-			a.Smin(v0.V4S(), v0.V4S(), v1.V4S());
+			a.Smax(v4.V4S(), fsv.V4S(), tv.V4S());
+			a.Smin(v0.V4S(), fsv.V4S(), tv.V4S());
 			if (op.op == Op::Max)
 				a.Bsl(v2.V16B(), v0.V16B(), v4.V16B());
 			else
@@ -1075,31 +1103,26 @@ namespace
 		}
 		if (op.op == Op::Opmula || op.op == Op::Opmsub)
 		{
-			// Outer product: rotate Fs to yzx and Ft to zxy before multiplying.
-			// The W lane of each shuffled vector is never read (mask is fixed
-			// to xyz), so it is left with whatever the copy produces.
-			a.Mov(v3.V16B(), v0.V16B());
-			a.Ins(v0.V4S(), 0, v3.V4S(), 1);
-			a.Ins(v0.V4S(), 1, v3.V4S(), 2);
-			a.Ins(v0.V4S(), 2, v3.V4S(), 0);
-			a.Mov(v3.V16B(), v1.V16B());
-			a.Ins(v1.V4S(), 0, v3.V4S(), 2);
-			a.Ins(v1.V4S(), 1, v3.V4S(), 0);
-			a.Ins(v1.V4S(), 2, v3.V4S(), 1);
+			// Outer product: rotate Fs to yzx (into v2) and Ft to zxy (into v1)
+			// before multiplying. EXT leaves the lane the rotation still needs
+			// in w. The W lanes are never read (mask is fixed to xyz).
+			const VRegister fsv = SourceVector(a, cache, v2, fs);
+			a.Ext(v2.V16B(), fsv.V16B(), fsv.V16B(), 4);
+			a.Ins(v2.V4S(), 2, v2.V4S(), 3);
+			const VRegister ftv = SourceVector(a, cache, v1, ft);
+			a.Ext(v1.V16B(), ftv.V16B(), ftv.V16B(), 12);
+			a.Ins(v1.V4S(), 0, v1.V4S(), 3);
 			if (!(s_clamp_skip & 1))
-				ClampInput(a, v0);
+				ClampInput(a, v2);
 			if (!(s_clamp_skip & 2))
 				ClampInput(a, v1);
 			if (op.op == Op::Opmula)
-				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
+				a.Fmul(v0.V4S(), v2.V4S(), v1.V4S());
 			else
 			{
-				LoadVector(a, cache, q2, 32);
-				if (!(s_clamp_skip & 4))
-					ClampInput(a, v2);
 				// Match the ARM64 interpreter's contracted multiply/subtract.
-				a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
-				a.Mov(v0.V16B(), v2.V16B());
+				FetchInput(a, cache, v0, 32, -1, s_clamp_skip & 4, true);
+				a.Fmls(v0.V4S(), v2.V4S(), v1.V4S());
 			}
 			StoreMAC(a, cache, op, code, 0xE);
 		}
