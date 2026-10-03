@@ -3374,6 +3374,73 @@ TEST_F(VU1RecompilerTest, ProfiledEntriesScheduleFromTheFirstPair)
 	EXPECT_GT(CpuArm64VU1.GetCommittedCache(), committed);
 }
 
+TEST_F(VU1RecompilerTest, CallsAndReturnsStayInOneTrace)
+{
+	// A BAL into a subroutine whose JR returns through the link it set. The
+	// trace follows both, so the program runs as one block; a callee that
+	// rewrites its link register (even with the same value) ends the trace at
+	// the JR as before. Variant 2 nests a second call with another link, and
+	// variant 3 returns one pair further than the BAL linked.
+	const VURegs initial = VU1, initial0 = VU0;
+	auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+	auto mul = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x2a; };
+	auto iaddiu = [](u32 it, u32 is, u32 imm) { return 0x10000000u | (it << 16) | (is << 11) | imm; };
+	auto bal = [](u32 it, s32 offset) { return 0x42000000u | (it << 16) | (static_cast<u32>(offset) & 0x7ff); };
+	auto jr = [](u32 is) { return 0x48000000u | (is << 11); };
+	constexpr u32 kNop = 0x8000033c;
+	auto load = [&](u32 variant) {
+		Put(0, add(3, 1, 2), bal(15, 7)); // -> 64
+		Put(8, add(4, 3, 2), iaddiu(2, 2, 1));
+		Put(16, mul(5, 4, 4), iaddiu(3, 3, 1)); // return address
+		Put(24, add(6, 5, 1), kNop);
+		Put(32, 0x400002ff, kNop); // E bit
+		Put(40, 0x2ff, kNop);
+		if (variant == 2)
+		{
+			Put(64, add(7, 3, 3), bal(14, 7)); // -> 128
+			Put(72, 0x2ff, iaddiu(4, 4, 2));
+			Put(80, add(9, 7, 1), jr(15));
+			Put(88, add(8, 7, 2), kNop);
+			Put(128, mul(10, 7, 2), kNop);
+			Put(136, 0x2ff, jr(14)); // -> 80
+			Put(144, add(11, 10, 1), iaddiu(6, 6, 1));
+		}
+		else
+		{
+			Put(64, add(7, 3, 3), variant ? iaddiu(15, 15, variant == 3 ? 1 : 0) : iaddiu(4, 4, 2));
+			Put(72, 0x2ff, jr(15));
+			Put(80, add(8, 7, 2), kNop);
+		}
+	};
+	auto run = [&](u32 budget) {
+		VU0 = initial0;
+		VU1 = initial;
+		Compare(budget);
+	};
+	std::array<u64, 4> dispatches{};
+	for (u32 variant : {0u, 1u, 2u, 3u})
+	{
+		load(variant);
+		for (u32 budget = 1; budget <= 40; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "variant=" << variant << " budget=" << budget);
+			run(budget);
+			if (HasFatalFailure())
+				return;
+		}
+		// A fresh source: the first run compiles and cannot link yet.
+		load(variant);
+		Put(48, 0x2ff, kNop);
+		const u64 before = CpuArm64VU1.GetDispatchCount();
+		run(1000);
+		if (HasFatalFailure())
+			return;
+		dispatches[variant] = CpuArm64VU1.GetDispatchCount() - before;
+	}
+	EXPECT_LT(dispatches[0], dispatches[1]);
+	EXPECT_LE(dispatches[2], dispatches[0]);
+}
+
 TEST_F(VU1RecompilerTest, LinkedExitsEnterTheNextBlockDirectly)
 {
 	// A counted loop whose untaken IBEQ ends each native block. The next block

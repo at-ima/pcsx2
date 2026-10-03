@@ -3266,12 +3266,17 @@ namespace
 		// pairs and the size limit end the trace.
 		u32 next_pc = pc, branch_target = 0;
 		bool pending_branch = false;
-		// JR/JALR/BAL: the target isn't a compile-time constant to continue tracing
-		// into (JR/JALR read it from a register; BAL's static target is deliberately
-		// not exploited, to keep one code path). EmitControlFlow resolves branchpc
-		// itself instead of relying on a precomputed branch_target/next_pc, so the
-		// trace simply ends once their delay slot has been emitted.
+		// JR/JALR/BAL: EmitControlFlow resolves branchpc itself (from the register
+		// at runtime for JR/JALR) instead of relying on a precomputed
+		// branch_target/next_pc. The trace follows BAL to its static target, and
+		// JR/JALR when the register still holds a return address a BAL/JALR in
+		// this trace linked, so subroutine calls and returns stay in one block.
+		// Otherwise it ends once their delay slot has been emitted.
 		bool pending_branch_terminal = false;
+		// VI[0..15] values the trace linked itself and has not overwritten since
+		// (in pairs), or -1. Neither JR nor JALR bypasses the VI backup.
+		std::array<int, 16> linked;
+		linked.fill(-1);
 		std::array<bool, VU1_PROGSIZE / 8> visited{};
 		for (u32 i = 0; i < MaxInstructions && next_pc < VU1_PROGSIZE; i++)
 		{
@@ -3335,8 +3340,20 @@ namespace
 			}
 			else if (terminal_branch)
 			{
+				const Lower op = DecodeLower(ins.lower);
+				const u32 is_reg = (ins.lower >> 11) & 15;
+				int target = -1;
+				if (op == Lower::Bal)
+				{
+					const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+					target = static_cast<int>((ins.pc + 8 + displacement) & VU1_PROGMASK);
+				}
+				else if (linked[is_reg] >= 0)
+					target = static_cast<int>((static_cast<u32>(linked[is_reg]) * 8) & VU1_PROGMASK);
 				pending_branch = true;
-				pending_branch_terminal = true;
+				pending_branch_terminal = target < 0;
+				if (target >= 0)
+					branch_target = static_cast<u32>(target);
 				block->has_branches = true;
 			}
 			next_pc = block->next_pc[i];
@@ -3382,6 +3399,16 @@ namespace
 					ins.readMasks[regs->VFread1] |= regs->VFr1xyzw;
 			}
 			ins.readsVF = std::any_of(ins.readMasks.begin(), ins.readMasks.end(), [](u8 mask) { return mask != 0; });
+			if (!(ins.upper & 0x80000000))
+			{
+				for (u32 reg = 1; reg < 16; reg++)
+					if (ins.lregs.VIwrite & (1 << reg))
+						linked[reg] = -1;
+				const Lower op = DecodeLower(ins.lower);
+				const u32 it_reg = (ins.lower >> 16) & 15;
+				if ((op == Lower::Bal || op == Lower::Jalr) && it_reg)
+					linked[it_reg] = static_cast<int>((ins.pc + 16) / 8);
+			}
 			if (i >= 3)
 			{
 				// Four cycles have elapsed since block entry, so incoming FMAC results
