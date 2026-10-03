@@ -403,6 +403,42 @@ TEST_F(VU1RecompilerTest, IntegerLoadsResumeScheduledSuffix)
 	}
 }
 
+TEST_F(VU1RecompilerTest, IntegerLoadsIssueInsideDeferredRegions)
+{
+	// An ILW in the middle of a deferred region stamps its IALU entry with the
+	// region's batched cycle count, which the integer branch after it stalls on
+	// (generic) or which a budget exit leaves in the queue. Also from a later
+	// pair, and from a profiled entry of the same block.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 load_at : {8u, 12u, 20u})
+	{
+		for (u32 gap : {0u, 1u, 3u})
+		{
+			const u32 branch_at = load_at + 1 + gap;
+			for (u32 i = 0; i < 32; i++)
+				Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
+			Put(load_at * 8, (15 << 21) | (2 << 16) | (3 << 11) | (4 << 6) | 0x28, 0x08000000 | (8 << 21) | (2 << 16) | (1 << 11) | 2); // ADD + ILW.x vi2, 2(vi1)
+			Put(branch_at * 8, 0x2ff, 0x52000000 | (2 << 11) | 4); // IBNE vi2, vi0, +4
+			Put(32 * 8, 0xc00002ff, 0x3f800000);
+			Put(33 * 8, 0x800002ff, 0x3f800000);
+			for (u32 value : {0u, 5u})
+			{
+				for (u32 budget = 1; budget <= 48; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << load_at << "/" << gap << "/" << value << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0;
+					std::memcpy(VU1.Mem + 32, &value, sizeof(value));
+					Compare(budget, 0, 3);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ConditionalTailPreservesEveryBudgetExit)
 {
 	const VURegs initial = VU1, initial0 = VU0;

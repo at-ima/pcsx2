@@ -79,10 +79,6 @@ namespace
 		// stall on them, so every other pair keeps its timing and just drops
 		// the entries that are due (VUPipeline::FlushIALU).
 		bool ialu_pending = false;
-		// Deferred regions keep retired flags in host registers, batch the backup
-		// countdown and cannot exit mid-region. A pair that observes any of that
-		// is still scheduled, but ends the region.
-		bool deferrable = true;
 	};
 
 	// Pipeline state a block was entered with, captured by Execute() so that
@@ -2393,9 +2389,6 @@ namespace
 				plan.efu_pending = efu_static != FdivIdle;
 				plan.efu_static = efu_static;
 				plan.ialu_pending = i < integer_ready;
-				// Deferred regions do not issue into the IALU pipe.
-				if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
-					plan.deferrable = false;
 				for (u32 k = 0; k < phantoms && plan.cycles; k++)
 				{
 					if (phantom_ages[k] < 0)
@@ -3235,6 +3228,9 @@ namespace
 				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);
 			s_vi_backup = nullptr;
+			// ILW/ILWR: the IALU entry goes to memory as on the generic path; the
+			// cycles were flushed above. Later pairs retire it (ialu_pending).
+			EmitIntegerIssue(a, ins);
 			if (HasFmac(ins))
 			{
 				const u32 slot = issued++ & 3;
@@ -3490,7 +3486,7 @@ namespace
 			std::vector<DeferredRegion> regions;
 			// A pair inside a divide's latency retires the FDIV slot into the
 			// status flag a deferred region keeps in w25.
-			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0 && block->schedule[i].deferrable; };
+			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0; };
 			// Unprofiled blocks never schedule their first seven pairs.
 			const u32 first_scheduled = block->profiled ? 0 : 7;
 			for (u32 i = first_scheduled; i < block->count;)
