@@ -4109,6 +4109,41 @@ TEST_F(VU1RecompilerTest, EfuOpsInsideScheduledLoopsMatchEveryBudget)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ReadOnlyRegistersKeepRawValuesWhenClampedAtEntry)
+{
+	// A cached register that a profiled block only reads through clamping
+	// FMAC ops is clamped once at entry. Its non-finite raw bits must still be
+	// what the block leaves in memory, and every read must see them clamped.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 nop = 0x8000033c;
+	for (u32 i = 0; i < 16; i++)
+	{
+		const u32 fd = 6 + i % 3;
+		const u32 upper = i % 2 ? (15 << 21) | (5 << 16) | (1 << 11) | (fd << 6) | 0x2a : // MUL vfN, vf1, vf5
+		                          (15 << 21) | (2 << 16) | (5 << 11) | (fd << 6) | 0x28; // ADD vfN, vf5, vf2
+		Put(i * 8, upper, nop);
+	}
+	Put(16 * 8, 0x400002ff, nop); // E bit
+	Put(17 * 8, 0x2ff, nop);
+	for (u32 budget : {3u, 9u, 1000u})
+	{
+		for (u32 run = 0; run < 3; run++)
+		{
+			SCOPED_TRACE(testing::Message() << "budget=" << budget << " run=" << run);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			VU1.VF[5].UL[0] = 0x7f800000; // +Inf
+			VU1.VF[5].UL[1] = 0xffc00001; // -NaN
+			VU1.VF[5].UL[2] = 0x7fffffff; // +NaN
+			VU1.VF[5].UL[3] = 0xff800000; // -Inf
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, DivideAfterFssetPassesItsStickyBits)
 {
 	// A divide passes on the scratch's sticky D/I bits. After a flag instruction

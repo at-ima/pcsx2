@@ -36,6 +36,8 @@ namespace
 		std::array<int, 33> slots;
 		std::array<u32, 8> offsets;
 		u32 count = 0;
+		// Slots the block writes; exits store only these back.
+		u8 dirty = 0;
 
 		VectorCache()
 		{
@@ -699,6 +701,19 @@ namespace
 			block.cache.offsets[slot] = VectorOffset(reg);
 			block.cache.count++;
 			*best = 0;
+		}
+		for (u32 i = 0; i < block.count; i++)
+		{
+			const auto& ins = block.instructions[i];
+			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
+			{
+				if (regs == &ins.lregs && (ins.upper & 0x80000000))
+					continue;
+				if (regs->VFwrite && block.cache.slots[regs->VFwrite] >= 0)
+					block.cache.dirty |= 1 << block.cache.slots[regs->VFwrite];
+				if ((regs->VIwrite & (1 << REG_ACC_FLAG)) && block.cache.slots[32] >= 0)
+					block.cache.dirty |= 1 << block.cache.slots[32];
+			}
 		}
 	}
 
@@ -3668,7 +3683,8 @@ namespace
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
-				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+				if (cache.dirty & (1 << slot))
+					a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			a.Bind(&restore);
 			for (u32 slot = 0; slot < 8; slot += 2)
 				a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
@@ -3685,7 +3701,8 @@ namespace
 			a.Bind(&link_exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
-				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+				if (cache.dirty & (1 << slot))
+					a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			a.Sub(x9, x26, x20);
 			a.Cmp(x9, x21);
 			a.B(hs, &restore);
