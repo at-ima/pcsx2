@@ -2056,12 +2056,16 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	}
 	if (std::any_of(words.begin(), words.end(), [](u32 code) { return MemorySize(code) != 0; }))
 		a.Mov(x14, reinterpret_cast<uintptr_t>(vtlb_private::vtlbdata.vmap));
+	bool falls_through = true;
 	for (u32 i = 0; i < words.size(); i++)
 	{
 		if (IsBranch(words[i]))
 		{
 			if (!EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]))
+			{
+				falls_through = false;
 				break;
+			}
 			continue; // the untaken path runs the delay slot next
 		}
 		if (MemorySize(words[i]))
@@ -2081,8 +2085,13 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	}
 	// Completion and early exits share one contract: PC/code describe the last
 	// completed instruction, and the caller charges exactly that prefix's cycles.
-	for (u32 completed = words.size();; completed--)
+	// Only exits something reaches get code: every branch to them is emitted
+	// by now, and most instructions never leave early. Unused exits were about
+	// 40% of the code, which spilled the hot blocks out of the instruction cache.
+	for (u32 completed = words.size(); completed > 0 || exits[0].IsLinked(); completed--)
 	{
+		if (!exits[completed].IsLinked() && (completed != words.size() || !falls_through))
+			continue;
 		a.Bind(&exits[completed]);
 		// The end of the block falls through to the next pc. Earlier exits stop
 		// before an access the interpreter has to perform, so they still return.
