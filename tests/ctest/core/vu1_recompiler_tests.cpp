@@ -63,6 +63,9 @@ namespace
 		compact(regs.ialu, regs.ialureadpos, regs.ialuwritepos, regs.ialucount);
 		if (!regs.fdiv.enable)
 			std::memset(&regs.fdiv, 0, sizeof(regs.fdiv));
+		// Retiring a divide takes only its D/I bits (0xC30) from this copy of
+		// the status scratch; a region may leave the rest stale.
+		regs.fdiv.statusflag &= 0xc30;
 		if (!regs.efu.enable)
 			std::memset(&regs.efu, 0, sizeof(regs.efu));
 		return regs;
@@ -157,7 +160,8 @@ namespace
 				CpuArm64VU1.Execute(cycles);
 			if (loose_flags)
 			{
-				VU1.VI[REG_STATUS_FLAG] = expected1.VI[REG_STATUS_FLAG];
+				// D/I (0xC30) come from divides and FSSET, never from relaxed flags.
+				VU1.VI[REG_STATUS_FLAG].UL = (expected1.VI[REG_STATUS_FLAG].UL & ~0xc30u) | (VU1.VI[REG_STATUS_FLAG].UL & 0xc30);
 				VU1.VI[REG_MAC_FLAG] = expected1.VI[REG_MAC_FLAG];
 				VU1.statusflag = expected1.statusflag;
 				VU1.macflag = expected1.macflag;
@@ -395,6 +399,83 @@ TEST_F(VU1RecompilerTest, IntegerLoadsResumeScheduledSuffix)
 			Compare(budget);
 			if (HasFatalFailure())
 				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, IntegerLoadsIssueInsideDeferredRegions)
+{
+	// An ILW in the middle of a deferred region stamps its IALU entry with the
+	// region's batched cycle count, which the integer branch after it stalls on
+	// (generic) or which a budget exit leaves in the queue. Also from a later
+	// pair, and from a profiled entry of the same block.
+	const VURegs initial = VU1, initial0 = VU0;
+	for (u32 load_at : {8u, 12u, 20u})
+	{
+		for (u32 gap : {0u, 1u, 3u})
+		{
+			const u32 branch_at = load_at + 1 + gap;
+			for (u32 i = 0; i < 32; i++)
+				Put(i * 8, 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28, 0x3f800000);
+			Put(load_at * 8, (15 << 21) | (2 << 16) | (3 << 11) | (4 << 6) | 0x28, 0x08000000 | (8 << 21) | (2 << 16) | (1 << 11) | 2); // ADD + ILW.x vi2, 2(vi1)
+			Put(branch_at * 8, 0x2ff, 0x52000000 | (2 << 11) | 4); // IBNE vi2, vi0, +4
+			Put(32 * 8, 0xc00002ff, 0x3f800000);
+			Put(33 * 8, 0x800002ff, 0x3f800000);
+			for (u32 value : {0u, 5u})
+			{
+				for (u32 budget = 1; budget <= 48; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << load_at << "/" << gap << "/" << value << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0;
+					std::memcpy(VU1.Mem + 32, &value, sizeof(value));
+					Compare(budget, 0, 3);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ProfiledEntriesStallOnTheirPendingLoadOnly)
+{
+	// A JR (to a register the trace did not link) ends the block with one or
+	// two ILWs in flight; the target's first pair branches on the earlier one.
+	// With one pending load the profile knows its register and due cycle, so
+	// the branch stalls for exactly that; with two it must not stall for the
+	// later one.
+	const VURegs initial = VU1, initial0 = VU0;
+	const u32 fill = 0x80000000 | (15 << 21) | (2 << 16) | (3 << 11) | (3 << 6) | 0x28; // ADD vf3, vf3, vf2 + I
+	auto ilw = [](u32 it, u32 imm) { return 0x08000000u | (8u << 21) | (it << 16) | (1u << 11) | imm; }; // ILW.x vi_it, imm(vi1)
+	for (u32 second : {0u, 1u})
+	{
+		for (u32 i = 0; i < 24; i++)
+			Put(i * 8, fill, 0x3f800000);
+		Put(5 * 8, 0x2ff, ilw(2, 2));
+		Put(6 * 8, 0x2ff, 0x48000000 | (5 << 11)); // JR vi5 -> 80
+		Put(7 * 8, 0x2ff, second ? ilw(3, 3) : 0x8000033c);
+		Put(10 * 8, 0x2ff, 0x52000000 | (2 << 11) | 4); // IBNE vi2, vi0, +4
+		Put(24 * 8, 0xc00002ff, 0x3f800000);
+		Put(25 * 8, 0x800002ff, 0x3f800000);
+		for (u32 value : {0u, 7u})
+		{
+			for (u32 runs : {1u, 2u})
+			{
+				for (u32 budget = 1; budget <= 40; budget++)
+				{
+					SCOPED_TRACE(testing::Message() << second << "/" << value << "/" << runs << "/" << budget);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.VI[1].UL = 0;
+					VU1.VI[5].UL = 10;
+					std::memcpy(VU1.Mem + 32, &value, sizeof(value));
+					Compare(budget, 0, runs);
+					if (HasFatalFailure())
+						return;
+				}
+			}
 		}
 	}
 }
@@ -2777,6 +2858,41 @@ TEST_F(VU1RecompilerTest, PairsInsideADivideLatencyStayScheduled)
 	}
 }
 
+TEST_F(VU1RecompilerTest, DivideInsideDeferredRegionRecordsItsIssueCycle)
+{
+	// Deferred regions add their pairs' cycles to the cycle register lazily. A
+	// divide inside one records its issue cycle and retires by it, so repeated
+	// runs (profiled variants, whole regions) must match the interpreter's Q,
+	// status flag and FDIV pipe at every budget.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 kMadd = (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28; // ADD vf3, vf1, vf2
+	constexpr u32 kMulQ = (15 << 21) | (1 << 11) | (4 << 6) | 0x1c; // MULq vf4, vf1, Q
+	constexpr u32 nop = 0x8000033c;
+	for (u32 i = 0; i < 24; i++)
+		Put(i * 8, kMadd, nop);
+	Put(12 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV VF1x, VF1y
+	Put(16 * 8, kMulQ, nop); // reads Q before the divide is due: stalls
+	Put(18 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // DIV again
+	Put(22 * 8, kMadd, 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11)); // still pending at the E bit
+	Put(24 * 8, 0x400002ff, nop); // E bit
+	Put(25 * 8, 0x2ff, nop);
+	for (u32 budget : {1u, 5u, 12u, 13u, 14u, 17u, 19u, 21u, 26u, 30u, 1000u})
+	{
+		for (u32 run = 0; run < 3; run++)
+		{
+			SCOPED_TRACE(testing::Message() << "budget=" << budget << " run=" << run);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			VU1.VF[1].F[0] = 5.0f;
+			VU1.VF[1].F[1] = 2.0f;
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, ProloguePairsWithoutVFReadsKeepProducerAgesKnown)
 {
 	const VURegs initial = VU1, initial0 = VU0;
@@ -3333,6 +3449,73 @@ TEST_F(VU1RecompilerTest, ProfiledEntriesScheduleFromTheFirstPair)
 	VU1.fmac[0] = {1, 0, 0, 15, 0, 99, 4};
 	Compare(16);
 	EXPECT_GT(CpuArm64VU1.GetCommittedCache(), committed);
+}
+
+TEST_F(VU1RecompilerTest, CallsAndReturnsStayInOneTrace)
+{
+	// A BAL into a subroutine whose JR returns through the link it set. The
+	// trace follows both, so the program runs as one block; a callee that
+	// rewrites its link register (even with the same value) ends the trace at
+	// the JR as before. Variant 2 nests a second call with another link, and
+	// variant 3 returns one pair further than the BAL linked.
+	const VURegs initial = VU1, initial0 = VU0;
+	auto add = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28; };
+	auto mul = [](u32 fd, u32 fs, u32 ft) { return (15u << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x2a; };
+	auto iaddiu = [](u32 it, u32 is, u32 imm) { return 0x10000000u | (it << 16) | (is << 11) | imm; };
+	auto bal = [](u32 it, s32 offset) { return 0x42000000u | (it << 16) | (static_cast<u32>(offset) & 0x7ff); };
+	auto jr = [](u32 is) { return 0x48000000u | (is << 11); };
+	constexpr u32 kNop = 0x8000033c;
+	auto load = [&](u32 variant) {
+		Put(0, add(3, 1, 2), bal(15, 7)); // -> 64
+		Put(8, add(4, 3, 2), iaddiu(2, 2, 1));
+		Put(16, mul(5, 4, 4), iaddiu(3, 3, 1)); // return address
+		Put(24, add(6, 5, 1), kNop);
+		Put(32, 0x400002ff, kNop); // E bit
+		Put(40, 0x2ff, kNop);
+		if (variant == 2)
+		{
+			Put(64, add(7, 3, 3), bal(14, 7)); // -> 128
+			Put(72, 0x2ff, iaddiu(4, 4, 2));
+			Put(80, add(9, 7, 1), jr(15));
+			Put(88, add(8, 7, 2), kNop);
+			Put(128, mul(10, 7, 2), kNop);
+			Put(136, 0x2ff, jr(14)); // -> 80
+			Put(144, add(11, 10, 1), iaddiu(6, 6, 1));
+		}
+		else
+		{
+			Put(64, add(7, 3, 3), variant ? iaddiu(15, 15, variant == 3 ? 1 : 0) : iaddiu(4, 4, 2));
+			Put(72, 0x2ff, jr(15));
+			Put(80, add(8, 7, 2), kNop);
+		}
+	};
+	auto run = [&](u32 budget) {
+		VU0 = initial0;
+		VU1 = initial;
+		Compare(budget);
+	};
+	std::array<u64, 4> dispatches{};
+	for (u32 variant : {0u, 1u, 2u, 3u})
+	{
+		load(variant);
+		for (u32 budget = 1; budget <= 40; budget++)
+		{
+			SCOPED_TRACE(testing::Message() << "variant=" << variant << " budget=" << budget);
+			run(budget);
+			if (HasFatalFailure())
+				return;
+		}
+		// A fresh source: the first run compiles and cannot link yet.
+		load(variant);
+		Put(48, 0x2ff, kNop);
+		const u64 before = CpuArm64VU1.GetDispatchCount();
+		run(1000);
+		if (HasFatalFailure())
+			return;
+		dispatches[variant] = CpuArm64VU1.GetDispatchCount() - before;
+	}
+	EXPECT_LT(dispatches[0], dispatches[1]);
+	EXPECT_LE(dispatches[2], dispatches[0]);
 }
 
 TEST_F(VU1RecompilerTest, LinkedExitsEnterTheNextBlockDirectly)
@@ -4006,6 +4189,146 @@ TEST_F(VU1RecompilerTest, DividesInsideScheduledLoopsMatchEveryBudget)
 	}
 }
 
+
+TEST_F(VU1RecompilerTest, EfuOpsInsideScheduledLoopsMatchEveryBudget)
+{
+	// Pairs inside an EFU op's latency are scheduled and retire the slot into P
+	// themselves; an EFU op or WAITP stalls until one cycle before the entry is
+	// due and retires it. A loop keeps EFU ops in flight across its edge
+	// (profiled entries), mixed with MFP readers, divides and flag ops.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 values[] = {0x3f800000, 0x40800000, 0x3e800000, 0x41200000, 0x3fc00000, 0x40400000, 0x42c80000, 0x3f000000};
+	constexpr u32 length = 40;
+	u32 random = 4711;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	for (u32 seed = 0; seed < 24; seed++)
+	{
+		CpuArm64VU1.Reset();
+		for (u32 i = 0; i < length; i++)
+		{
+			u32 upper = 0x2ff;
+			const u32 fd = 1 + next() % 8, fs = 1 + next() % 8, ft = 1 + next() % 8, dest = 1 + next() % 15;
+			const u32 kind = next() % 10;
+			if (kind < 6)
+				upper = (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | (kind < 2 ? 0x28 : kind < 4 ? 0x2c : 0x2a); // ADD/SUB/MUL
+			u32 lower = 0x8000033c;
+			const u32 op = next() % 24, fsf = next() % 4, lfs = 1 + next() % 8, lft = 9 + next() % 4;
+			if (op < 2)
+				lower = 0x800007bd | (fsf << 21) | (lfs << 11); // ERSQRT
+			else if (op < 3)
+				lower = 0x800007bc | (fsf << 21) | (lfs << 11); // ESQRT
+			else if (op < 4)
+				lower = 0x800007be | (fsf << 21) | (lfs << 11); // ERCPR
+			else if (op < 5)
+				lower = 0x8000073c | (lfs << 11); // ESADD
+			else if (op < 6)
+				lower = 0x8000077e | (lfs << 11); // ESUM
+			else if (op < 7)
+				lower = 0x800007bf; // WAITP
+			else if (op < 10)
+				lower = 0x8000067c | (dest << 21) | (lft << 16); // MFP into vf9-12
+			else if (op < 11)
+				lower = 0x800003bc | (fsf << 23) | (lfs << 16) | (lfs << 11); // DIV
+			if (i == length - 1)
+				lower = 0x40000000 | ((0 - length) & 0x7ff); // B to the top
+			Put(i * 8, upper, lower);
+		}
+		Put(length * 8, 0x2ff, 0x8000033c); // Delay slot
+		for (u32 budget : {1u, 7u, 23u, 64u, 150u, 400u, 1000u})
+		{
+			for (u32 run = 0; run < 2; run++)
+			{
+				SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget << " run=" << run);
+				VU0 = initial0;
+				VU1 = initial;
+				VU1.cycle = 1000;
+				for (u32 reg = 1; reg <= 8; reg++)
+					for (u32 lane = 0; lane < 4; lane++)
+						VU1.VF[reg].UL[lane] = values[(reg * 3 + lane + seed) % std::size(values)];
+				Compare(budget);
+				if (HasFatalFailure())
+					return;
+			}
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ReadOnlyRegistersKeepRawValuesWhenClampedAtEntry)
+{
+	// A cached register that a profiled block only reads through clamping
+	// FMAC ops is clamped once at entry. Its non-finite raw bits must still be
+	// what the block leaves in memory, and every read must see them clamped.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 nop = 0x8000033c;
+	for (u32 i = 0; i < 16; i++)
+	{
+		const u32 fd = 6 + i % 3;
+		const u32 upper = i % 2 ? (15 << 21) | (5 << 16) | (1 << 11) | (fd << 6) | 0x2a : // MUL vfN, vf1, vf5
+		                          (15 << 21) | (2 << 16) | (5 << 11) | (fd << 6) | 0x28; // ADD vfN, vf5, vf2
+		Put(i * 8, upper, nop);
+	}
+	Put(16 * 8, 0x400002ff, nop); // E bit
+	Put(17 * 8, 0x2ff, nop);
+	for (u32 budget : {3u, 9u, 1000u})
+	{
+		for (u32 run = 0; run < 3; run++)
+		{
+			SCOPED_TRACE(testing::Message() << "budget=" << budget << " run=" << run);
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			VU1.VF[5].UL[0] = 0x7f800000; // +Inf
+			VU1.VF[5].UL[1] = 0xffc00001; // -NaN
+			VU1.VF[5].UL[2] = 0x7fffffff; // +NaN
+			VU1.VF[5].UL[3] = 0xff800000; // -Inf
+			Compare(budget);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, DivideAfterFssetPassesItsStickyBits)
+{
+	// A divide passes on the scratch's sticky D/I bits. After a flag instruction
+	// they are clear, so a region's divide does not need that instruction's
+	// flags; an FSSET in between sets them again and has to be seen.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 add = (15 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | 0x28; // ADD vf3, vf1, vf2
+	constexpr u32 nop = 0x8000033c;
+	constexpr u32 div = 0x800003bc | (1 << 23) | (1 << 16) | (1 << 11); // DIV Q, vf1x, vf1y
+	for (bool fsset : {false, true})
+	{
+		for (bool hack : {false, true})
+		{
+			EmuConfig.Speedhacks.vuFlagHack = hack;
+			CpuArm64VU1.Reset();
+			for (u32 i = 0; i < 24; i++)
+				Put(i * 8, add, nop);
+			if (fsset)
+				Put(10 * 8, 0x2ff, (0x15u << 25) | (1 << 21) | 0x400); // FSSET DS|IS
+			Put(11 * 8, 0x2ff, div); // no flag instruction between FSSET and the divide
+			Put(24 * 8, 0x400002ff, nop); // E bit
+			Put(25 * 8, 0x2ff, nop);
+			for (u32 budget : {1u, 9u, 12u, 15u, 20u, 1000u})
+			{
+				for (u32 run = 0; run < 3; run++)
+				{
+					SCOPED_TRACE(testing::Message() << "fsset=" << fsset << " hack=" << hack << " budget=" << budget << " run=" << run);
+					VU0 = initial0;
+					VU1 = initial;
+					VU1.cycle = 1000;
+					VU1.VF[1].F[0] = 0.0f;
+					VU1.VF[1].F[1] = 0.0f;
+					// Exits may relax the Z/S/U/O flags under the hack; D/I stay exact.
+					Compare(budget, hack ? 0x3c0 : 0, 1, hack);
+					if (HasFatalFailure())
+						return;
+				}
+			}
+		}
+	}
+}
 
 TEST_F(VU1RecompilerTest, SubroutineReturnsLinkToEveryCaller)
 {

@@ -21,6 +21,7 @@ sections unless a section says so.
 | 09-30 | Shadow of the Colossus at 6x | "EE: linking blocks on unprotected pages" |
 | 09-30 | Shadow of the Colossus at 6x | "MTVU ring: shared cache lines" |
 | 09-30 | SotC and Burnout 3 at 6x | "VU1 region exits under the flag hack" |
+| 10-01..04 | SotC and Burnout 3 at 6x | "VU1 per-pair cost and block transitions" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -3057,3 +3058,83 @@ Saru! Get You! 3. SotC (`WANDER_TO_KYOZOU_001`) is not deterministic from
 that state: master differed from itself at frames 480/600 in one of five MTVU
 runs, and with MTVU off at frames 300-600 in one of three. Frames 60-420
 matched in every MTVU run of both builds.
+
+## VU1 per-pair cost and block transitions
+
+Branch `vu1-pair-peepholes`. Each step was measured as host instructions per
+VU1 cycle on the VU1 thread (`thread_selfcounts` around `Execute()`), in ABBA
+pairs of 40 s runs from `WANDER_TO_KYOZOU_001` (SotC) and `BURN_OUT_3_002`
+(Burnout 3) at 6x, discarding the first two 4 s samples of each run. The
+toolchain changed partway (Command Line Tools clang 21, SDK 26.5), so the
+summary row rebuilds master with the same compiler.
+
+| Commit | Change | SotC | Burnout 3 |
+| --- | --- | --- | --- |
+| `a1b842205` | No vector copies around FMAC inputs, results and loads | 34.8 -> 33.5 | 68.2 -> 66.0 |
+| `a088536f0`, `34e9f6789` | Region cycles added to x26 only where read; FDIV slot resolved at compile time | -> 32.0 | -> 63.4 |
+| `ca4ab79ef` | Divides after a region flag op skip the scratch store | -> 31.3 | -> 62.7 |
+| `41fc2b3e8` | Pairs inside EFU latency scheduled like divides | 31.3 | -> 50.9 |
+| `8b38cb78b` | Exits store only the cached vectors the block writes | no change | no change |
+| `0ee4c3789` | Broadcast lanes by element; non-FMAC operands in place | 31.2 -> 30.7 | 51.1 -> 50.2 |
+| `0d3843cba` | Linked entries keep x19/x26/constants; self links skip the cache spill | 30.7 -> 29.9 | 50.2 -> 48.9 |
+| `d67295e59` | Traces follow BAL and the matching JR | 29.9 -> 28.8 | no change |
+| `9c25d3ed8` | An incoming CLIP retires on the schedule | 28.7 -> 28.4 | 49.1 -> 46.3 |
+| `2876fa292` | ILW/ILWR issue inside deferred regions | 28.3 -> 27.2 | 46.2 -> 44.2 |
+| `f8d751dd2` | Integer branch stalls on the block's own loads are computed | 27.2 -> 27.0 | 44.2 -> 41.2 |
+| `c4aa2ca4c` | The profile records a pending incoming load's registers | no change | 41.2 -> 36.3 |
+| | master -> branch, same compiler | 34.7 -> 27.0 (-22%) | 68.3 -> 36.4 (-47%) |
+
+Burnout 3's host cycles per VU1 cycle went from 14.8 to 8.4 in the same
+master/branch pairs; SotC's were too noisy on a hot machine to quote.
+
+Frame dumps (frames 60-600 by 60) matched master in all four states after
+each step, except SotC's frames 480/600, which also vary between runs of
+master; repeated SotC runs of each build matched every frame.
+
+### Where the VU1 thread's time goes
+
+Instruction counts hid the block transitions. A temporary build recorded each
+block's code address and pair boundaries, and `sample`'s JIT frame addresses
+were mapped onto them (self time, SotC, VU1 thread):
+
+| | Before `0d3843cba` | After `d67295e59` |
+| --- | --- | --- |
+| Deferred pairs | 30.7% | 32.0% |
+| Block entry | 10.2% | 4.2% |
+| Exit tails (link lookup, spills) | 10.1% | 9.3% |
+| Region exits and entries | 3.8% | 4.1% |
+| Generic and scheduled pairs, stubs | 14.1% | 14.0% |
+| `dVifUnpack` | 8.5% | 9.1% |
+| `ExecuteRingBuffer` | 7.0% | 6.4% |
+| `Execute` | 4.6% | 5.7% |
+
+SotC's hottest loops end in an integer branch whose delay slot is the block's
+own entry pair, and profiled loops always leave through their end exit, so
+each iteration paid a full link. About 30% of SotC's block exits were
+subroutine calls and returns. In Burnout 3 the generic pairs were mostly ILW
+and the integer branch testing the loaded word right after it; after
+`c4aa2ca4c` they are 2.7% of its VU1 thread, against 46% for deferred pairs.
+
+### What did not help
+
+- Clamping read-only cached registers in place at block entry (with
+  dirty-only writeback): 31.22 -> 31.18 in SotC. Most cached registers are
+  written somewhere in the block. Dropped; the writeback half was kept.
+- Moving `s_micro_changed`/`s_epoch` off a cache line the GS thread writes:
+  the sampled `swpab` stall moved to the next instructions and host cycles
+  did not change. Reading FPCR at entry costs about a cycle.
+- Tracking clamped lanes through ITOF, ABS, MAX/MINI, MOVE and MR32: 0.1%.
+  The input clamps left in hot code are on loop-carried values and loads.
+
+### Left
+
+- Under the flag hack, an exit followed by the E bit (Burnout 3: 887 of
+  1220 exact exits) keeps exact flags, so the last flag ops of each
+  microprogram compute them. That policy is unchanged here.
+- VI registers live in memory (`ldrh`/`strh`, about 1.5 per Burnout 3
+  deferred pair), and each region VI write captures the backup value even
+  when it expires unread.
+- A link transition still writes the four FMAC entries and the dirty cache
+  and the next block reloads them.
+- `dVifUnpack`'s own time (about 9% of SotC's VU1 thread) is in its block
+  lookup, not in the unpack code.

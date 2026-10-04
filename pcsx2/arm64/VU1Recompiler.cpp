@@ -36,6 +36,8 @@ namespace
 		std::array<int, 33> slots;
 		std::array<u32, 8> offsets;
 		u32 count = 0;
+		// Slots the block writes; exits store only these back.
+		u8 dirty = 0;
 
 		VectorCache()
 		{
@@ -43,6 +45,14 @@ namespace
 			offsets.fill(~u32(0));
 		}
 		VRegister Host(u32 reg) const { return VRegister(8 + slots[reg], 128); }
+	};
+
+	enum FdivStatic : u8
+	{
+		FdivUnknown, // check at runtime
+		FdivIdle, // nothing in the slot
+		FdivBusy, // in the slot, not due yet
+		FdivRetires, // due at this pair's cycle
 	};
 
 	struct RetirementSchedule
@@ -57,14 +67,18 @@ namespace
 		// so this pair has to retire it itself instead of leaving that to the
 		// generic per-pair preparation it is replacing.
 		bool fdiv_pending = false;
+		// What the FDIV slot does at this pair's start when the analysis knows
+		// the cycles since the divide issued (FdivStatic). Deferred regions use it.
+		u8 fdiv_static = 0;
+		// The same for the EFU slot (ESADD..ERSQRT, retiring into P). An EFU op
+		// or WAITP stalls until one cycle before the entry is due and retires
+		// it (_vuTestEFUStalls), so there it goes as soon as it is enabled.
+		bool efu_pending = false;
+		u8 efu_static = 0;
 		// Likewise for ILW/ILWR results in the IALU pipe. Only integer branches
 		// stall on them, so every other pair keeps its timing and just drops
 		// the entries that are due (VUPipeline::FlushIALU).
 		bool ialu_pending = false;
-		// Deferred regions keep retired flags in host registers, batch the backup
-		// countdown and cannot exit mid-region. A pair that observes any of that
-		// is still scheduled, but ends the region.
-		bool deferrable = true;
 	};
 
 	// Pipeline state a block was entered with, captured by Execute() so that
@@ -75,12 +89,15 @@ namespace
 	struct IncomingFmac
 	{
 		u32 regupper = 0, reglower = 0, xyzwupper = 0, xyzwlower = 0;
-		bool flags = false; // writes the status or clip flag, which scheduling must not retire
+		bool flags = false; // writes the status flag (FSSET), which scheduling must not retire
+		bool clip = false; // writes the clip flag (CLIP, FCSET), which a scheduled pair retires
 		u32 age = 0; // cycles since issue, 3 meaning ready before the first pair
 	};
 	// Packed, since Execute() captures and compares one on every dispatch:
 	// the entry count (3 bits) and the divide (6 bits), then 22 bits for each
-	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56.
+	// FMAC entry, oldest first, two in each word; the IALU pipe in bits 53-56
+	// and the EFU pipe in bits 57-62; the IALU registers in bits 44-59 of the
+	// second word.
 	struct IncomingProfile
 	{
 		u64 words[2] = {};
@@ -91,11 +108,20 @@ namespace
 		// Pairs an incoming ILW/ILWR result may still be pending; 0 if the IALU
 		// pipe is empty.
 		u32 Ialu() const { return (words[0] >> 53) & 15; }
+		// Pairs the incoming EFU entry may still be pending; 0 if none.
+		u32 Efu() const { return (words[0] >> 57) & 63; }
+		// The VI registers (bit n: VIn) the one ILW/ILWR still pending writes,
+		// which stalls integer branches reading them until Ialu() - 1 cycles
+		// after entry; AnyIaluRegs if more than one is pending.
+		static constexpr u32 AnyIaluRegs = 0xffff;
+		u32 IaluRegs() const { return (words[1] >> 44) & 0xffff; }
+		void SetIaluRegs(u32 regs) { words[1] |= u64(regs & 0xffff) << 44; }
 		static u32 Shift(u32 k) { return k < 2 ? 9 + 22 * k : 22 * (k - 2); }
-		void Set(u32 count, u32 fdiv, u32 ialu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53); }
+		void Set(u32 count, u32 fdiv, u32 ialu, u32 efu) { words[0] |= count | (fdiv << 3) | (u64(ialu) << 53) | (u64(efu) << 57); }
 		void SetFmac(u32 k, const IncomingFmac& e)
 		{
-			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) | (e.xyzwlower << 17);
+			const u64 bits = e.age | (e.flags << 2) | (e.regupper << 3) | (e.reglower << 8) | (e.xyzwupper << 13) |
+			                 (e.xyzwlower << 17) | (u64(e.clip) << 21);
 			words[k / 2] |= bits << Shift(k);
 		}
 		IncomingFmac Fmac(u32 k) const
@@ -108,6 +134,7 @@ namespace
 			e.reglower = (bits >> 8) & 31;
 			e.xyzwupper = (bits >> 13) & 15;
 			e.xyzwlower = (bits >> 17) & 15;
+			e.clip = (bits >> 21) & 1;
 			return e;
 		}
 	};
@@ -555,19 +582,38 @@ namespace
 		a.Str(w9, Field(offset));
 	}
 
+	// Stores the `mask` lanes (x = 8) of `value`: xy and zw as doublewords,
+	// other lanes singly. v3 is scratch.
 	void StoreMasked(MacroAssembler& a, VRegister value, MemOperand address, u32 mask)
 	{
 		if (!mask)
 			return;
 		if (mask == 15)
-			a.Str(value.Q(), address);
-		else
 		{
-			a.Ldr(q3, address);
-			for (u32 i = 0; i < 4; i++)
-				if (mask & (8 >> i))
-					a.Ins(v3.V4S(), i, value.V4S(), i);
-			a.Str(q3, address);
+			a.Str(value.Q(), address);
+			return;
+		}
+		const Register base = address.GetBaseRegister();
+		const s64 offset = address.GetOffset();
+		for (u32 half = 0; half < 2; half++)
+		{
+			const u32 lanes = (mask >> (2 - half * 2)) & 3; // bit 1: the half's first lane
+			if (lanes == 3)
+			{
+				if (half)
+					a.Mov(d3, value.V2D(), 1);
+				a.Str(half ? d3 : value.D(), MemOperand(base, offset + half * 8));
+				continue;
+			}
+			for (u32 k = 0; k < 2; k++)
+			{
+				if (!(lanes & (2 >> k)))
+					continue;
+				const u32 lane = half * 2 + k;
+				if (lane)
+					a.Mov(s3, value.V4S(), lane);
+				a.Str(lane ? s3 : value.S(), MemOperand(base, offset + lane * 4));
+			}
 		}
 	}
 
@@ -579,20 +625,56 @@ namespace
 			a.Ldr(value.Q(), Field(VectorOffset(reg)));
 	}
 
+	// The cache register of `reg`, or `temp` loaded from memory. Read only.
+	VRegister SourceVector(MacroAssembler& a, const VectorCache& cache, VRegister temp, u32 reg)
+	{
+		if (cache.slots[reg] >= 0)
+			return cache.Host(reg);
+		a.Ldr(temp.Q(), Field(VectorOffset(reg)));
+		return temp;
+	}
+
+	// Copies the `mask` lanes of `value` into `dest`, xy and zw as doublewords.
+	void MergeLanes(MacroAssembler& a, VRegister dest, VRegister value, u32 mask)
+	{
+		if (mask == 15)
+		{
+			if (!dest.Is(value))
+				a.Mov(dest.V16B(), value.V16B());
+			return;
+		}
+		for (u32 half = 0; half < 2; half++)
+		{
+			const u32 lanes = (mask >> (2 - half * 2)) & 3;
+			if (lanes == 3)
+				a.Ins(dest.V2D(), half, value.V2D(), half);
+			else
+				for (u32 k = 0; k < 2; k++)
+					if (lanes & (2 >> k))
+						a.Ins(dest.V4S(), half * 2 + k, value.V4S(), half * 2 + k);
+		}
+	}
+
 	void StoreVector(MacroAssembler& a, const VectorCache& cache, VRegister value, u32 reg, u32 mask = 15)
 	{
 		if (cache.slots[reg] < 0)
-		{
 			StoreMasked(a, value, Field(VectorOffset(reg)), mask);
+		else
+			MergeLanes(a, cache.Host(reg), value, mask);
+	}
+
+	// LQ and friends: loads the quadword at x1 + x0 * 16 into the `mask` lanes
+	// of `reg`, straight into a fully written cache register.
+	void LoadQuad(MacroAssembler& a, const VectorCache& cache, u32 reg, u32 mask)
+	{
+		const MemOperand address(x1, x0, LSL, 4);
+		if (mask == 15 && cache.slots[reg] >= 0)
+		{
+			a.Ldr(cache.Host(reg).Q(), address);
 			return;
 		}
-		const VRegister dest = cache.Host(reg);
-		if (mask == 15)
-			a.Mov(dest.V16B(), value.V16B());
-		else
-			for (u32 lane = 0; lane < 4; lane++)
-				if (mask & (8 >> lane))
-					a.Ins(dest.V4S(), lane, value.V4S(), lane);
+		a.Ldr(q0, address);
+		StoreVector(a, cache, v0, reg, mask);
 	}
 
 	void AssignVectorCache(Block& block)
@@ -625,6 +707,19 @@ namespace
 			block.cache.offsets[slot] = VectorOffset(reg);
 			block.cache.count++;
 			*best = 0;
+		}
+		for (u32 i = 0; i < block.count; i++)
+		{
+			const auto& ins = block.instructions[i];
+			for (const _VURegsNum* regs : {&ins.uregs, &ins.lregs})
+			{
+				if (regs == &ins.lregs && (ins.upper & 0x80000000))
+					continue;
+				if (regs->VFwrite && block.cache.slots[regs->VFwrite] >= 0)
+					block.cache.dirty |= 1 << block.cache.slots[regs->VFwrite];
+				if ((regs->VIwrite & (1 << REG_ACC_FLAG)) && block.cache.slots[32] >= 0)
+					block.cache.dirty |= 1 << block.cache.slots[32];
+			}
 		}
 	}
 
@@ -679,6 +774,34 @@ namespace
 		ClampInputAlways(a, reg);
 	}
 
+	// An FMAC input: VF `reg` (or ACC) with `lane` broadcast (-1: none), clamped
+	// like ClampInput unless `clamped`. Returns the cache register itself when
+	// nothing has to change, else `temp`; `copy` forces `temp`.
+	VRegister FetchInput(MacroAssembler& a, const VectorCache& cache, VRegister temp, u32 reg, int lane, bool clamped, bool copy = false)
+	{
+		VRegister value = SourceVector(a, cache, temp, reg);
+		if (lane >= 0)
+		{
+			a.Dup(temp.V4S(), value.V4S(), lane);
+			value = temp;
+		}
+		const bool daz = EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero();
+		if (!clamped && daz && CHECK_VU_OVERFLOW(0))
+		{
+			a.Smin(temp.V4S(), value.V4S(), v6.V4S());
+			a.Umin(temp.V4S(), temp.V4S(), v7.V4S());
+			return temp;
+		}
+		if (!value.Is(temp) && (copy || (!clamped && !daz)))
+		{
+			a.Mov(temp.V16B(), value.V16B());
+			value = temp;
+		}
+		if (!clamped && !daz)
+			ClampInputAlways(a, temp);
+		return value;
+	}
+
 	// Loads the shared per-block constants: the overflow-clamp bounds into
 	// v6/v7 when this block's options actually need them, and the FP
 	// exponent mask into v24 unconditionally (StoreMAC's MAC/status flag
@@ -716,6 +839,25 @@ namespace
 	u8 s_clamp_skip = 0;
 	u32 s_store_mac_count = 0;
 
+	// Clamps the result in v0 (v6/v7 hold the bounds for the whole block; see
+	// EmitBlockConstants) and writes its `mask` lanes to `reg`, unless that is
+	// VF0. A fully written cache register takes the last clamp step directly.
+	void StoreResult(MacroAssembler& a, const VectorCache& cache, u32 reg, u32 mask)
+	{
+		if (CHECK_VU_OVERFLOW(1))
+		{
+			a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
+			if (reg && mask == 15 && cache.slots[reg] >= 0)
+			{
+				a.Umin(cache.Host(reg).V4S(), v0.V4S(), v7.V4S());
+				return;
+			}
+			a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
+		}
+		if (reg)
+			StoreVector(a, cache, v0, reg, mask);
+	}
+
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
 	{
 		s_store_mac_count++;
@@ -735,14 +877,7 @@ namespace
 				a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
 				a.Mov(v0.V16B(), v19.V16B());
 			}
-			if (CHECK_VU_OVERFLOW(1))
-			{
-				a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
-				a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
-			}
-			const u32 fd = (code >> 6) & 31;
-			if (op.acc || fd)
-				StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+			StoreResult(a, cache, op.acc ? 32 : (code >> 6) & 31, mask);
 			return;
 		}
 		// v0 is the result. Classify all lanes using the interpreter's FP zero test.
@@ -796,16 +931,7 @@ namespace
 			a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
 			a.Mov(v0.V16B(), v19.V16B());
 		}
-		if (CHECK_VU_OVERFLOW(1))
-		{
-			// v6/v7 hold the clamp bounds for the whole block; see
-			// EmitBlockConstants.
-			a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
-			a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
-		}
-		const u32 fd = (code >> 6) & 31;
-		if (op.acc || fd)
-			StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+		StoreResult(a, cache, op.acc ? 32 : (code >> 6) & 31, mask);
 	}
 
 	void EmitUpper(MacroAssembler& a, const VectorCache& cache, u32 code)
@@ -815,21 +941,85 @@ namespace
 			return;
 		const u32 fs = (code >> 11) & 31, ft = (code >> 16) & 31, fd = (code >> 6) & 31;
 		const u32 mask = (code >> 21) & 15;
-		LoadVector(a, cache, q0, fs);
+		if (op.op == Op::Add || op.op == Op::Sub || op.op == Op::Mul || op.op == Op::Madd || op.op == Op::Msub)
+		{
+			// Inputs are read from the vector cache in place where possible; the
+			// result is computed into v0 (see StoreMAC).
+			const bool fused = op.op == Op::Madd || op.op == Op::Msub;
+			// FMUL/FMLA/FMLS read a broadcast operand's lane in place (`lane`);
+			// only ADD/SUB need it duplicated first. Same per-lane arithmetic.
+			const bool by_element = op.broadcast >= 0 && op.op != Op::Add && op.op != Op::Sub;
+			int lane = -1;
+			VRegister t;
+			if (op.broadcast >= 4)
+			{
+				a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
+				if (by_element)
+					lane = 0;
+				else
+					a.Dup(v1.V4S(), v1.V4S(), 0);
+				t = v1;
+				if (!(s_clamp_skip & 2))
+					ClampInput(a, v1);
+			}
+			else if (by_element)
+			{
+				// clamp_skip's ft bit covers just the broadcast lane.
+				t = FetchInput(a, cache, v1, ft, -1, s_clamp_skip & 2);
+				lane = op.broadcast;
+			}
+			else
+				t = FetchInput(a, cache, v1, ft, op.broadcast, s_clamp_skip & 2);
+			const VRegister s = FetchInput(a, cache, fused ? v2 : v0, fs, -1, s_clamp_skip & 1);
+			switch (op.op)
+			{
+				case Op::Add:
+					a.Fadd(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				case Op::Sub:
+					a.Fsub(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				case Op::Mul:
+					if (lane >= 0)
+						a.Fmul(v0.V4S(), s.V4S(), t.S(), lane);
+					else
+						a.Fmul(v0.V4S(), s.V4S(), t.V4S());
+					break;
+				default:
+					// Match the ARM64 interpreter's contracted multiply/add operations.
+					FetchInput(a, cache, v0, 32, -1, s_clamp_skip & 4, true);
+					if (op.op == Op::Madd)
+					{
+						if (lane >= 0)
+							a.Fmla(v0.V4S(), s.V4S(), t.S(), lane);
+						else
+							a.Fmla(v0.V4S(), s.V4S(), t.V4S());
+					}
+					else if (lane >= 0)
+						a.Fmls(v0.V4S(), s.V4S(), t.S(), lane);
+					else
+						a.Fmls(v0.V4S(), s.V4S(), t.V4S());
+					break;
+			}
+			StoreMAC(a, cache, op, code);
+			return;
+		}
+		// The other ops read fs (and ft) from the cache registers in place.
 		if (op.op == Op::Clip)
 		{
 			// CLIP compares signed bit patterns, including non-finite inputs.
 			// A denormal W uses the largest denormal threshold; FP compares differ.
-			LoadVector(a, cache, q1, ft);
-			a.Umov(w0, v1.V4S(), 3);
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			const VRegister ftv = SourceVector(a, cache, v1, ft);
+			a.Umov(w0, ftv.V4S(), 3);
 			a.And(w1, w0, 0x7fffffff);
 			a.Mov(w2, 0x007fffff);
 			a.Tst(w0, 0x7f800000);
 			a.Csel(w1, w1, w2, ne);
 			a.Dup(v1.V4S(), w1);
 			a.Movi(v2.V4S(), 0x80000000);
-			a.Eor(v2.V16B(), v0.V16B(), v2.V16B());
-			a.Cmgt(v0.V4S(), v0.V4S(), v1.V4S());
+			a.Eor(v2.V16B(), fsv.V16B(), v2.V16B());
+			a.Cmgt(v0.V4S(), fsv.V4S(), v1.V4S());
 			a.Cmgt(v2.V4S(), v2.V4S(), v1.V4S());
 			// Pack +X/-X/+Y/-Y/+Z/-Z into the next six history bits.
 			a.Mov(x0, 0x0000000400000001ull);
@@ -852,14 +1042,16 @@ namespace
 		{
 			if (!ft)
 				return;
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			VRegister result = v0;
 			if (op.op == Op::Abs)
 			{
 				a.Movi(v1.V4S(), 0x7fffffff);
-				a.And(v0.V16B(), v0.V16B(), v1.V16B());
+				a.And(v0.V16B(), fsv.V16B(), v1.V16B());
 			}
 			else if (op.op == Op::Itof)
 			{
-				a.Scvtf(v0.V4S(), v0.V4S());
+				a.Scvtf(v0.V4S(), fsv.V4S());
 				if (op.scale)
 				{
 					a.Movi(v1.V4S(), 0x3f800000 - (op.scale << 23));
@@ -868,44 +1060,46 @@ namespace
 			}
 			else
 			{
+				VRegister x = fsv;
 				if (op.scale)
 				{
 					a.Movi(v1.V4S(), 0x3f800000 + (op.scale << 23));
-					a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
+					a.Fmul(v0.V4S(), fsv.V4S(), v1.V4S());
+					x = v0;
 				}
 				a.Movi(v1.V4S(), 0x7f800000);
-				a.And(v2.V16B(), v0.V16B(), v1.V16B());
+				a.And(v2.V16B(), x.V16B(), v1.V16B());
 				a.Movi(v1.V4S(), 0x4f000000);
 				a.Cmhs(v2.V4S(), v2.V4S(), v1.V4S());
-				a.Sshr(v4.V4S(), v0.V4S(), 31);
+				a.Sshr(v4.V4S(), x.V4S(), 31);
 				a.Movi(v1.V4S(), 0x7fffffff);
 				a.Eor(v4.V16B(), v4.V16B(), v1.V16B());
-				a.Fcvtzs(v0.V4S(), v0.V4S());
+				a.Fcvtzs(v0.V4S(), x.V4S());
 				a.Bsl(v2.V16B(), v4.V16B(), v0.V16B());
-				a.Mov(v0.V16B(), v2.V16B());
+				result = v2;
 			}
-			StoreVector(a, cache, v0, ft, mask);
+			StoreVector(a, cache, result, ft, mask);
 			return;
-		}
-		if (op.broadcast < 4)
-		{
-			LoadVector(a, cache, q1, ft);
-			if (op.broadcast >= 0)
-				a.Dup(v1.V4S(), v1.V4S(), op.broadcast);
-		}
-		else
-		{
-			a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
-			a.Dup(v1.V4S(), v1.V4S(), 0);
 		}
 		if (op.op == Op::Max || op.op == Op::Min)
 		{
 			if (!fd)
 				return;
-			a.And(v2.V16B(), v0.V16B(), v1.V16B());
+			const VRegister fsv = SourceVector(a, cache, v0, fs);
+			VRegister tv = v1;
+			if (op.broadcast < 0)
+				tv = SourceVector(a, cache, v1, ft);
+			else if (op.broadcast < 4)
+				a.Dup(v1.V4S(), SourceVector(a, cache, v1, ft).V4S(), op.broadcast);
+			else
+			{
+				a.Ldr(s1, Field(VI(op.broadcast == 4 ? REG_I : REG_Q)));
+				a.Dup(v1.V4S(), v1.V4S(), 0);
+			}
+			a.And(v2.V16B(), fsv.V16B(), tv.V16B());
 			a.Cmlt(v2.V4S(), v2.V4S(), 0);
-			a.Smax(v4.V4S(), v0.V4S(), v1.V4S());
-			a.Smin(v0.V4S(), v0.V4S(), v1.V4S());
+			a.Smax(v4.V4S(), fsv.V4S(), tv.V4S());
+			a.Smin(v0.V4S(), fsv.V4S(), tv.V4S());
 			if (op.op == Op::Max)
 				a.Bsl(v2.V16B(), v0.V16B(), v4.V16B());
 			else
@@ -915,66 +1109,29 @@ namespace
 		}
 		if (op.op == Op::Opmula || op.op == Op::Opmsub)
 		{
-			// Outer product: rotate Fs to yzx and Ft to zxy before multiplying.
-			// The W lane of each shuffled vector is never read (mask is fixed
-			// to xyz), so it is left with whatever the copy produces.
-			a.Mov(v3.V16B(), v0.V16B());
-			a.Ins(v0.V4S(), 0, v3.V4S(), 1);
-			a.Ins(v0.V4S(), 1, v3.V4S(), 2);
-			a.Ins(v0.V4S(), 2, v3.V4S(), 0);
-			a.Mov(v3.V16B(), v1.V16B());
-			a.Ins(v1.V4S(), 0, v3.V4S(), 2);
-			a.Ins(v1.V4S(), 1, v3.V4S(), 0);
-			a.Ins(v1.V4S(), 2, v3.V4S(), 1);
+			// Outer product: rotate Fs to yzx (into v2) and Ft to zxy (into v1)
+			// before multiplying. EXT leaves the lane the rotation still needs
+			// in w. The W lanes are never read (mask is fixed to xyz).
+			const VRegister fsv = SourceVector(a, cache, v2, fs);
+			a.Ext(v2.V16B(), fsv.V16B(), fsv.V16B(), 4);
+			a.Ins(v2.V4S(), 2, v2.V4S(), 3);
+			const VRegister ftv = SourceVector(a, cache, v1, ft);
+			a.Ext(v1.V16B(), ftv.V16B(), ftv.V16B(), 12);
+			a.Ins(v1.V4S(), 0, v1.V4S(), 3);
 			if (!(s_clamp_skip & 1))
-				ClampInput(a, v0);
+				ClampInput(a, v2);
 			if (!(s_clamp_skip & 2))
 				ClampInput(a, v1);
 			if (op.op == Op::Opmula)
-				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
+				a.Fmul(v0.V4S(), v2.V4S(), v1.V4S());
 			else
 			{
-				LoadVector(a, cache, q2, 32);
-				if (!(s_clamp_skip & 4))
-					ClampInput(a, v2);
 				// Match the ARM64 interpreter's contracted multiply/subtract.
-				a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
-				a.Mov(v0.V16B(), v2.V16B());
+				FetchInput(a, cache, v0, 32, -1, s_clamp_skip & 4, true);
+				a.Fmls(v0.V4S(), v2.V4S(), v1.V4S());
 			}
 			StoreMAC(a, cache, op, code, 0xE);
-			return;
 		}
-		if (!(s_clamp_skip & 1))
-			ClampInput(a, v0);
-		if (!(s_clamp_skip & 2))
-			ClampInput(a, v1);
-		switch (op.op)
-		{
-			case Op::Add:
-				a.Fadd(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Sub:
-				a.Fsub(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Mul:
-				a.Fmul(v0.V4S(), v0.V4S(), v1.V4S());
-				break;
-			case Op::Madd:
-			case Op::Msub:
-				LoadVector(a, cache, q2, 32);
-				if (!(s_clamp_skip & 4))
-					ClampInput(a, v2);
-				// Match the ARM64 interpreter's contracted multiply/add operations.
-				if (op.op == Op::Madd)
-					a.Fmla(v2.V4S(), v0.V4S(), v1.V4S());
-				else
-					a.Fmls(v2.V4S(), v0.V4S(), v1.V4S());
-				a.Mov(v0.V16B(), v2.V16B());
-				break;
-			default:
-				break;
-		}
-		StoreMAC(a, cache, op, code);
 	}
 
 	// The VI backup (_vuBackupVI) as a deferred region knows it at compile time.
@@ -1028,8 +1185,25 @@ namespace
 	// prepare stub covers. The interpreter retires the pipe (_vuTestPipes)
 	// between that stall and the new op, so the old result must reach Q
 	// before this one replaces it.
+	// Set by EmitDeferredRegion around a divide whose status scratch was last
+	// written by a flag instruction in the region: that leaves only Z/S/U/O
+	// (VU_STAT_UPDATE), so FSSET's D/I sticky bits there are known clear.
+	bool s_div_clean_scratch = false;
+
+	// The status scratch bits a divide keeps: all but its own I/D.
+	u32 DivScratchMask()
+	{
+		return s_div_clean_scratch ? 0xfffff3cf : 0xffffffcf;
+	}
+
+	// Set by EmitDeferredRegion around a pair whose FDIV slot is known to be
+	// empty when its body runs (FdivStatic), so there is no stall to check.
+	bool s_fdiv_idle = false;
+
 	void EmitFDIVStall(MacroAssembler& a)
 	{
+		if (s_fdiv_idle)
+			return;
 		Label not_pending;
 		a.Ldr(w9, Field(offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)));
 		a.Cbz(w9, &not_pending);
@@ -1094,8 +1268,13 @@ namespace
 	// since every EFU-issuing op immediately overwrites the entry's Cycle right
 	// after anyway (WAITP leaves it disabled instead); mutate efu.Cycle to
 	// match exactly, needs proper testing right at the cycle-wrap boundary.
+	// Set by EmitDeferredRegion: its pairs retire the EFU slot before the body.
+	bool s_efu_idle = false;
+
 	void EmitEFUStall(MacroAssembler& a)
 	{
+		if (s_efu_idle)
+			return;
 		Label not_pending;
 		a.Ldr(w9, Field(offsetof(VURegs, efu) + offsetof(efuPipe, enable)));
 		a.Cbz(w9, &not_pending);
@@ -1243,12 +1422,12 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			a.B(&have_result);
 			a.Bind(&is_zero);
 			{
 				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-				a.And(w1, w1, 0xffffffcf);
+				a.And(w1, w1, DivScratchMask());
 				a.Fcmp(s2, 0.0);
 				Label fs_nonzero;
 				a.B(ne, &fs_nonzero);
@@ -1283,7 +1462,7 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			// "pl" (N==0) matches a plain "ft < 0.0" comparison, including the
 			// false-for-NaN case; "lt"/"ge" treat unordered operands as taken.
 			a.Fcmp(s3, 0.0);
@@ -1319,7 +1498,7 @@ namespace
 			ClampInput(a, v4); // result, after vuDouble
 			a.Umov(w0, v4.V4S(), 0);
 			a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-			a.And(w1, w1, 0xffffffcf);
+			a.And(w1, w1, DivScratchMask());
 			// See the SQRT case: "pl" is the correct false-for-NaN "ft < 0.0" test.
 			a.Fcmp(s3, 0.0);
 			a.B(pl, &have_result);
@@ -1328,7 +1507,7 @@ namespace
 			a.Bind(&ft_zero);
 			{
 				a.Ldr(w1, Field(offsetof(VURegs, statusflag)));
-				a.And(w1, w1, 0xffffffcf);
+				a.And(w1, w1, DivScratchMask());
 				a.Orr(w1, w1, 0x20); // D flag, always: division by zero
 				a.Eor(w0, w2, w3);
 				a.And(w0, w0, 0x80000000);
@@ -1563,9 +1742,15 @@ namespace
 			}
 			else
 			{
-				LoadVector(a, cache, q0, fs);
+				const VRegister value = SourceVector(a, cache, v0, fs);
 				if (op == Lower::Mr32)
-					a.Ext(v0.V16B(), v0.V16B(), v0.V16B(), 4);
+					a.Ext(v0.V16B(), value.V16B(), value.V16B(), 4);
+				else if (!value.Is(v0))
+				{
+					// MOVE between cached registers or out to memory: no copy.
+					StoreVector(a, cache, value, ft, mask);
+					return;
+				}
 			}
 			StoreVector(a, cache, v0, ft, mask);
 			return;
@@ -1586,16 +1771,12 @@ namespace
 			{
 				a.And(w0, w2, 0x3ff);
 				a.Ldr(x1, Field(offsetof(VURegs, Mem)));
-				a.Add(x1, x1, Operand(x0, LSL, 4));
 				if (load)
-				{
-					a.Ldr(q0, MemOperand(x1));
-					StoreVector(a, cache, v0, ft, mask);
-				}
+					LoadQuad(a, cache, ft, mask);
 				else
 				{
-					LoadVector(a, cache, q0, fs);
-					StoreMasked(a, v0, MemOperand(x1), mask);
+					a.Add(x1, x1, Operand(x0, LSL, 4));
+					StoreMasked(a, SourceVector(a, cache, v0, fs), MemOperand(x1), mask);
 				}
 			}
 			if (update)
@@ -1615,16 +1796,12 @@ namespace
 			a.Add(w0, w0, imm);
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
-			a.Add(x1, x1, Operand(x0, LSL, 4));
 			if (op == Lower::Lq)
-			{
-				a.Ldr(q0, MemOperand(x1));
-				StoreVector(a, cache, v0, ft, mask);
-			}
+				LoadQuad(a, cache, ft, mask);
 			else
 			{
-				LoadVector(a, cache, q0, fs);
-				StoreMasked(a, v0, MemOperand(x1), mask);
+				a.Add(x1, x1, Operand(x0, LSL, 4));
+				StoreMasked(a, SourceVector(a, cache, v0, fs), MemOperand(x1), mask);
 			}
 			return;
 		}
@@ -2035,7 +2212,24 @@ namespace
 			incoming[k] = block.incoming.Fmac(k);
 			phantom_ages[k] = incoming[k].age;
 		}
-		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0, efu_ready = 0;
+		u32 integer_ready = block.profiled ? block.incoming.Ialu() : 0;
+		// The block's own ILW/ILWR results: per VI register, the cycle (on the
+		// `elapsed` scale) at which the latest one stops stalling integer
+		// branches, or -1. Before `ialu_unknown`, incoming ones may be pending.
+		// (Once `elapsed` is unknown it stays so, along with these.)
+		std::array<int, 16> ialu_due;
+		ialu_due.fill(-1);
+		const u32 incoming_ialu_regs = block.profiled ? block.incoming.IaluRegs() : 0;
+		const u32 ialu_unknown = !block.profiled ? 4 :
+		                         incoming_ialu_regs == IncomingProfile::AnyIaluRegs ? block.incoming.Ialu() :
+		                                                                              0;
+		if (incoming_ialu_regs != IncomingProfile::AnyIaluRegs)
+			for (u32 reg = 0; reg < 16; reg++)
+				if (incoming_ialu_regs & (1 << reg))
+					ialu_due[reg] = static_cast<int>(block.incoming.Ialu()) - 1;
+		u32 efu_ready = block.profiled ? block.incoming.Efu() : 0;
+		int efu_due = block.profiled && block.incoming.Efu() ? static_cast<int>(block.incoming.Efu()) - 1 : -1;
+		bool efu_retired = false;
 		u32 fdiv_ready = block.profiled ? block.incoming.Fdiv() : 0;
 		// Cycles from block entry to the current pair, while every advance so
 		// far is known, and the cycle on that scale at which the pending divide
@@ -2043,6 +2237,8 @@ namespace
 		// remaining cycles plus one.
 		int elapsed = 0;
 		int fdiv_due = block.profiled && block.incoming.Fdiv() ? static_cast<int>(block.incoming.Fdiv()) - 1 : -1;
+		// Whether the pending divide has come due at a pair with a known cycle.
+		bool fdiv_retired = false;
 		block.known_prefix = block.count;
 		for (u32 i = 0; i < block.count; i++)
 		{
@@ -2117,7 +2313,18 @@ namespace
 			// unprofiled one's have retired after four pairs (ILW latency is four,
 			// and every pair advances at least one cycle).
 			const bool integer_branch = ins.lregs.pipe == VUPIPE_BRANCH && ins.lregs.VIread;
-			const bool integer_wait = integer_branch && !(i >= integer_ready && (block.profiled || i >= 4));
+			bool integer_wait = integer_branch && !(i >= integer_ready && (block.profiled || i >= 4));
+			// Within the latency of the block's own loads, the stall is known like
+			// a divide's: _vuTestALUStalls advances the branch to the load's
+			// stamp (the end of its pair) plus its latency, if that is later.
+			int ialu_target = -1;
+			if (integer_wait && i >= ialu_unknown && elapsed >= 0)
+			{
+				integer_wait = false;
+				for (u32 reg = 0; reg < 16; reg++)
+					if (ins.lregs.VIread & (1 << reg))
+						ialu_target = std::max(ialu_target, ialu_due[reg]);
+			}
 			if (integer_wait || ins.lregs.pipe == VUPIPE_XGKICK ||
 				(i && block.instructions[i - 1].lregs.pipe == VUPIPE_XGKICK))
 				cycles = -1;
@@ -2140,41 +2347,88 @@ namespace
 			if (fdiv_op && i < fdiv_ready)
 				cycles = (cycles > 0 && elapsed >= 0 && fdiv_due >= 0) ? std::max(cycles, fdiv_due - elapsed) : -1;
 			if (efu_op && i < efu_ready)
-				cycles = -1;
+				cycles = (cycles > 0 && elapsed >= 0 && efu_due >= 0) ? std::max(cycles, efu_due - 1 - elapsed) : -1;
+			if (cycles > 0 && ialu_target >= 0)
+				cycles = std::max(cycles, ialu_target - elapsed);
 			// An unprofiled block may be entered with a divide (up to 13 cycles)
 			// or an EFU operation (up to 54) in flight. Each pair advances at
 			// least one cycle.
 			if (!block.profiled && ((fdiv_op && i < 13) || (efu_op && i < 54)))
 				cycles = -1;
+			// The slot as this pair starts, before its own issue. A scheduled pair
+			// with no divide of the block's (or the profile's) in reach finds it
+			// empty: readiness admitted the schedule only with an idle slot.
+			u8 fdiv_static = FdivUnknown;
+			if (i >= fdiv_ready)
+				fdiv_static = FdivIdle;
+			else if (elapsed >= 0 && fdiv_due >= 0 && cycles > 0)
+			{
+				if (fdiv_retired)
+					fdiv_static = FdivIdle;
+				else if (elapsed + cycles >= fdiv_due)
+				{
+					fdiv_static = FdivRetires;
+					fdiv_retired = true;
+				}
+				else
+					fdiv_static = FdivBusy;
+			}
+			u8 efu_static = FdivUnknown;
+			if (i >= efu_ready)
+				efu_static = FdivIdle;
+			else if (elapsed >= 0 && efu_due >= 0 && cycles > 0)
+			{
+				if (efu_retired)
+					efu_static = FdivIdle;
+				else if (elapsed + cycles >= efu_due - (efu_op ? 1 : 0))
+				{
+					efu_static = FdivRetires;
+					efu_retired = true;
+				}
+				else
+					efu_static = FdivBusy;
+			}
 			if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
+			{
 				integer_ready = i + 5;
+				const int due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
+				for (u32 reg = 0; reg < 16; reg++)
+					if (ins.lregs.VIwrite & (1 << reg))
+						ialu_due[reg] = due;
+			}
 			// Divides are frequent enough in transform code that excluding their whole
 			// latency from scheduling costs far more than retiring the pipe's single
 			// slot inline: those pairs carry fdiv_pending instead and do it themselves
 			// (see EmitScheduledPrepare and EmitDeferredRegion).
 			if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles)
 			{
+				fdiv_retired = false;
 				fdiv_ready = i + ins.lregs.cycles + 1;
 				// _vuFDIVAdd stamps the cycle the pair ends on.
 				fdiv_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
 			}
-			// The EFU pipe's single slot (ESADD..EEXP, retiring into P) is rare enough
-			// that it keeps the simpler treatment: stay generic for its full latency.
+			// The EFU slot the same way: Burnout 3's lighting loops keep an EFU op in
+			// flight nearly all the time. Needs proper testing across games.
 			if (ins.lregs.pipe == VUPIPE_EFU && ins.lregs.cycles)
+			{
+				efu_retired = false;
 				efu_ready = i + ins.lregs.cycles + 1;
+				efu_due = (elapsed >= 0 && cycles > 0) ? elapsed + cycles + static_cast<int>(ins.lregs.cycles) : -1;
+			}
 			if (cycles <= 0 && block.known_prefix == block.count)
 				block.known_prefix = i;
 			// Without a profile the first seven pairs stay generic: three whose
 			// stalls depend on the unknown incoming entries, then four for the
 			// ages of their producers to become known.
-			if ((block.profiled || i >= 7) && cycles > 0 && i >= efu_ready)
+			if ((block.profiled || i >= 7) && cycles > 0)
 			{
 				RetirementSchedule plan{static_cast<u8>(cycles)};
 				plan.fdiv_pending = i < fdiv_ready;
+				plan.fdiv_static = fdiv_static;
+				// Before this pair's own issue moved efu_ready.
+				plan.efu_pending = efu_static != FdivIdle;
+				plan.efu_static = efu_static;
 				plan.ialu_pending = i < integer_ready;
-				// Deferred regions do not issue into the IALU pipe.
-				if (ins.lregs.pipe == VUPIPE_IALU && ins.lregs.cycles)
-					plan.deferrable = false;
 				for (u32 k = 0; k < phantoms && plan.cycles; k++)
 				{
 					if (phantom_ages[k] < 0)
@@ -2187,6 +2441,9 @@ namespace
 					{
 						if (incoming[k].flags)
 							plan.cycles = 0;
+						// Like a CLIP issued in the block (see below).
+						if (incoming[k].clip)
+							plan.clip_retires |= 1 << plan.retired;
 						plan.retired++;
 					}
 				}
@@ -2228,7 +2485,9 @@ namespace
 				// VU1 thread in region exits. EFU issues stay generic.
 				const bool waitq = !(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Waitq;
 				const bool fdiv_issue = ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles;
-				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq && !fdiv_issue)
+				// EFU ops and WAITP likewise: the slot retires before the body.
+				const bool efu_issue = ins.lregs.pipe == VUPIPE_EFU;
+				if ((ins.lregs.VIwrite & ((1 << REG_Q) | (1 << REG_P))) && !waitq && !fdiv_issue && !efu_issue)
 					plan.cycles = 0;
 				// Flag, Q and P readers stay in a region, which publishes the
 				// status and MAC flags it keeps in registers before them. An
@@ -2265,7 +2524,7 @@ namespace
 	// flight there is the block's own or the profiled incoming one: an in-block
 	// divide stalls until any earlier one retires, and every later pair that
 	// does not retire the slot is past that divide's latency.
-	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false, bool ialu_pending = false)
+	void EmitScheduleReadiness(MacroAssembler& a, bool fdiv_pending = false, bool ialu_pending = false, bool efu_pending = false)
 	{
 		// Bit 0 validates incoming FMAC timing and excludes callbacks. Bit 1
 		// additionally permits scheduled execution once special queues drain.
@@ -2276,6 +2535,7 @@ namespace
 				 offsetof(VURegs, efu) + offsetof(efuPipe, enable), offsetof(VURegs, ialucount)})
 		{
 			if ((fdiv_pending && offset == offsetof(VURegs, fdiv) + offsetof(fdivPipe, enable)) ||
+				(efu_pending && offset == offsetof(VURegs, efu) + offsetof(efuPipe, enable)) ||
 				(ialu_pending && offset == offsetof(VURegs, ialucount)))
 				continue;
 			a.Ldr(w9, Field(offset));
@@ -2357,6 +2617,49 @@ namespace
 	// due, which is the common case even inside a divide's latency. `status`
 	// holds the status flag; it is loaded and stored around the merge unless
 	// the caller keeps it in that register (deferred regions keep it in w25).
+	// Retires the EFU slot into P: when due at x26, or (`stall`) whenever it is
+	// enabled, for the EFU op or WAITP that stalls on it; `known` skips the
+	// checks for a slot known to be due.
+	void EmitEFUSlotRetire(MacroAssembler& a, bool stall, bool known)
+	{
+		Label end;
+		constexpr size_t offset = offsetof(VURegs, efu);
+		if (!known)
+		{
+			a.Ldr(w11, Field(offset + offsetof(efuPipe, enable)));
+			a.Cbz(w11, &end);
+			if (!stall)
+			{
+				a.Ldr(x11, Field(offset + offsetof(efuPipe, sCycle)));
+				a.Ldr(w12, Field(offset + offsetof(efuPipe, Cycle)));
+				a.Sub(x11, x26, x11);
+				a.Cmp(x11, x12);
+				a.B(lo, &end);
+			}
+		}
+		a.Str(wzr, Field(offset + offsetof(efuPipe, enable)));
+		a.Ldr(w11, Field(offset + offsetof(efuPipe, reg)));
+		a.Str(w11, Field(VI(REG_P)));
+		a.Bind(&end);
+	}
+
+	// Retires the FDIV slot, known to be due: Q and the status flag's D/I bits.
+	void EmitFDIVRetire(MacroAssembler& a, const Register& status, bool in_memory)
+	{
+		constexpr size_t offset = offsetof(VURegs, fdiv);
+		a.Str(wzr, Field(offset + offsetof(fdivPipe, enable)));
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, reg)));
+		a.Str(w11, Field(VI(REG_Q)));
+		if (in_memory)
+			a.Ldr(status, Field(VI(REG_STATUS_FLAG)));
+		a.And(status, status, 0xfcf);
+		a.Ldr(w11, Field(offset + offsetof(fdivPipe, statusflag)));
+		a.And(w11, w11, 0xc30);
+		a.Orr(status, status, w11);
+		if (in_memory)
+			a.Str(status, Field(VI(REG_STATUS_FLAG)));
+	}
+
 	void EmitFDIVSlotRetire(MacroAssembler& a, const Register& status, bool in_memory)
 	{
 		Label end;
@@ -2451,6 +2754,8 @@ namespace
 		// both merge into VI[REG_STATUS_FLAG].
 		if (plan.fdiv_pending)
 			EmitFDIVSlotRetire(a, w10, true);
+		if (plan.efu_pending)
+			EmitEFUSlotRetire(a, block.instructions[index].lregs.pipe == VUPIPE_EFU, false);
 		if (plan.ialu_pending)
 			EmitIALURetire(a);
 		// Needs proper testing across more games.
@@ -2474,10 +2779,20 @@ namespace
 		};
 		std::array<Slot, 4> slots{};
 		u32 issued = 0, elapsed = 0, backup_cycles = 0;
+		// Cycles not yet added to x26, which only divides, IALU retirement and
+		// exits read inside a region.
+		u32 pending_cycles = 0;
 		StaticViBackup vi;
 		// Whether v25 may hold sticky status bits not yet in w25.
 		bool raw_retired = false;
 	};
+
+	void FlushCycles(MacroAssembler& a, RegionSlots& state)
+	{
+		if (state.pending_cycles)
+			a.Add(x26, x26, state.pending_cycles);
+		state.pending_cycles = 0;
+	}
 
 	// Fold the sticky bits of retired unobserved entries (v25) into w25.
 	void EmitStickyFold(MacroAssembler& a, const RegionSlots& state)
@@ -2514,8 +2829,9 @@ namespace
 	// Publish what a deferred region keeps in registers, as of the end of pair
 	// `last`: the live FMAC entries, queue positions, status/MAC flags, the
 	// batched backup countdown and TPC.
-	void EmitRegionExit(MacroAssembler& a, const Block& block, const RegionSlots& state, u32 last_index)
+	void EmitRegionExit(MacroAssembler& a, const Block& block, RegionSlots state, u32 last_index)
 	{
+		FlushCycles(a, state);
 		if (state.vi.known)
 		{
 			a.Mov(w9, state.vi.left);
@@ -2768,10 +3084,13 @@ namespace
 			Dead,
 		};
 		std::array<Entry, MaxInstructions> kinds{};
+		std::array<bool, MaxInstructions> div_clean{};
 		{
 			std::array<int, MaxInstructions> source{};
 			std::array<bool, MaxInstructions> flag_op{}, needed{}, scratch_full{};
 			int scratch = -1, latest = -1;
+			// Whether a flag instruction wrote the scratch after any FSSET.
+			bool scratch_clean = false;
 			u32 count = 0, sticky_seen = 0;
 			const bool flag_hack = EmuConfig.Speedhacks.vuFlagHack;
 			// [first, count) entries live at exits whose flags nothing reads.
@@ -2794,17 +3113,29 @@ namespace
 				{
 					flag_op[count] = UpdatesMacFlags(ins.upper);
 					if (flag_op[count])
+					{
 						scratch = static_cast<int>(count);
+						scratch_clean = true;
+					}
 					source[count] = scratch;
 					// CLIP/FCSET retire the clip flag, FSSET reads the scratch.
 					if ((ins.uregs.VIwrite | ins.lregs.VIwrite) & ((1 << REG_CLIP_FLAG) | (1 << REG_STATUS_FLAG)))
 						needed[count] = true;
 					count++;
 				}
-				// A divide reads the status scratch (for the sticky D/I bits it
-				// passes on) from memory, so the latest flag op has to store it.
+				if (!(ins.upper & 0x80000000) && DecodeLower(ins.lower) == Lower::Fsset)
+					scratch_clean = false;
+				// A divide passes on the scratch's sticky D/I bits and keeps the
+				// rest. After a flag instruction in the region those bits are
+				// clear, so it needs nothing from that instruction; otherwise the
+				// latest one has to store the scratch.
 				if (ins.lregs.pipe == VUPIPE_FDIV && ins.lregs.cycles && scratch >= 0)
-					scratch_full[scratch] = true;
+				{
+					if (scratch_clean)
+						div_clean[i] = true;
+					else
+						scratch_full[scratch] = true;
+				}
 				const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 				const bool untaken = integer_branch && i + 1 < block.count;
 				if (untaken || i + 1 == end)
@@ -2846,7 +3177,7 @@ namespace
 			const auto& ins = block.instructions[i];
 			const bool integer_branch = !(ins.upper & 0x80000000) && IsIntegerBranch(DecodeLower(ins.lower));
 			elapsed += plan.cycles;
-			a.Add(x26, x26, plan.cycles);
+			state.pending_cycles += plan.cycles;
 			int mac_from = -1;
 			for (u32 j = 0; j < plan.retired; j++)
 			{
@@ -2876,8 +3207,17 @@ namespace
 			}
 			if (mac_from >= 0)
 				a.Umov(w28, VRegister(28 + mac_from, 128).V4S(), 0);
-			if (plan.fdiv_pending)
+			const bool fdiv_check = plan.fdiv_pending && plan.fdiv_static == FdivUnknown;
+			const bool efu_stall = ins.lregs.pipe == VUPIPE_EFU;
+			const bool efu_check = plan.efu_pending && plan.efu_static == FdivUnknown && !efu_stall;
+			if (fdiv_check || efu_check || plan.ialu_pending)
+				FlushCycles(a, state);
+			if (fdiv_check)
 				EmitFDIVSlotRetire(a, w25, false);
+			else if (plan.fdiv_pending && plan.fdiv_static == FdivRetires)
+				EmitFDIVRetire(a, w25, false);
+			if (plan.efu_pending && plan.efu_static != FdivBusy)
+				EmitEFUSlotRetire(a, efu_stall, plan.efu_static == FdivRetires);
 			if (plan.ialu_pending)
 				EmitIALURetire(a);
 			// Only an integer write or branch can inspect/reset the backup
@@ -2910,7 +3250,17 @@ namespace
 			s_discard_flags = kind == Entry::Dead;
 			s_vi_backup = &state.vi;
 			s_clamp_skip = block.clamp_skip[i];
+			// Divides (and WAITQ) stall on and record the cycle.
+			if (ins.lregs.pipe != VUPIPE_FMAC && ins.lregs.pipe != VUPIPE_NONE && ins.lregs.pipe != VUPIPE_BRANCH)
+				FlushCycles(a, state);
+			s_fdiv_idle = plan.fdiv_static == FdivIdle || plan.fdiv_static == FdivRetires;
+			// An EFU op or WAITP retired the slot above.
+			s_efu_idle = true;
+			s_div_clean_scratch = div_clean[i];
 			EmitPair(a, block.cache, ins, false);
+			s_div_clean_scratch = false;
+			s_fdiv_idle = false;
+			s_efu_idle = false;
 			s_clamp_skip = 0;
 			s_raw_flag_slot = -1;
 			s_discard_flags = false;
@@ -2918,6 +3268,9 @@ namespace
 				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);
 			s_vi_backup = nullptr;
+			// ILW/ILWR: the IALU entry goes to memory as on the generic path; the
+			// cycles were flushed above. Later pairs retire it (ialu_pending).
+			EmitIntegerIssue(a, ins);
 			if (HasFmac(ins))
 			{
 				const u32 slot = issued++ & 3;
@@ -2955,12 +3308,17 @@ namespace
 		// pairs and the size limit end the trace.
 		u32 next_pc = pc, branch_target = 0;
 		bool pending_branch = false;
-		// JR/JALR/BAL: the target isn't a compile-time constant to continue tracing
-		// into (JR/JALR read it from a register; BAL's static target is deliberately
-		// not exploited, to keep one code path). EmitControlFlow resolves branchpc
-		// itself instead of relying on a precomputed branch_target/next_pc, so the
-		// trace simply ends once their delay slot has been emitted.
+		// JR/JALR/BAL: EmitControlFlow resolves branchpc itself (from the register
+		// at runtime for JR/JALR) instead of relying on a precomputed
+		// branch_target/next_pc. The trace follows BAL to its static target, and
+		// JR/JALR when the register still holds a return address a BAL/JALR in
+		// this trace linked, so subroutine calls and returns stay in one block.
+		// Otherwise it ends once their delay slot has been emitted.
 		bool pending_branch_terminal = false;
+		// VI[0..15] values the trace linked itself and has not overwritten since
+		// (in pairs), or -1. Neither JR nor JALR bypasses the VI backup.
+		std::array<int, 16> linked;
+		linked.fill(-1);
 		std::array<bool, VU1_PROGSIZE / 8> visited{};
 		for (u32 i = 0; i < MaxInstructions && next_pc < VU1_PROGSIZE; i++)
 		{
@@ -3024,8 +3382,20 @@ namespace
 			}
 			else if (terminal_branch)
 			{
+				const Lower op = DecodeLower(ins.lower);
+				const u32 is_reg = (ins.lower >> 11) & 15;
+				int target = -1;
+				if (op == Lower::Bal)
+				{
+					const s32 displacement = (static_cast<s32>(ins.lower << 21) >> 21) * 8;
+					target = static_cast<int>((ins.pc + 8 + displacement) & VU1_PROGMASK);
+				}
+				else if (linked[is_reg] >= 0)
+					target = static_cast<int>((static_cast<u32>(linked[is_reg]) * 8) & VU1_PROGMASK);
 				pending_branch = true;
-				pending_branch_terminal = true;
+				pending_branch_terminal = target < 0;
+				if (target >= 0)
+					branch_target = static_cast<u32>(target);
 				block->has_branches = true;
 			}
 			next_pc = block->next_pc[i];
@@ -3071,6 +3441,16 @@ namespace
 					ins.readMasks[regs->VFread1] |= regs->VFr1xyzw;
 			}
 			ins.readsVF = std::any_of(ins.readMasks.begin(), ins.readMasks.end(), [](u8 mask) { return mask != 0; });
+			if (!(ins.upper & 0x80000000))
+			{
+				for (u32 reg = 1; reg < 16; reg++)
+					if (ins.lregs.VIwrite & (1 << reg))
+						linked[reg] = -1;
+				const Lower op = DecodeLower(ins.lower);
+				const u32 it_reg = (ins.lower >> 16) & 15;
+				if ((op == Lower::Bal || op == Lower::Jalr) && it_reg)
+					linked[it_reg] = static_cast<int>((ins.pc + 16) / 8);
+			}
 			if (i >= 3)
 			{
 				// Four cycles have elapsed since block entry, so incoming FMAC results
@@ -3146,7 +3526,7 @@ namespace
 			std::vector<DeferredRegion> regions;
 			// A pair inside a divide's latency retires the FDIV slot into the
 			// status flag a deferred region keeps in w25.
-			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0 && block->schedule[i].deferrable; };
+			const auto deferrable = [&](u32 i) { return block->schedule[i].cycles != 0; };
 			// Unprofiled blocks never schedule their first seven pairs.
 			const u32 first_scheduled = block->profiled ? 0 : 7;
 			for (u32 i = first_scheduled; i < block->count;)
@@ -3187,7 +3567,9 @@ namespace
 				return &link_sites[link_count++];
 			};
 			// Entered from another block's exit: the frame, start and budget are
-			// already in place, and a linked exit never has a packet pending.
+			// already in place, and a linked exit never has a packet pending. So
+			// are x19, the block constants (every block uses the same options, and
+			// code that calls C++ reloads them) and x26, which the exit stored.
 			a.Bind(&linked_entry);
 			a.Str(wzr, MemOperand(sp, 72));
 			a.B(&common_entry);
@@ -3203,8 +3585,11 @@ namespace
 				a.Stp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
 			a.Mov(x20, x0);
 			a.Mov(x21, x1);
-			a.Bind(&common_entry);
 			a.Mov(x19, reinterpret_cast<uintptr_t>(&VU1));
+			// Keep queue insertion and budget checks off the cycle store/load chain.
+			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+			EmitBlockConstants(a);
+			a.Bind(&common_entry);
 			u32 scheduled_pairs = 0;
 			for (u32 i = first_scheduled; i < block->count; i++)
 				scheduled_pairs += block->schedule[i].cycles != 0;
@@ -3219,12 +3604,9 @@ namespace
 				a.Mov(w25, block->incoming.Ialu() ? 1 : 3);
 			else if (scheduled)
 				EmitScheduleGuard(a);
-			// Keep queue insertion and budget checks off the cycle store/load chain.
-			a.Ldr(x26, Field(offsetof(VURegs, cycle)));
 			a.Mov(x24, reinterpret_cast<uintptr_t>(cache.offsets.data()));
 			for (u32 slot = 0; slot < cache.count; slot++)
 				a.Ldr(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
-			EmitBlockConstants(a);
 			// Share the most frequent helper address in x22; keep preparation code
 			// outside the emitted instruction stream to avoid instruction-cache growth.
 			const auto& prepare = s_pipeline.prepare;
@@ -3253,7 +3635,7 @@ namespace
 				const bool schedule_pair = scheduled && block->schedule[i].cycles != 0;
 				if (schedule_pair && (!readiness_checked || !block->schedule[i - 1].cycles || region_start))
 				{
-					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending, block->schedule[i].ialu_pending);
+					EmitScheduleReadiness(a, block->schedule[i].fdiv_pending, block->schedule[i].ialu_pending, block->schedule[i].efu_pending);
 					readiness_checked = true;
 				}
 				if (region_start)
@@ -3384,6 +3766,57 @@ namespace
 				a.Str(w9, MemOperand(sp, 72));
 				a.B(&loop_entry);
 			}
+			else if (block->next_pc[block->count - 1] == block->instructions[0].pc)
+			{
+				// The end exit continues at this block's own entry, typically a
+				// loop whose closing branch has the entry pair as its delay slot
+				// (profiled loops always leave this way). Once Execute() linked it
+				// back to this very block, its first way enters it, and a running
+				// block is current: re-enter at loop_entry with the cache, x22-x24
+				// and the frame as they are, skipping the spill, the reload and
+				// the way search. The other checks match link_exit's; failing one
+				// leaves through `exit`, which spills. Needs proper testing.
+				Label* site = add_link(block->count - 1);
+				const LinkSlot& slot = block->links[link_count - 1];
+				a.Mov(x0, reinterpret_cast<uintptr_t>(&slot));
+				a.Ldr(x11, MemOperand(x0, offsetof(LinkSlot, ways) + offsetof(LinkSlot::Way, entry)));
+				a.Adr(x10, &linked_entry);
+				a.Cmp(x11, x10);
+				a.B(ne, site);
+				a.Ldr(w9, Field(VI(REG_TPC)));
+				a.Ldr(w10, MemOperand(x0, offsetof(LinkSlot, ways) + offsetof(LinkSlot::Way, pc)));
+				a.Cmp(w9, w10);
+				a.B(ne, site);
+				a.Sub(x9, x26, x20);
+				a.Cmp(x9, x21);
+				a.B(hs, &exit);
+				if (s_options & 32)
+				{
+					a.Ldr(w9, Field(offsetof(VURegs, flags)));
+					a.Tbz(w9, __builtin_ctz(VUFLAG_MTVURUNNING), &exit);
+				}
+				else
+				{
+					a.Mov(x16, reinterpret_cast<uintptr_t>(&VU0.VI[REG_VPU_STAT].UL));
+					a.Ldr(w9, MemOperand(x16));
+					a.Tbz(w9, 8, &exit);
+				}
+				a.Ldr(w9, Field(offsetof(VURegs, branch)));
+				a.Ldr(w10, Field(offsetof(VURegs, ebit)));
+				a.Orr(w9, w9, w10);
+				a.Ldrb(w10, Field(offsetof(VURegs, takedelaybranch)));
+				a.Orr(w9, w9, w10);
+				a.Ldr(w10, Field(offsetof(VURegs, xgkickenable)));
+				a.Orr(w9, w9, w10);
+				a.Cbnz(w9, &exit);
+				a.Str(x26, Field(offsetof(VURegs, cycle)));
+				a.Str(wzr, MemOperand(sp, 72));
+				if (block->profiled && scheduled)
+					a.Mov(w25, block->incoming.Ialu() ? 1 : 3);
+				else if (scheduled)
+					EmitScheduleGuard(a);
+				a.B(&loop_entry);
+			}
 			else
 				a.B(add_link(block->count - 1));
 			for (u32 k = 0; k < link_count; k++)
@@ -3395,7 +3828,8 @@ namespace
 			a.Bind(&exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
-				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+				if (cache.dirty & (1 << slot))
+					a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			a.Bind(&restore);
 			for (u32 slot = 0; slot < 8; slot += 2)
 				a.Ldp(VRegister(8 + slot, 64), VRegister(9 + slot, 64), MemOperand(sp, saved_size + slot * 8));
@@ -3412,7 +3846,8 @@ namespace
 			a.Bind(&link_exit);
 			a.Str(x26, Field(offsetof(VURegs, cycle)));
 			for (u32 slot = 0; slot < cache.count; slot++)
-				a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
+				if (cache.dirty & (1 << slot))
+					a.Str(VRegister(8 + slot, 128), Field(cache.offsets[slot]));
 			a.Sub(x9, x26, x20);
 			a.Cmp(x9, x21);
 			a.B(hs, &restore);
@@ -3493,11 +3928,19 @@ namespace
 	// divide is admitted and described instead. Anything else stays unprofiled.
 	bool CaptureProfile(IncomingProfile& profile)
 	{
-		if (VU1.xgkickenable || VU1.efu.enable)
+		if (VU1.xgkickenable)
 			return false;
 		const u64 cycle = VU1.cycle;
 		if (cycle >= ~u64(0) - (MaxInstructions * 4 + 4))
 			return false;
+		u32 efu = 0;
+		if (VU1.efu.enable)
+		{
+			if (VU1.efu.sCycle > cycle || VU1.efu.Cycle > 60)
+				return false;
+			const u64 ready = VU1.efu.sCycle + VU1.efu.Cycle;
+			efu = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
+		}
 		u32 fdiv = 0;
 		if (VU1.fdiv.enable)
 		{
@@ -3510,7 +3953,7 @@ namespace
 		}
 		// ILW/ILWR results only delay integer branches, and the generic
 		// preparation drains the pipe; the schedule stays off until it has.
-		u32 ialu = 0;
+		u32 ialu = 0, ialu_regs = 0;
 		if (VU1.ialucount)
 		{
 			if (VU1.ialucount > 4 || VU1.ialureadpos > 3 || VU1.ialuwritepos != ((VU1.ialureadpos + VU1.ialucount) & 3))
@@ -3522,13 +3965,17 @@ namespace
 				if (entry.sCycle > cycle || entry.Cycle > 8)
 					return false;
 				ready = std::max<u64>(ready, entry.sCycle + entry.Cycle);
+				// Due entries stall nothing.
+				if (entry.sCycle + entry.Cycle > cycle)
+					ialu_regs = ialu_regs ? IncomingProfile::AnyIaluRegs : (entry.reg & 0xffff);
 			}
 			ialu = static_cast<u32>((ready > cycle ? ready - cycle : 0) + 1);
 		}
 		const u32 count = VU1.fmaccount;
 		if (count > 4 || VU1.fmacreadpos > 3 || VU1.fmacwritepos != ((VU1.fmacreadpos + count) & 3))
 			return false;
-		profile.Set(count, fdiv, ialu);
+		profile.Set(count, fdiv, ialu, efu);
+		profile.SetIaluRegs(ialu_regs);
 		u64 previous = 0;
 		for (u32 k = 0; k < count; k++)
 		{
@@ -3538,7 +3985,8 @@ namespace
 				return false;
 			previous = entry.sCycle;
 			IncomingFmac fmac;
-			fmac.flags = (entry.flagreg & ((1 << REG_STATUS_FLAG) | (1 << REG_CLIP_FLAG))) != 0;
+			fmac.flags = (entry.flagreg & (1 << REG_STATUS_FLAG)) != 0;
+			fmac.clip = (entry.flagreg & (1 << REG_CLIP_FLAG)) != 0;
 			// Three cycles old is ready at the first pair's cycle and cannot stall
 			// it; the registers of such an entry no longer matter.
 			fmac.age = static_cast<u32>(std::min<u64>(cycle - entry.sCycle, 3));
