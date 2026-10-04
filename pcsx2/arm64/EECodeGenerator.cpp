@@ -1162,6 +1162,10 @@ namespace
 		a.Ldp(x4, x5, MemOperand(sp, 32));
 		a.Ldp(x2, x3, MemOperand(sp, 16));
 		a.Ldp(x0, x1, MemOperand(sp, 96, PostIndex));
+		// Handlers can move both (VU0 syncs add to cpuRegs.cycle). x19-x22 are
+		// callee-saved, so the rest of the cycle state survives the call.
+		a.Ldr(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+		a.Ldr(x21, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
 	}
 
 	// The FMAC macro ops run natively while VU0 is idle, which is when
@@ -1661,19 +1665,36 @@ namespace
 		std::deque<std::pair<Label, std::function<void()>>>* deferred = nullptr;
 	} s_exit;
 
-	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
-	// same CP0.Config bit TryExecute uses) into w11, with x13 = block_cycles.
-	// x1 holds &g_link_state for the whole block. Branches to `off` when
-	// chaining is off. Clobbers x9-x13 only, so x0 and a taken branch's x15
-	// survive.
+	// While chaining, adds cycles[completed] (scaled by the same CP0.Config bit
+	// TryExecute uses) to w20, the block_cycles register (see EmitEnter). x1
+	// holds &g_link_state for the whole block. Branches to `off` when chaining
+	// is off. Clobbers w9 only, so x0 and a taken branch's x15 survive.
 	void EmitAddCycles(MacroAssembler& a, u32 completed, Label* off)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
 		a.Cbz(w9, off);
-		a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
-		a.Ldr(w11, MemOperand(x13));
-		a.Add(w11, w11, s_exit.cycles[completed] * s_exit.cycle_scale);
+		a.Add(w20, w20, s_exit.cycles[completed] * s_exit.cycle_scale);
+	}
+
+	// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
+	// cycle += max(block_cycles >> 3, 1); block_cycles &= 7. Memory keeps the
+	// cycle too, for C++ and the next Enter().
+	void EmitCommitCycles(MacroAssembler& a)
+	{
+		a.Lsr(w10, w20, 3);
+		a.Cmp(w10, 1);
+		a.Csinc(w10, w10, wzr, hs);
+		a.And(w20, w20, 7);
+		a.Add(x19, x19, x10);
+		a.Str(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+	}
+
+	// EEBranchEventDue(): the signed 64-bit distance to the deadline.
+	void EmitEventDue(MacroAssembler& a, Label* due)
+	{
+		a.Sub(x9, x19, x21);
+		a.Tbz(x9, 63, due);
 	}
 
 	// A returning exit: w0 = value, plus x15 (already shifted) as the target
@@ -1686,7 +1707,6 @@ namespace
 		{
 			Label off, done;
 			EmitAddCycles(a, completed, &off);
-			a.Str(w11, MemOperand(x13));
 			a.Mov(x16, CyclesCommitted);
 			a.B(&done);
 			a.Bind(&off);
@@ -1732,28 +1752,9 @@ namespace
 		Label request, due;
 		EmitAddCycles(a, completed, classic);
 		if (kind == LinkKind::Taken)
-		{
-			// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
-			// cycle += max(block_cycles >> 3, 1); block_cycles &= 7.
-			a.Lsr(w10, w11, 3);
-			a.Cmp(w10, 1);
-			a.Csinc(w10, w10, wzr, hs);
-			a.And(w11, w11, 7);
-			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-			a.Add(x9, x9, x10);
-			a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		}
-		a.Str(w11, MemOperand(x13));
+			EmitCommitCycles(a);
 		if (kind != LinkKind::Continue)
-		{
-			// EEBranchEventDue(): signed 64-bit distance to the deadline. A taken
-			// exit still has the new cycle in x9.
-			if (kind != LinkKind::Taken)
-				a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
-			a.Sub(x9, x9, x10);
-			a.Tbz(x9, 63, &due);
-		}
+			EmitEventDue(a, &due);
 		// A link is only valid in the generation it was made in: any drop of
 		// compiled blocks bumps it, including one from a write fault taken
 		// inside the block that is running now.
@@ -1793,17 +1794,8 @@ namespace
 		static_assert(sizeof(IndirectEntry) == 16);
 		Label due, miss;
 		EmitAddCycles(a, completed, classic);
-		a.Lsr(w10, w11, 3);
-		a.Cmp(w10, 1);
-		a.Csinc(w10, w10, wzr, hs);
-		a.And(w11, w11, 7);
-		a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		a.Add(x9, x9, x10);
-		a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		a.Str(w11, MemOperand(x13));
-		a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
-		a.Sub(x9, x9, x10);
-		a.Tbz(x9, 63, &due);
+		EmitCommitCycles(a);
+		EmitEventDue(a, &due);
 		a.Mov(x10, reinterpret_cast<uintptr_t>(g_indirect.data()));
 		a.Ubfx(w9, w15, 2, IndirectBits);
 		a.Add(x10, x10, Operand(x9, LSL, 4));
@@ -1968,12 +1960,7 @@ namespace
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
 		a.Cbz(w9, &label);
 		if (event_test)
-		{
-			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
-			a.Sub(x9, x9, x10);
-			a.Tbz(x9, 63, &label);
-		}
+			EmitEventDue(a, &label);
 		return true;
 	}
 
@@ -1999,6 +1986,28 @@ bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 branch, u32 code)
 
 Arm64EE::CodeGenerator::LinkState Arm64EE::CodeGenerator::g_link_state;
 std::array<Arm64EE::CodeGenerator::IndirectEntry, 1u << Arm64EE::CodeGenerator::IndirectBits> Arm64EE::CodeGenerator::g_indirect;
+
+size_t Arm64EE::CodeGenerator::EmitEnter(u8* buffer, size_t capacity)
+{
+	MacroAssembler a(buffer, capacity);
+	a.Stp(x29, x30, MemOperand(sp, -48, PreIndex));
+	a.Stp(x19, x20, MemOperand(sp, 16));
+	a.Stp(x21, x22, MemOperand(sp, 32));
+	a.Mov(x22, x1);
+	a.Ldr(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+	a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
+	a.Ldr(w20, MemOperand(x13));
+	a.Ldr(x21, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
+	a.Blr(x2);
+	a.Ldr(x13, MemOperand(x22, offsetof(LinkState, block_cycles)));
+	a.Str(w20, MemOperand(x13));
+	a.Ldp(x21, x22, MemOperand(sp, 32));
+	a.Ldp(x19, x20, MemOperand(sp, 16));
+	a.Ldp(x29, x30, MemOperand(sp, 48, PostIndex));
+	a.Ret();
+	a.FinalizeCode();
+	return a.GetSizeOfCodeGenerated();
+}
 
 void Arm64EE::CodeGenerator::PatchLink(u8* slot, const void* target, u32 generation)
 {

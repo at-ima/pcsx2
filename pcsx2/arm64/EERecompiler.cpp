@@ -129,6 +129,8 @@ namespace
 	std::array<LookupEntry, 65536> s_lookup{};
 	u8* s_write = nullptr;
 	u8* s_write_limit = nullptr;
+	// At the start of the code buffer; see CodeGenerator::EmitEnter.
+	Arm64EE::CodeGenerator::Enter s_enter = nullptr;
 	bool s_goemon_tlb_hack = false;
 	// Native links inline intUpdateCPUCycles() for the default cycle rate only.
 	s8 s_cycle_rate = 0;
@@ -240,6 +242,12 @@ __noinline void Arm64EE::Reset()
 	s_last_dispatch_pc = 0;
 	s_last_dispatch_block = nullptr;
 	s_write = SysMemory::GetEERec();
+	HostSys::BeginCodeWrite();
+	const size_t enter_size = Arm64EE::CodeGenerator::EmitEnter(s_write, SysMemory::GetEERecEnd() - s_write);
+	HostSys::EndCodeWrite();
+	HostSys::FlushInstructionCache(s_write, static_cast<u32>(enter_size));
+	s_enter = reinterpret_cast<Arm64EE::CodeGenerator::Enter>(s_write);
+	s_write += (enter_size + 15) & ~size_t(15);
 	// The reserved buffer is stable until Shutdown; keep its compilation margin
 	// out of the per-block memory-manager call path.
 	s_write_limit = SysMemory::GetEERecEnd() - 16 * 1024;
@@ -344,7 +352,7 @@ namespace
 	// cycles the generated code did not already add.
 	u64 RunBlock(const Block* block, u32& block_cycles)
 	{
-		const u64 result = block->function(&cpuRegs, &Arm64EE::CodeGenerator::g_link_state);
+		const u64 result = s_enter(&cpuRegs, &Arm64EE::CodeGenerator::g_link_state, reinterpret_cast<const void*>(block->function));
 		if (!(result & Arm64EE::CodeGenerator::CyclesCommitted))
 		{
 			const u32 completed = static_cast<u32>(result) & Arm64EE::CodeGenerator::CompletedMask;
@@ -366,6 +374,7 @@ namespace
 EEBlockResult Arm64EE::TryExecute(u32& block_cycles)
 {
 	CodeGenerator::g_link_state.chaining = 0;
+	CodeGenerator::g_link_state.block_cycles = &block_cycles;
 	const Block* block = LookupBlock();
 	return block ? DecodeResult(RunBlock(block, block_cycles)) : EEBlockResult{};
 }

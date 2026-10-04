@@ -129,6 +129,16 @@ namespace Arm64EE::CodeGenerator
 	// A link slot is a B instruction followed by the generation it was linked in.
 	void PatchLink(u8* slot, const void* target, u32 generation);
 
+	// Blocks run with the cycle bookkeeping in callee-saved registers, so a
+	// chain of linked blocks never round-trips it through memory: x19 =
+	// cpuRegs.cycle (also stored at every commit, so memory stays current),
+	// w20 = *block_cycles, x21 = cpuRegs.nextEventCycle (reloaded after any
+	// call into C++), x22 = the LinkState. EmitEnter() writes the stub C++
+	// calls blocks through: Enter(&cpuRegs, &g_link_state, block) loads them,
+	// runs the block and writes w20 back.
+	using Enter = u64 (*)(cpuRegisters*, LinkState*, const void*);
+	size_t EmitEnter(u8* buffer, size_t capacity);
+
 	// Generated functions return the completed prefix and exit action. On an
 	// unsupported memory access they leave PC at that instruction for fallback.
 	// Stores overlapping this block's source exit immediately for revalidation.
