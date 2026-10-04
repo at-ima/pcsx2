@@ -1497,9 +1497,31 @@ namespace
 		return (code >> 26) == 54 || (code >> 26) == 62; // LQC2, SQC2
 	}
 
+	// Set by Compile() when fastmem is on: the accesses emitted through the
+	// fastmem area so far, each with the exit a fault sends it to, and the one
+	// EmitMemory() is emitting now (exit is null outside of it).
+	struct FastmemState
+	{
+		std::vector<std::pair<Arm64EE::CodeGenerator::FastmemAccess, Label*>>* accesses = nullptr;
+		Label* exit = nullptr;
+		u32 pc = 0;
+		u32 block_pc = 0;
+	} s_fastmem;
+
+	// Call right after the instruction that accesses [x12]: the macro
+	// assembler emits any pool before an instruction, never after.
+	void MarkAccess(MacroAssembler& a)
+	{
+		if (s_fastmem.exit)
+			s_fastmem.accesses->push_back({{static_cast<u32>(a.GetCursorOffset()) - kInstructionSize, 0, s_fastmem.pc}, s_fastmem.exit});
+	}
+
 	// Leaves the host address of a RAM access in x12, or branches to `before`
-	// when the interpreter has to perform it. Clobbers x9-x12 only.
-	void EmitAddress(MacroAssembler& a, u32 code, Label* before)
+	// when the interpreter has to perform it. Clobbers x9-x12 only. With
+	// `fast`, x12 points into the fastmem area (x24) instead of going through
+	// the vtlb map, and an access the interpreter has to perform faults there
+	// (see vtlb_DynBackpatchLoadStore).
+	void EmitAddress(MacroAssembler& a, u32 code, Label* before, bool fast = false)
 	{
 		const u32 op = code >> 26, rs = (code >> 21) & 31;
 		const u32 size = MemorySize(code);
@@ -1529,6 +1551,12 @@ namespace
 			a.Cmp(w11, 0x8000);
 			a.B(eq, before);
 		}
+		if (fast)
+		{
+			// Every write of w9 above is a 32-bit op, so x9 holds it zero-extended.
+			a.Add(x12, x24, x9);
+			return;
+		}
 		a.Lsr(w11, w9, vtlb_private::VTLB_PAGE_BITS);
 		a.Ldr(x12, MemOperand(x23, x11, LSL, 3)); // x23 = vtlbdata.vmap (see EmitEnter)
 		a.Add(x12, x12, x9);
@@ -1553,16 +1581,19 @@ namespace
 				a.Mov(x10, reinterpret_cast<uintptr_t>(&VU0.VF[rt]));
 				a.Ldr(q0, MemOperand(x10));
 				a.Str(q0, MemOperand(x12));
+				MarkAccess(a);
 			}
 			else if (size == 16)
 			{
 				a.Ldr(q0, GPR(rt));
 				a.Str(q0, MemOperand(x12));
+				MarkAccess(a);
 			}
 			else if (fpu)
 			{
 				a.Ldr(w10, FPR(rt));
 				a.Str(w10, MemOperand(x12));
+				MarkAccess(a);
 			}
 			else
 			{
@@ -1576,6 +1607,7 @@ namespace
 					a.Strh(value.W(), MemOperand(x12));
 				else
 					a.Strb(value.W(), MemOperand(x12));
+				MarkAccess(a);
 			}
 			if (after)
 			{
@@ -1621,6 +1653,7 @@ namespace
 					a.Ldr(value, MemOperand(x12));
 					break;
 			}
+			MarkAccess(a);
 			if (IsVU0Transfer(code))
 			{
 				// LQC2 into vf0 reads and discards, like the interpreter.
@@ -1645,10 +1678,23 @@ namespace
 		}
 	}
 
-	void EmitMemory(MacroAssembler& a, u32 code, const u32* source, u32 source_bytes, Label* before, Label* after)
+	// `pc` is the instruction's. Through the fastmem area unless fastmem is
+	// off or this instruction already faulted there once.
+	void EmitMemory(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes, Label* before, Label* after)
 	{
-		EmitAddress(a, code, before);
+		const bool fast = s_fastmem.accesses && !vtlb_IsFaultingPC(pc);
+		if (fast)
+		{
+			s_fastmem.exit = before;
+			s_fastmem.pc = pc;
+			// A store into this block's own code is caught through the address it
+			// was fetched from; a write through another alias of the same page only
+			// shows up at the next entry (or the write fault). Needs proper testing.
+			source = reinterpret_cast<const u32*>(vtlb_private::vtlbdata.fastmem_base + s_fastmem.block_pc);
+		}
+		EmitAddress(a, code, before, fast);
 		EmitAccess(a, code, source, source_bytes, after);
+		s_fastmem.exit = nullptr;
 	}
 	// Set by Compile() for the block being emitted.
 	struct ExitInfo
@@ -1999,6 +2045,7 @@ size_t Arm64EE::CodeGenerator::EmitEnter(u8* buffer, size_t capacity)
 	a.Mov(x22, x1);
 	a.Mov(x13, reinterpret_cast<uintptr_t>(&vtlb_private::vtlbdata.vmap));
 	a.Ldr(x23, MemOperand(x13));
+	a.Ldr(x24, MemOperand(x13, offsetof(vtlb_private::MapData, fastmem_base) - offsetof(vtlb_private::MapData, vmap)));
 	a.Ldr(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
 	a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
 	a.Ldr(w20, MemOperand(x13));
@@ -2042,11 +2089,16 @@ void Arm64EE::CodeGenerator::UnpatchLinks(std::span<const std::pair<u8*, u32>> l
 }
 
 size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
-	std::span<const u32> cycles, bool linkable, bool self_check)
+	std::span<const u32> cycles, bool linkable, bool self_check, std::vector<FastmemAccess>* fastmem)
 {
 	MacroAssembler a(buffer, capacity);
 	std::deque<std::pair<Label, std::function<void()>>> deferred;
 	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1), &deferred};
+	std::vector<std::pair<FastmemAccess, Label*>> accesses;
+	s_fastmem = {fastmem ? &accesses : nullptr, nullptr, 0, pc};
+	// Exits a fastmem access may be patched to jump to; they need code even
+	// when nothing branches to them.
+	std::array<bool, MaxInstructions + 1> fault_exits{};
 	s_gpr.Reset();
 	std::array<Label, MaxInstructions + 1> exits;
 	Label stale, copy;
@@ -2087,7 +2139,11 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 			continue; // the untaken path runs the delay slot next
 		}
 		if (MemorySize(words[i]))
-			EmitMemory(a, words[i], source, words.size_bytes(), &exits[i], &exits[i + 1]);
+		{
+			const size_t before = accesses.size();
+			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
+			fault_exits[i] = accesses.size() != before;
+		}
 		else if (IsTrapping(words[i]))
 			EmitTrapping(a, words[i], &exits[i]);
 		else if (IsQuadFunnelShift(words[i]))
@@ -2106,9 +2162,9 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	// Only exits something reaches get code: every branch to them is emitted
 	// by now, and most instructions never leave early. Unused exits were about
 	// 40% of the code, which spilled the hot blocks out of the instruction cache.
-	for (u32 completed = words.size(); completed > 0 || exits[0].IsLinked(); completed--)
+	for (u32 completed = words.size(); completed > 0 || exits[0].IsLinked() || fault_exits[0]; completed--)
 	{
-		if (!exits[completed].IsLinked() && (completed != words.size() || !falls_through))
+		if (!exits[completed].IsLinked() && !fault_exits[completed] && (completed != words.size() || !falls_through))
 			continue;
 		a.Bind(&exits[completed]);
 		// The end of the block falls through to the next pc. Earlier exits stop
@@ -2145,6 +2201,12 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		a.Bind(&deferred[i].first);
 		deferred[i].second();
 	}
+	for (auto& [access, exit] : accesses)
+	{
+		access.exit = static_cast<u32>(exit->GetLocation());
+		fastmem->push_back(access);
+	}
+	s_fastmem = {};
 	if (self_check)
 	{
 		// The exit that got here committed its cycles, so the dispatcher only has
