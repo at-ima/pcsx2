@@ -192,6 +192,28 @@ TEST_F(VU0RecompilerTest, EmitsNativeCodeForASupportedBlock)
 	EXPECT_GT(CpuArm64VU0.GetCommittedCache(), 0u);
 }
 
+// Games swap microprograms at the same VU0 address, so the cache keeps more
+// than one block per PC. Once both programs are compiled, alternating between
+// them must reuse their code instead of recompiling on every switch.
+TEST_F(VU0RecompilerTest, AlternatingMicroprogramsAtOneAddressKeepTheirCode)
+{
+	constexpr u32 kAdd = MakeUpper(0x28, 15, 5, 6, 7);
+	constexpr u32 kSub = MakeUpper(0x2c, 15, 5, 6, 7);
+	size_t committed = 0;
+	for (u32 round = 0; round < 6; round++)
+	{
+		SCOPED_TRACE(testing::Message() << "round=" << round);
+		Rewind();
+		Put(0, (round & 1) ? kSub : kAdd, kNopLower);
+		Compare(16);
+		if (round == 1)
+			committed = CpuArm64VU0.GetCommittedCache();
+		else if (round > 1)
+			EXPECT_EQ(CpuArm64VU0.GetCommittedCache(), committed);
+	}
+	EXPECT_GT(committed, 0u);
+}
+
 // An integer load lands in its destination register some cycles after it
 // issues, so a branch testing that register has to wait for the load to retire
 // rather than reading the stale value. The compiled branch gets that wait from
