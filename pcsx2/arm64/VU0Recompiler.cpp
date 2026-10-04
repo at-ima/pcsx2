@@ -82,7 +82,12 @@ namespace
 		Function function = nullptr;
 	};
 
-	std::array<std::unique_ptr<Block>, VU0_PROGSIZE / 8> s_blocks;
+	// Games swap microprograms at the same VU0 address: Burnout 3 alternates
+	// two or three per address, and with one block per PC it recompiled about
+	// over a thousand times a second. Keep a few variants per PC, most recently used
+	// first, as arm64/VU1Recompiler.cpp does.
+	constexpr size_t MaxVariants = 8;
+	std::array<std::vector<std::unique_ptr<Block>>, VU0_PROGSIZE / 8> s_blocks;
 	u8* s_base = nullptr;
 	u8* s_write = nullptr;
 	u8* s_end = nullptr;
@@ -101,8 +106,8 @@ namespace
 
 	void InvalidateAll()
 	{
-		for (auto& block : s_blocks)
-			block.reset();
+		for (auto& variants : s_blocks)
+			variants.clear();
 		s_write = s_base;
 		// The pipeline stubs live at the start of the same buffer, so rewinding
 		// s_write without dropping them leaves prepare[] pointing at memory the
@@ -1559,9 +1564,13 @@ namespace
 			block->function = reinterpret_cast<Block::Function>(s_write);
 			s_write += (size + 15) & ~size_t(15);
 		}
-		auto& result = s_blocks[pc / 8];
-		result = std::move(block);
-		return *result;
+		// An evicted variant's code stays in the buffer until the next
+		// InvalidateAll, like any other replaced block.
+		auto& variants = s_blocks[pc / 8];
+		if (variants.size() >= MaxVariants)
+			variants.pop_back();
+		variants.insert(variants.begin(), std::move(block));
+		return *variants.front();
 	}
 
 	// A trace that follows a branch is not one contiguous span, so validation
@@ -1677,8 +1686,16 @@ void Arm64VU0Recompiler::Execute(u32 cycles)
 			continue;
 		}
 		const u64 remaining = cycles - (VU0.cycle - start);
-		Block* block = s_blocks[pc / 8].get();
-		if (!block || !Matches(*block, pc, remaining))
+		auto& variants = s_blocks[pc / 8];
+		const auto found = std::find_if(variants.begin(), variants.end(),
+			[pc, remaining](const std::unique_ptr<Block>& candidate) { return Matches(*candidate, pc, remaining); });
+		Block* block;
+		if (found != variants.end())
+		{
+			std::rotate(variants.begin(), found, found + 1);
+			block = variants.front().get();
+		}
+		else
 			block = &Compile(pc);
 		// A restored chained-delay state still needs interpreter branch retirement.
 		if (block->function && !(block->has_branches && VU0.takedelaybranch))

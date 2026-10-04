@@ -22,6 +22,7 @@ sections unless a section says so.
 | 09-30 | Shadow of the Colossus at 6x | "MTVU ring: shared cache lines" |
 | 09-30 | SotC and Burnout 3 at 6x | "VU1 region exits under the flag hack" |
 | 10-01..04 | SotC and Burnout 3 at 6x | "VU1 per-pair cost and block transitions" |
+| 10-04 | Burnout 3 at 1x | "VU0: microprogram variants per address" |
 
 ## Intro performance investigation (2026-09-18)
 
@@ -3138,3 +3139,30 @@ and the integer branch testing the loaded word right after it; after
   and the next block reloads them.
 - `dVifUnpack`'s own time (about 9% of SotC's VU1 thread) is in its block
   lookup, not in the unpack code.
+
+## VU0: microprogram variants per address
+
+After the VU1 work the EE thread is the larger gap to ARMSX2 (README
+benchmarks, 2026-10-04). A `sample` of the EE thread in Burnout 3 at 1x
+(`BURN_OUT_3_002`) put about 305 of 4501 samples in the VU0 recompiler's
+`Compile(u32)`, under `CTC2`/`CFC2` and `_vu0WaitMicro`. A temporary build
+that logged each VU0 compile with a hash of the micro memory at its PC
+found about 12k compiles in the last 8 CPU-seconds of a 25 s run, but only
+102 distinct (PC, code) pairs at 90 PCs. The game swaps two or three
+microprograms at the same addresses, and the cache kept one block per PC,
+so every switch recompiled.
+
+The cache now keeps up to eight variants per PC, most recently used first,
+as the VU1 recompiler does. Lookup still validates each candidate with
+`Matches()`, so it runs the same code as before; only the recompiles go.
+
+Bench runs (`bench.sh`, 1x, OSD and `proc_pid_rusage`), master and this
+change alternated A B B A:
+
+| Build | EE ms per frame | Power | Instructions |
+| --- | ---: | ---: | ---: |
+| master | 7.76, 7.80 | 3.03 W, 3.03 W | 13.01, 12.98 G/s |
+| variants | 7.24, 7.21 | 2.69 W, 2.75 W | 12.13, 12.13 G/s |
+
+Frame dumps at frames 60-600 match master in all four test states.
+
