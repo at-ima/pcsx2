@@ -6,6 +6,7 @@
 #include "Interpreter.h"
 #include <array>
 #include <span>
+#include <utility>
 
 namespace Arm64EE::CodeGenerator
 {
@@ -100,7 +101,7 @@ namespace Arm64EE::CodeGenerator
 	// taken branch, an untaken branch, the end of the block) also do the
 	// driver's work for that exit themselves -- pc commit, cycle commit, event
 	// deadline -- and then jump straight to the next block through a patchable
-	// B, provided the generation recorded next to it is still current.
+	// B. Dropping compiled blocks points every patched B back at its exit.
 	// Otherwise they return to C++ with the flags below.
 	struct LinkState
 	{
@@ -126,14 +127,17 @@ namespace Arm64EE::CodeGenerator
 	constexpr u32 IndirectBits = 12;
 	constexpr u32 IndirectIndex(u32 pc) { return (pc >> 2) & ((1u << IndirectBits) - 1); }
 	extern std::array<IndirectEntry, 1u << IndirectBits> g_indirect;
-	// A link slot is a B instruction followed by the generation it was linked in.
-	void PatchLink(u8* slot, const void* target, u32 generation);
+	// A link slot is a B instruction. PatchLink() returns the B it replaced,
+	// which UnpatchLinks() writes back when blocks are dropped.
+	u32 PatchLink(u8* slot, const void* target);
+	void UnpatchLinks(std::span<const std::pair<u8*, u32>> links);
 
 	// Blocks run with the cycle bookkeeping in callee-saved registers, so a
 	// chain of linked blocks never round-trips it through memory: x19 =
 	// cpuRegs.cycle (also stored at every commit, so memory stays current),
 	// w20 = *block_cycles, x21 = cpuRegs.nextEventCycle (reloaded after any
-	// call into C++), x22 = the LinkState. EmitEnter() writes the stub C++
+	// call into C++), x22 = the LinkState, x23 = vtlbdata.vmap for memory
+	// accesses. EmitEnter() writes the stub C++
 	// calls blocks through: Enter(&cpuRegs, &g_link_state, block) loads them,
 	// runs the block and writes w20 back.
 	using Enter = u64 (*)(cpuRegisters*, LinkState*, const void*);

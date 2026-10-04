@@ -2273,8 +2273,9 @@ TEST_F(EERecompilerTest, UntrustedBlocksLinkAndCatchChangedSource)
 		run(true, chained_cycles);
 		if (HasFatalFailure())
 			return;
-		if (!round)
-			EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
+		// The recompile drops the links into the old code, and they link again
+		// to the new one instead of sending every call back to the dispatcher.
+		EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
 		const cpuRegisters chained = cpuRegs;
 		EXPECT_EQ(chained.GPR.r[2].UL[0], initial_r2 + (round ? 11 : 7) * iterations);
 		prepare();
