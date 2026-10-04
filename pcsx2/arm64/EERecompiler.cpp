@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <vector>
 
 namespace
 {
@@ -71,6 +72,16 @@ namespace
 	// Also bumped when a block is recompiled in place, which the block table
 	// does not need to know about.
 	u32 s_link_generation = 1;
+	// Every link patched since blocks were last dropped, with the B it replaced.
+	std::vector<std::pair<u8*, u32>> s_links;
+	// Points every patched link back at its exit, so none can enter a block
+	// that is about to be dropped or replaced.
+	void DropLinks()
+	{
+		Arm64EE::CodeGenerator::g_link_state.generation = ++s_link_generation;
+		Arm64EE::CodeGenerator::UnpatchLinks(s_links);
+		s_links.clear();
+	}
 	u32 HashBlockPc(u32 pc) { return ((pc >> 2) * 0x9E3779B1u) >> (32 - 19); } // Fibonacci hashing, top 19 bits
 	// Existing entry for pc, or nullptr. Linear-probes from the hashed slot;
 	// bounded by BlockTableSize, though a real miss resolves in O(1) average
@@ -111,8 +122,7 @@ namespace
 	void ClearBlockTable()
 	{
 		s_block_table_generation++;
-		// Invalidates every native link made so far (see LinkState).
-		Arm64EE::CodeGenerator::g_link_state.generation = ++s_link_generation;
+		DropLinks();
 		s_block_table_count = 0;
 		std::deque<Block>{}.swap(s_block_storage);
 	}
@@ -259,6 +269,8 @@ __noinline void Arm64EE::Reset()
 
 void Arm64EE::Shutdown()
 {
+	// The code buffer may go away with the rest of the emulator; leave it be.
+	s_links.clear();
 	s_lookup.fill({});
 	ClearBlockTable();
 	s_last_dispatch_pc = 0;
@@ -335,7 +347,7 @@ namespace
 			// replaces; drop them. Its self-check keeps them from running
 			// stale code, but every entry through them would come back here.
 			if (block)
-				Arm64EE::CodeGenerator::g_link_state.generation = ++s_link_generation;
+				DropLinks();
 			const bool tracked = source == reinterpret_cast<const u32*>(PSM(pc));
 			const vtlb_ProtectionMode page_type = tracked ? mmap_GetRamPageInfo(pc) : ProtMode_None;
 			block = &Compile(pc, source, page_type, tracked);
@@ -414,7 +426,7 @@ EEBlockResult Arm64EE::ExecuteChained(u32& block_cycles)
 		// write fault in the block, or a Reset() while looking this one up,
 		// which also rewinds the code buffer the slot lives in).
 		if (pending_slot && pending_generation == g_link_state.generation)
-			PatchLink(pending_slot, reinterpret_cast<const void*>(block->function), pending_generation);
+			s_links.emplace_back(pending_slot, PatchLink(pending_slot, reinterpret_cast<const void*>(block->function)));
 		pending_slot = nullptr;
 		const u32 generation = g_link_state.generation;
 		const u64 raw = RunBlock(block, block_cycles);
