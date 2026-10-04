@@ -7,6 +7,7 @@
 #include "MTVU.h"
 #include "Host.h"
 #include "IconsFontAwesome.h"
+#include "PerformanceMetrics.h"
 #include "VMManager.h"
 
 #include "common/FPControl.h"
@@ -18,6 +19,12 @@
 #include <list>
 #include <mutex>
 #include <thread>
+
+#include "GS/GSThreadCorePolicy.h"
+
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 // Uncomment this to enable profiling of the GS RingBufferCopy function.
 //#define PCSX2_GSRING_SAMPLING_STATS
@@ -100,7 +107,85 @@ namespace MTGS
 	static std::atomic_bool s_shutdown_flag{false};
 	static std::atomic_bool s_run_idle_flag{false};
 	static Threading::UserspaceSemaphore s_open_or_close_done;
+
+	// Moves this thread between the efficiency and performance cores.
+	static void AdjustCores();
+#ifdef __APPLE__
+	// Ticks (GetCPUTicks) this thread spent spinning on semaXGkick: CPU time,
+	// but no GS work.
+	static u64 s_spin_ticks = 0;
+#endif
 } // namespace MTGS
+
+#ifdef __APPLE__
+// With GSThreadEfficiencyCores, the GS thread runs at background QoS, which
+// keeps it on the efficiency cores, for as long as its work fits there with
+// room to spare. On a performance core much of its time went to spinning on
+// semaXGkick for VU1 (MTVU); on an efficiency core it is the slower side and
+// hardly waits. Process power at 1x dropped 15-20% in Burnout 3, Ridge Racer V
+// and Ape Escape 3 (16% in Burnout 3 at 6x); Shadow of the Colossus needs too
+// much GS work to stay there. Every 30 frames the GS work (CPU time minus
+// semaXGkick spins) over wall time, and whether emulation ran below full
+// speed, go to GSThreadCorePolicy, which decides. Needs proper testing across
+// more games.
+static void MTGS::AdjustCores()
+{
+	constexpr u32 kWindowFrames = 30;
+	static GSThreadCorePolicy s_policy;
+	static bool s_applied = false;
+	static u32 s_frames = 0;
+	static u64 s_start_ticks = 0, s_start_cpu = 0, s_start_spin = 0;
+	static qos_class_t s_original = QOS_CLASS_UNSPECIFIED;
+
+	const auto apply = [](bool efficiency) {
+		if (s_original == QOS_CLASS_UNSPECIFIED)
+		{
+			int relative;
+			if (pthread_get_qos_class_np(pthread_self(), &s_original, &relative) != 0 || s_original == QOS_CLASS_UNSPECIFIED)
+				s_original = QOS_CLASS_USER_INTERACTIVE;
+		}
+		pthread_set_qos_class_self_np(efficiency ? QOS_CLASS_BACKGROUND : s_original, 0);
+		s_applied = efficiency;
+	};
+
+	if (!GSConfig.GSThreadEfficiencyCores)
+	{
+		if (s_applied)
+		{
+			apply(false);
+			s_policy = {};
+		}
+		s_frames = 0;
+		return;
+	}
+
+	const u64 now = GetCPUTicks();
+	const u64 cpu = Threading::ThreadHandle::GetForCallingThread().GetCPUTime();
+	if (s_frames++ == 0)
+	{
+		s_start_ticks = now;
+		s_start_cpu = cpu;
+		s_start_spin = s_spin_ticks;
+		return;
+	}
+	if (s_frames <= kWindowFrames)
+		return;
+	s_frames = 0;
+	const double wall = static_cast<double>(now - s_start_ticks) / GetTickFrequency();
+	const double work = static_cast<double>(cpu - s_start_cpu) / Threading::GetThreadTicksPerSecond() -
+						static_cast<double>(s_spin_ticks - s_start_spin) / GetTickFrequency();
+	// GetSpeed() is a percentage, updated about twice a second on the EE thread.
+	const float target = VMManager::GetTargetSpeed();
+	const bool slow = target > 0.0f && PerformanceMetrics::GetSpeed() < target * 97.0f;
+	const bool efficiency = s_policy.Update(wall > 0.0 ? std::max(work, 0.0) / wall : 0.0, slow);
+	if (efficiency != s_applied)
+		apply(efficiency);
+}
+#else
+static void MTGS::AdjustCores()
+{
+}
+#endif
 
 // =====================================================================================================
 //  MTGS Threaded Class Implementation
@@ -467,8 +552,16 @@ void MTGS::MainLoop()
 						// Wait for MTVU to complete vu1 program. Many programs take
 						// microseconds (Shadow of the Colossus runs ~500k a second),
 						// and waking a sleeping GS thread took ~15% of MTVU there.
+#ifdef __APPLE__
+						const u64 spin_start = GetCPUTicks();
+						const bool got = vu1Thread.semaXGkick.TryWaitWithLowPowerSpin(SPIN_TIME_NS);
+						s_spin_ticks += GetCPUTicks() - spin_start;
+						if (!got)
+							vu1Thread.semaXGkick.Wait();
+#else
 						if (!vu1Thread.semaXGkick.TryWaitWithLowPowerSpin(SPIN_TIME_NS))
 							vu1Thread.semaXGkick.Wait();
+#endif
 						mtvu_lock.lock();
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
@@ -509,6 +602,8 @@ void MTGS::MainLoop()
 							s_QueuedFrameCount.fetch_sub(1);
 							if (s_VsyncSignalListener.exchange(false))
 								s_sem_Vsync.Post();
+
+							AdjustCores();
 
 							// Do not StateCheckInThread() here
 							// Otherwise we could pause while there's still data in the queue

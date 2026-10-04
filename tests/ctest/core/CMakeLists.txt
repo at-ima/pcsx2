@@ -10,6 +10,7 @@ add_pcsx2_test(core_test
 	iop_fetch_tests.cpp
 	iop_dispatch_tests.cpp
 	iop_branch_tests.cpp
+	gs_thread_core_policy_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )

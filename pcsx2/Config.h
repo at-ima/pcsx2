@@ -790,6 +790,7 @@ struct Pcsx2Config
 					OsdBoldText : 1,
 					HWSpinGPUForReadbacks : 1,
 					HWSpinCPUForReadbacks : 1,
+					GSThreadEfficiencyCores : 1,
 					GPUPaletteConversion : 1,
 					AutoFlushSW : 1,
 					PreloadFrameWithGSData : 1,
