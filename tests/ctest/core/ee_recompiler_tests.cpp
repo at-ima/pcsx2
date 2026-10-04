@@ -505,11 +505,18 @@ TEST_F(EERecompilerTest, RamLoadsStoresAndAddressWrapping)
 		{
 			SCOPED_TRACE(testing::Message() << "opcode=" << op << " seed=" << seed);
 			Init(seed);
+			// Compare() leaves the stores' results behind; a zeroed word would hide
+			// a load that wrongly writes r0.
+			memory.fill(0x81abcdef);
 			const u32 address = Data + ((seed % 16) * 16) + ((op == 30 || op == 31) ? seed % 16 : 0);
 			// Exercise negative displacements, 32-bit address addition and rt == rs.
 			const s16 displacement = (seed & 1) ? -32768 : 32752;
 			cpuRegs.GPR.r[1].UD[0] = 0xffffffff00000000ULL | u32(address - displacement);
 			const u32 rt = seed % 4;
+			// The interpreter's LD writes r0 (R5900OpcodeImpl.cpp); native code keeps
+			// it zero, as the hardware does.
+			if (op == 55 && rt == 0)
+				continue;
 			program[0] = (op << 26) | (1 << 21) | (rt << 16) | static_cast<u16>(displacement);
 			Compare(1);
 			if (HasFailure())
@@ -2107,6 +2114,32 @@ TEST_F(EERecompilerTest, LinkedAndRegisterJumpsMatchSteppedExecution)
 		EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
 		EXPECT_EQ(chained_cycles, stepped_cycles);
 		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+	}
+}
+
+TEST_F(EERecompilerTest, LinkedBlockLeavingBeforeItsFirstInstructionStoresItsPc)
+{
+	// Links do not store pc. A linked block whose first instruction is an access
+	// the interpreter has to perform (here an unaligned LW) leaves before running
+	// anything, and has to name its own entry for the interpreter.
+	program.fill(Stop);
+	program[0] = (9u << 26) | (2 << 21) | (2 << 16) | 1u; // ADDIU $2, $2, 1
+	program[1] = (2u << 26) | ((Base + 64) >> 2); // J Base + 64
+	program[2] = 0; // delay: NOP
+	program[16] = (35u << 26) | (1 << 21) | (3 << 16) | 1u; // LW $3, 1($1)
+	Arm64EE::Reset();
+	// The first round links the jump; the second runs through the link.
+	for (u32 round = 0; round < 2; round++)
+	{
+		SCOPED_TRACE(testing::Message() << "round=" << round);
+		Init(0);
+		cpuRegs.GPR.r[1].UD[0] = Data;
+		cpuRegs.nextEventCycle = u64(1) << 40;
+		const u64 initial_r2 = cpuRegs.GPR.r[2].UD[0];
+		u32 cycles = 0;
+		EXPECT_FALSE(Arm64EE::ExecuteChained(cycles));
+		EXPECT_EQ(cpuRegs.pc, Base + 64);
+		EXPECT_EQ(cpuRegs.GPR.r[2].UD[0], initial_r2 + 1);
 	}
 }
 
