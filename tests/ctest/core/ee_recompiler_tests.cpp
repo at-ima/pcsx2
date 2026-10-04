@@ -505,11 +505,18 @@ TEST_F(EERecompilerTest, RamLoadsStoresAndAddressWrapping)
 		{
 			SCOPED_TRACE(testing::Message() << "opcode=" << op << " seed=" << seed);
 			Init(seed);
+			// Compare() leaves the stores' results behind; a zeroed word would hide
+			// a load that wrongly writes r0.
+			memory.fill(0x81abcdef);
 			const u32 address = Data + ((seed % 16) * 16) + ((op == 30 || op == 31) ? seed % 16 : 0);
 			// Exercise negative displacements, 32-bit address addition and rt == rs.
 			const s16 displacement = (seed & 1) ? -32768 : 32752;
 			cpuRegs.GPR.r[1].UD[0] = 0xffffffff00000000ULL | u32(address - displacement);
 			const u32 rt = seed % 4;
+			// The interpreter's LD writes r0 (R5900OpcodeImpl.cpp); native code keeps
+			// it zero, as the hardware does.
+			if (op == 55 && rt == 0)
+				continue;
 			program[0] = (op << 26) | (1 << 21) | (rt << 16) | static_cast<u16>(displacement);
 			Compare(1);
 			if (HasFailure())
@@ -874,6 +881,82 @@ TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
 		EXPECT_EQ(cpuRegs.pc, Base + 44); // stopped at the SYSCALL
 		EXPECT_EQ(cpuRegs.cycle, stepped.cycle);
 		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+	}
+}
+
+// While chaining, a block goes on past an untaken BEQ/BNE/BLEZ and runs the
+// delay slot as an ordinary instruction (ContinuesAfterBranch). The loop below
+// takes and skips each branch in turn, loads in a delay slot, and rewrites one
+// of its own words (with the same value) after the first untaken branch, so
+// a mid-block self-modification exit runs too. It has to end exactly where
+// one block per TryExecute() call ends.
+TEST_F(EERecompilerTest, ChainedBlocksGoOnPastUntakenBranches)
+{
+	program.fill(Stop);
+	program[0] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // ADDIU $1, $1, -1
+	program[1] = (12u << 26) | (1 << 21) | (5 << 16) | 1u; // ANDI $5, $1, 1
+	program[2] = (4u << 26) | (5 << 21) | (0 << 16) | 4u; // BEQ $5, $0, Base + 28
+	program[3] = (35u << 26) | (7 << 21) | (6 << 16) | 0u; // delay: LW $6, 0($7)
+	program[4] = (7 << 21) | (6 << 16) | (8 << 11) | 33; // ADDU $8, $7, $6
+	program[5] = (43u << 26) | (7 << 21) | (8 << 16) | 4u; // SW $8, 4($7)
+	program[6] = (43u << 26) | (12 << 21) | (11 << 16) | 32u; // SW $11, 32($12): word 8, unchanged
+	program[7] = (6u << 26) | (1 << 21) | 3u; // BLEZ $1, Base + 44
+	program[8] = (9u << 26) | (9 << 21) | (9 << 16) | 1u; // delay: ADDIU $9, $9, 1
+	program[9] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfff6u; // BNE $1, $0, Base
+	program[10] = (9u << 26) | (10 << 21) | (10 << 16) | 3u; // delay: ADDIU $10, $10, 3
+	for (u32 seed : {0u, 1u})
+	{
+		for (u32 initial_t0 : {1u, 2u, 7u, 3000u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " initial_t0=" << initial_t0);
+			Arm64EE::Reset();
+			Init(seed);
+			memory.fill(0x81abcdef);
+			cpuRegs.GPR.r[1].UD[0] = initial_t0;
+			cpuRegs.GPR.r[7].UD[0] = Data;
+			cpuRegs.GPR.r[11].UD[0] = program[8];
+			cpuRegs.GPR.r[12].UD[0] = Base;
+			cpuRegs.nextEventCycle = u64(1) << 40; // keep events away, as in ChainedBlocksMatchOneBlockPerCall
+			const cpuRegisters initial = cpuRegs;
+			const auto initial_memory = memory;
+			auto run = [&](bool chained, u32& cycles) {
+				cpuRegs = initial;
+				memory = initial_memory;
+				cycles = 0;
+				EEBlockResult result;
+				u32 calls = 0;
+				do
+				{
+					result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
+					if (result.exit == EEBlockExit::TakenBranch)
+					{
+						cpuRegs.branch = 1;
+						cpuRegs.pc = result.target;
+						cpuRegs.branch = 0;
+						cpuRegs.cycle += std::max(cycles >> 3, 1u);
+						cycles &= 7;
+					}
+					ASSERT_LT(++calls, 100000u);
+				} while (result);
+			};
+			u32 stepped_cycles, chained_cycles;
+			run(false, stepped_cycles);
+			if (HasFatalFailure())
+				return;
+			const cpuRegisters stepped = cpuRegs;
+			const auto stepped_memory = memory;
+			run(true, chained_cycles);
+			if (HasFatalFailure())
+				return;
+			EXPECT_EQ(cpuRegs.pc, Base + 44);
+			EXPECT_EQ(cpuRegs.GPR.r[9].UL[0], initial.GPR.r[9].UL[0] + initial_t0); // every BLEZ delay slot ran
+			EXPECT_EQ(chained_cycles, stepped_cycles);
+			EXPECT_EQ(cpuRegs.cycle, stepped.cycle);
+			EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+			EXPECT_EQ(memory, stepped_memory);
+			if (HasFailure())
+				return;
+		}
 	}
 }
 
@@ -2107,6 +2190,32 @@ TEST_F(EERecompilerTest, LinkedAndRegisterJumpsMatchSteppedExecution)
 		EXPECT_LT(Arm64EE::GetDispatchCount() - dispatches, 16u);
 		EXPECT_EQ(chained_cycles, stepped_cycles);
 		EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+	}
+}
+
+TEST_F(EERecompilerTest, LinkedBlockLeavingBeforeItsFirstInstructionStoresItsPc)
+{
+	// Links do not store pc. A linked block whose first instruction is an access
+	// the interpreter has to perform (here an unaligned LW) leaves before running
+	// anything, and has to name its own entry for the interpreter.
+	program.fill(Stop);
+	program[0] = (9u << 26) | (2 << 21) | (2 << 16) | 1u; // ADDIU $2, $2, 1
+	program[1] = (2u << 26) | ((Base + 64) >> 2); // J Base + 64
+	program[2] = 0; // delay: NOP
+	program[16] = (35u << 26) | (1 << 21) | (3 << 16) | 1u; // LW $3, 1($1)
+	Arm64EE::Reset();
+	// The first round links the jump; the second runs through the link.
+	for (u32 round = 0; round < 2; round++)
+	{
+		SCOPED_TRACE(testing::Message() << "round=" << round);
+		Init(0);
+		cpuRegs.GPR.r[1].UD[0] = Data;
+		cpuRegs.nextEventCycle = u64(1) << 40;
+		const u64 initial_r2 = cpuRegs.GPR.r[2].UD[0];
+		u32 cycles = 0;
+		EXPECT_FALSE(Arm64EE::ExecuteChained(cycles));
+		EXPECT_EQ(cpuRegs.pc, Base + 64);
+		EXPECT_EQ(cpuRegs.GPR.r[2].UD[0], initial_r2 + 1);
 	}
 }
 

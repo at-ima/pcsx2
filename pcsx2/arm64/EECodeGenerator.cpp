@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
+#include <functional>
 
 namespace
 {
@@ -233,9 +235,12 @@ namespace
 		void Reset() { *this = {}; }
 		// Registers handed out for one guest instruction are not evicted by it.
 		void BeginInstruction() { m_pinned = 0; }
-		// The cached register holding `reg`, loading it on a miss.
+		// The cached register holding `reg`, loading it on a miss. r0 is always
+		// zero, so it reads as the zero register.
 		Register Read(MacroAssembler& a, u32 reg)
 		{
+			if (!reg)
+				return xzr;
 			if (!m_host[reg])
 			{
 				Map(reg, Allocate());
@@ -1157,6 +1162,10 @@ namespace
 		a.Ldp(x4, x5, MemOperand(sp, 32));
 		a.Ldp(x2, x3, MemOperand(sp, 16));
 		a.Ldp(x0, x1, MemOperand(sp, 96, PostIndex));
+		// Handlers can move both (VU0 syncs add to cpuRegs.cycle). x19-x22 are
+		// callee-saved, so the rest of the cycle state survives the call.
+		a.Ldr(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+		a.Ldr(x21, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
 	}
 
 	// The FMAC macro ops run natively while VU0 is idle, which is when
@@ -1529,17 +1538,15 @@ namespace
 
 	// Performs the access at x12. A store overlapping this block's source
 	// branches to `after` when one is given.
-	void EmitAccess(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes, Label* after)
+	void EmitAccess(MacroAssembler& a, u32 code, const u32* source, u32 source_bytes, Label* after)
 	{
 		const u32 op = code >> 26, rt = (code >> 16) & 31;
 		const u32 size = MemorySize(code);
 		const bool store = op == 31 || op == 40 || op == 41 || op == 43 || op == 63 || op == 57 || op == 62;
 		const bool fpu = op == 49 || op == 57; // LWC1/SWC1 target fpuRegs.fpr, not a GPR
-		// Match the architectural PC/code at the access, including host write faults.
-		a.Mov(w13, pc + 4);
-		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, pc)));
-		a.Mov(w13, code);
-		a.Str(w13, MemOperand(x0, offsetof(cpuRegisters, code)));
+		// No pc/code store: a direct RAM access never runs C++ that reads them.
+		// A write fault on a protected page only drops the cached blocks
+		// (mmap_ClearCpuBlock), and every exit stores pc/code itself.
 		if (store)
 		{
 			if (IsVU0Transfer(code))
@@ -1582,6 +1589,10 @@ namespace
 		}
 		else
 		{
+			// A GPR load lands in the GPR cache. EmitAddress pinned rs, and x12
+			// already holds the address, so rt may reuse rs's register.
+			const bool cached = !fpu && size < 16 && rt;
+			const Register value = cached ? s_gpr.Write(rt) : Register(x10);
 			switch (op)
 			{
 				case 30:
@@ -1589,26 +1600,26 @@ namespace
 					a.Ldr(q0, MemOperand(x12));
 					break;
 				case 32:
-					a.Ldrsb(x10, MemOperand(x12));
+					a.Ldrsb(value, MemOperand(x12));
 					break;
 				case 33:
-					a.Ldrsh(x10, MemOperand(x12));
+					a.Ldrsh(value, MemOperand(x12));
 					break;
 				case 35:
-					a.Ldrsw(x10, MemOperand(x12));
+					a.Ldrsw(value, MemOperand(x12));
 					break;
 				case 36:
-					a.Ldrb(w10, MemOperand(x12));
+					a.Ldrb(value.W(), MemOperand(x12));
 					break;
 				case 37:
-					a.Ldrh(w10, MemOperand(x12));
+					a.Ldrh(value.W(), MemOperand(x12));
 					break;
 				case 39:
 				case 49:
-					a.Ldr(w10, MemOperand(x12));
+					a.Ldr(value.W(), MemOperand(x12));
 					break;
 				case 55:
-					a.Ldr(x10, MemOperand(x12));
+					a.Ldr(value, MemOperand(x12));
 					break;
 			}
 			if (IsVU0Transfer(code))
@@ -1625,21 +1636,20 @@ namespace
 				// Unlike GPR r0, fpr[0] is a real writable register.
 				a.Str(w10, FPR(rt));
 			}
-			else if (rt)
+			else if (size == 16)
 			{
-				if (size == 16)
+				if (rt)
 					a.Str(q0, GPRWrite(rt));
-				else
-					a.Str(x10, GPRWrite(rt));
 			}
+			else if (cached)
+				a.Str(value, GPR(rt));
 		}
 	}
 
-	void EmitMemory(MacroAssembler& a, u32 code, u32 pc, const u32* source, u32 source_bytes,
-		Label* before, Label* after)
+	void EmitMemory(MacroAssembler& a, u32 code, const u32* source, u32 source_bytes, Label* before, Label* after)
 	{
 		EmitAddress(a, code, before);
-		EmitAccess(a, code, pc, source, source_bytes, after);
+		EmitAccess(a, code, source, source_bytes, after);
 	}
 	// Set by Compile() for the block being emitted.
 	struct ExitInfo
@@ -1650,21 +1660,41 @@ namespace
 		// 2 - CP0.Config bit 18 when the block was compiled; the dispatcher drops
 		// every block when that bit changes.
 		u32 cycle_scale = 2;
+		// Exits emitted after the block's last instruction, out of the way of
+		// the code that runs on.
+		std::deque<std::pair<Label, std::function<void()>>>* deferred = nullptr;
 	} s_exit;
 
-	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
-	// same CP0.Config bit TryExecute uses) into w11, with x13 = block_cycles.
-	// x1 holds &g_link_state for the whole block. Branches to `off` when
-	// chaining is off. Clobbers x9-x13 only, so x0 and a taken branch's x15
-	// survive.
+	// While chaining, adds cycles[completed] (scaled by the same CP0.Config bit
+	// TryExecute uses) to w20, the block_cycles register (see EmitEnter). x1
+	// holds &g_link_state for the whole block. Branches to `off` when chaining
+	// is off. Clobbers w9 only, so x0 and a taken branch's x15 survive.
 	void EmitAddCycles(MacroAssembler& a, u32 completed, Label* off)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
 		a.Cbz(w9, off);
-		a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
-		a.Ldr(w11, MemOperand(x13));
-		a.Add(w11, w11, s_exit.cycles[completed] * s_exit.cycle_scale);
+		a.Add(w20, w20, s_exit.cycles[completed] * s_exit.cycle_scale);
+	}
+
+	// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
+	// cycle += max(block_cycles >> 3, 1); block_cycles &= 7. Memory keeps the
+	// cycle too, for C++ and the next Enter().
+	void EmitCommitCycles(MacroAssembler& a)
+	{
+		a.Lsr(w10, w20, 3);
+		a.Cmp(w10, 1);
+		a.Csinc(w10, w10, wzr, hs);
+		a.And(w20, w20, 7);
+		a.Add(x19, x19, x10);
+		a.Str(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+	}
+
+	// EEBranchEventDue(): the signed 64-bit distance to the deadline.
+	void EmitEventDue(MacroAssembler& a, Label* due)
+	{
+		a.Sub(x9, x19, x21);
+		a.Tbz(x9, 63, due);
 	}
 
 	// A returning exit: w0 = value, plus x15 (already shifted) as the target
@@ -1677,7 +1707,6 @@ namespace
 		{
 			Label off, done;
 			EmitAddCycles(a, completed, &off);
-			a.Str(w11, MemOperand(x13));
 			a.Mov(x16, CyclesCommitted);
 			a.B(&done);
 			a.Bind(&off);
@@ -1722,31 +1751,10 @@ namespace
 		using namespace Arm64EE::CodeGenerator;
 		Label request, due;
 		EmitAddCycles(a, completed, classic);
-		a.Mov(w9, next);
-		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
 		if (kind == LinkKind::Taken)
-		{
-			// intUpdateCPUCycles() at EECycleRate 0, which linkable blocks require:
-			// cycle += max(block_cycles >> 3, 1); block_cycles &= 7.
-			a.Lsr(w10, w11, 3);
-			a.Cmp(w10, 1);
-			a.Csinc(w10, w10, wzr, hs);
-			a.And(w11, w11, 7);
-			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-			a.Add(x9, x9, x10);
-			a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		}
-		a.Str(w11, MemOperand(x13));
+			EmitCommitCycles(a);
 		if (kind != LinkKind::Continue)
-		{
-			// EEBranchEventDue(): signed 64-bit distance to the deadline. A taken
-			// exit still has the new cycle in x9.
-			if (kind != LinkKind::Taken)
-				a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
-			a.Sub(x9, x9, x10);
-			a.Tbz(x9, 63, &due);
-		}
+			EmitEventDue(a, &due);
 		// A link is only valid in the generation it was made in: any drop of
 		// compiled blocks bumps it, including one from a write fault taken
 		// inside the block that is running now.
@@ -1762,14 +1770,16 @@ namespace
 			a.b(&request); // PatchLink() retargets this to the next block
 			a.dc32(0); // generation of the link; 0 is never current
 		}
+		// pc is only stored on the paths that return to C++: the linked block
+		// stores it itself wherever it exits, and nothing reads it in between.
 		a.Bind(&request);
-		EmitCode(a, code);
+		EmitPosition(a, next, code);
 		a.Mov(x0, (slot << 32) | LinkRequest | CyclesCommitted);
 		a.Ret();
 		if (kind != LinkKind::Continue)
 		{
 			a.Bind(&due);
-			EmitCode(a, code);
+			EmitPosition(a, next, code);
 			a.Mov(x0, EventDue | CyclesCommitted);
 			a.Ret();
 		}
@@ -1784,18 +1794,8 @@ namespace
 		static_assert(sizeof(IndirectEntry) == 16);
 		Label due, miss;
 		EmitAddCycles(a, completed, classic);
-		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
-		a.Lsr(w10, w11, 3);
-		a.Cmp(w10, 1);
-		a.Csinc(w10, w10, wzr, hs);
-		a.And(w11, w11, 7);
-		a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		a.Add(x9, x9, x10);
-		a.Str(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
-		a.Str(w11, MemOperand(x13));
-		a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
-		a.Sub(x9, x9, x10);
-		a.Tbz(x9, 63, &due);
+		EmitCommitCycles(a);
+		EmitEventDue(a, &due);
 		a.Mov(x10, reinterpret_cast<uintptr_t>(g_indirect.data()));
 		a.Ubfx(w9, w15, 2, IndirectBits);
 		a.Add(x10, x10, Operand(x9, LSL, 4));
@@ -1808,10 +1808,12 @@ namespace
 		a.Ldr(x16, MemOperand(x10, 8));
 		a.Br(x16);
 		a.Bind(&miss);
+		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
 		EmitCode(a, code);
 		a.Mov(x0, NextBlock | CyclesCommitted);
 		a.Ret();
 		a.Bind(&due);
+		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
 		EmitCode(a, code);
 		a.Mov(x0, EventDue | CyclesCommitted);
 		a.Ret();
@@ -1828,7 +1830,9 @@ namespace
 	// address first, so an access the interpreter has to perform leaves before
 	// the link register or anything else is written, and the interpreter then
 	// runs the branch and its delay slot.
-	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding, const u32* source,
+	// Returns true when the untaken path falls through to the delay slot, which
+	// the caller then emits as the next ordinary instruction.
+	bool EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding, const u32* source,
 		u32 source_bytes, Label* before)
 	{
 		using namespace Arm64EE::CodeGenerator;
@@ -1894,10 +1898,13 @@ namespace
 			}
 			a.B(InvertCondition(taken), &untaken);
 		}
+		// The taken path changes what the GPR cache holds; an untaken path that
+		// goes on starts from the state at the branch.
+		const GprCache untaken_gpr = s_gpr;
 		// Nothing of this block runs after its delay slot, so a store there needs
 		// no self-modification exit: a write fault drops every block and link.
 		if (memory_delay)
-			EmitAccess(a, delay, pc + 4, source, source_bytes, nullptr);
+			EmitAccess(a, delay, source, source_bytes, nullptr);
 		else if ((delay >> 26) == 17)
 			EmitCOP1(a, delay);
 		else
@@ -1920,12 +1927,13 @@ namespace
 		EmitPosition(a, pc + 8, delay);
 		a.Lsl(x15, x15, 32);
 		EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
-		if (conditional)
-		{
-			a.Bind(&untaken);
-			// BEQ/BNE and annulled likely branches test events without committing
-			// cycles. Other untaken branches simply continue at the delay slot.
-			const bool event_test = likely || op == 4 || op == 5;
+		if (!conditional)
+			return false;
+		a.Bind(&untaken);
+		// BEQ/BNE and annulled likely branches test events without committing
+		// cycles. Other untaken branches simply continue at the delay slot.
+		const bool event_test = likely || op == 4 || op == 5;
+		const auto exit = [&a, event_test, likely, preceding, pc, code]() {
 			if (s_exit.linkable)
 			{
 				Label classic;
@@ -1934,7 +1942,26 @@ namespace
 			}
 			EmitPosition(a, pc + (likely ? 8 : 4), code);
 			EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
+		};
+		if (!s_exit.linkable || !ContinuesAfterBranch(code))
+		{
+			exit();
+			return false;
 		}
+		// While chaining, go on at the delay slot. That is what the exit would
+		// do: link to pc + 4 unless the event deadline has passed, and leave the
+		// cycles uncommitted. cycle only changes at taken-branch commits, so it is
+		// the value the exit would test. Not chaining, return as before, so
+		// TryExecute() still runs to the first branch. Needs proper testing
+		// across more games.
+		s_gpr = untaken_gpr;
+		auto& [label, emit] = s_exit.deferred->emplace_back();
+		emit = exit;
+		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
+		a.Cbz(w9, &label);
+		if (event_test)
+			EmitEventDue(a, &label);
+		return true;
 	}
 
 } // namespace
@@ -1960,6 +1987,28 @@ bool Arm64EE::CodeGenerator::SupportsDelaySlot(u32 branch, u32 code)
 Arm64EE::CodeGenerator::LinkState Arm64EE::CodeGenerator::g_link_state;
 std::array<Arm64EE::CodeGenerator::IndirectEntry, 1u << Arm64EE::CodeGenerator::IndirectBits> Arm64EE::CodeGenerator::g_indirect;
 
+size_t Arm64EE::CodeGenerator::EmitEnter(u8* buffer, size_t capacity)
+{
+	MacroAssembler a(buffer, capacity);
+	a.Stp(x29, x30, MemOperand(sp, -48, PreIndex));
+	a.Stp(x19, x20, MemOperand(sp, 16));
+	a.Stp(x21, x22, MemOperand(sp, 32));
+	a.Mov(x22, x1);
+	a.Ldr(x19, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+	a.Ldr(x13, MemOperand(x1, offsetof(LinkState, block_cycles)));
+	a.Ldr(w20, MemOperand(x13));
+	a.Ldr(x21, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
+	a.Blr(x2);
+	a.Ldr(x13, MemOperand(x22, offsetof(LinkState, block_cycles)));
+	a.Str(w20, MemOperand(x13));
+	a.Ldp(x21, x22, MemOperand(sp, 32));
+	a.Ldp(x19, x20, MemOperand(sp, 16));
+	a.Ldp(x29, x30, MemOperand(sp, 48, PostIndex));
+	a.Ret();
+	a.FinalizeCode();
+	return a.GetSizeOfCodeGenerated();
+}
+
 void Arm64EE::CodeGenerator::PatchLink(u8* slot, const void* target, u32 generation)
 {
 	// The code buffer is 64 MiB, well inside B's +-128 MiB range.
@@ -1976,7 +2025,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	std::span<const u32> cycles, bool linkable, bool self_check)
 {
 	MacroAssembler a(buffer, capacity);
-	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1)};
+	std::deque<std::pair<Label, std::function<void()>>> deferred;
+	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1), &deferred};
 	s_gpr.Reset();
 	std::array<Label, MaxInstructions + 1> exits;
 	Label stale, copy;
@@ -2010,11 +2060,12 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	{
 		if (IsBranch(words[i]))
 		{
-			EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]);
-			break;
+			if (!EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]))
+				break;
+			continue; // the untaken path runs the delay slot next
 		}
 		if (MemorySize(words[i]))
-			EmitMemory(a, words[i], pc + i * 4, source, words.size_bytes(), &exits[i], &exits[i + 1]);
+			EmitMemory(a, words[i], source, words.size_bytes(), &exits[i], &exits[i + 1]);
 		else if (IsTrapping(words[i]))
 			EmitTrapping(a, words[i], &exits[i]);
 		else if (IsQuadFunnelShift(words[i]))
@@ -2046,16 +2097,30 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		}
 		if (completed && !handler_pc)
 			EmitPosition(a, pc + completed * 4, words[completed - 1]);
+		else if (!completed)
+		{
+			// Links do not store pc, so an exit before the first instruction (an
+			// access the interpreter has to perform) names this block's entry.
+			a.Mov(w9, pc);
+			a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
+		}
 		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)
 			break;
 	}
+	for (auto& [label, emit] : deferred)
+	{
+		a.Bind(&label);
+		emit();
+	}
 	if (self_check)
 	{
-		// pc is this block's entry and the exit that got here committed its
-		// cycles, so the dispatcher only has to look the block up again. Outside
-		// chaining the empty exit field reads as NotHandled.
+		// The exit that got here committed its cycles, so the dispatcher only has
+		// to look this block up again; links do not store pc, so do it here.
+		// Outside chaining the empty exit field reads as NotHandled.
 		a.Bind(&stale);
+		a.Mov(w9, pc);
+		a.Str(w9, MemOperand(x0, offsetof(cpuRegisters, pc)));
 		a.Mov(x0, NextBlock | CyclesCommitted);
 		a.Ret();
 		vixl::ExactAssemblyScope scope(&a, (words.size() + 2) * kInstructionSize);

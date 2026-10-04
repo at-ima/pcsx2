@@ -75,6 +75,18 @@ namespace Arm64EE::CodeGenerator
 		return ((code >> 11) & 31) == 16;
 	}
 	bool SupportsDelaySlot(u32 branch, u32 code);
+	// A conditional branch that is not "likely" and can fall through: when it is
+	// not taken, its delay slot runs as an ordinary instruction at pc + 4, so a
+	// linkable block goes on past it instead of ending there.
+	constexpr bool ContinuesAfterBranch(u32 code)
+	{
+		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
+		if (!IsBranch(code) || op == 0 || op == 2 || op == 3 || (op >= 20 && op <= 23))
+			return false;
+		if ((op == 1 || op == 16 || op == 17) && (rt & 2))
+			return false; // REGIMM, COP0 and COP1 likely forms
+		return !(op == 4 && rs == 0 && rt == 0); // BEQ $0, $0 is always taken
+	}
 	// Packed native return value: completed prefix in bits 0-7, exit action in
 	// bits 8-9 and the taken target in bits 32-63. No events run in generated code.
 	constexpr u32 CompletedMask = 0xff;
@@ -116,6 +128,16 @@ namespace Arm64EE::CodeGenerator
 	extern std::array<IndirectEntry, 1u << IndirectBits> g_indirect;
 	// A link slot is a B instruction followed by the generation it was linked in.
 	void PatchLink(u8* slot, const void* target, u32 generation);
+
+	// Blocks run with the cycle bookkeeping in callee-saved registers, so a
+	// chain of linked blocks never round-trips it through memory: x19 =
+	// cpuRegs.cycle (also stored at every commit, so memory stays current),
+	// w20 = *block_cycles, x21 = cpuRegs.nextEventCycle (reloaded after any
+	// call into C++), x22 = the LinkState. EmitEnter() writes the stub C++
+	// calls blocks through: Enter(&cpuRegs, &g_link_state, block) loads them,
+	// runs the block and writes w20 back.
+	using Enter = u64 (*)(cpuRegisters*, LinkState*, const void*);
+	size_t EmitEnter(u8* buffer, size_t capacity);
 
 	// Generated functions return the completed prefix and exit action. On an
 	// unsupported memory access they leave PC at that instruction for fallback.
