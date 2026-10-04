@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
+#include <functional>
 
 namespace
 {
@@ -1654,6 +1656,9 @@ namespace
 		// 2 - CP0.Config bit 18 when the block was compiled; the dispatcher drops
 		// every block when that bit changes.
 		u32 cycle_scale = 2;
+		// Exits emitted after the block's last instruction, out of the way of
+		// the code that runs on.
+		std::deque<std::pair<Label, std::function<void()>>>* deferred = nullptr;
 	} s_exit;
 
 	// While chaining, loads *block_cycles + cycles[completed] (scaled by the
@@ -1833,7 +1838,9 @@ namespace
 	// address first, so an access the interpreter has to perform leaves before
 	// the link register or anything else is written, and the interpreter then
 	// runs the branch and its delay slot.
-	void EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding, const u32* source,
+	// Returns true when the untaken path falls through to the delay slot, which
+	// the caller then emits as the next ordinary instruction.
+	bool EmitBranch(MacroAssembler& a, u32 code, u32 delay, u32 pc, u32 preceding, const u32* source,
 		u32 source_bytes, Label* before)
 	{
 		using namespace Arm64EE::CodeGenerator;
@@ -1899,6 +1906,9 @@ namespace
 			}
 			a.B(InvertCondition(taken), &untaken);
 		}
+		// The taken path changes what the GPR cache holds; an untaken path that
+		// goes on starts from the state at the branch.
+		const GprCache untaken_gpr = s_gpr;
 		// Nothing of this block runs after its delay slot, so a store there needs
 		// no self-modification exit: a write fault drops every block and link.
 		if (memory_delay)
@@ -1925,12 +1935,13 @@ namespace
 		EmitPosition(a, pc + 8, delay);
 		a.Lsl(x15, x15, 32);
 		EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
-		if (conditional)
-		{
-			a.Bind(&untaken);
-			// BEQ/BNE and annulled likely branches test events without committing
-			// cycles. Other untaken branches simply continue at the delay slot.
-			const bool event_test = likely || op == 4 || op == 5;
+		if (!conditional)
+			return false;
+		a.Bind(&untaken);
+		// BEQ/BNE and annulled likely branches test events without committing
+		// cycles. Other untaken branches simply continue at the delay slot.
+		const bool event_test = likely || op == 4 || op == 5;
+		const auto exit = [&a, event_test, likely, preceding, pc, code]() {
 			if (s_exit.linkable)
 			{
 				Label classic;
@@ -1939,7 +1950,31 @@ namespace
 			}
 			EmitPosition(a, pc + (likely ? 8 : 4), code);
 			EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
+		};
+		if (!s_exit.linkable || !ContinuesAfterBranch(code))
+		{
+			exit();
+			return false;
 		}
+		// While chaining, go on at the delay slot. That is what the exit would
+		// do: link to pc + 4 unless the event deadline has passed, and leave the
+		// cycles uncommitted. cycle only changes at taken-branch commits, so it is
+		// the value the exit would test. Not chaining, return as before, so
+		// TryExecute() still runs to the first branch. Needs proper testing
+		// across more games.
+		s_gpr = untaken_gpr;
+		auto& [label, emit] = s_exit.deferred->emplace_back();
+		emit = exit;
+		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, chaining)));
+		a.Cbz(w9, &label);
+		if (event_test)
+		{
+			a.Ldr(x9, MemOperand(x0, offsetof(cpuRegisters, cycle)));
+			a.Ldr(x10, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
+			a.Sub(x9, x9, x10);
+			a.Tbz(x9, 63, &label);
+		}
+		return true;
 	}
 
 } // namespace
@@ -1981,7 +2016,8 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	std::span<const u32> cycles, bool linkable, bool self_check)
 {
 	MacroAssembler a(buffer, capacity);
-	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1)};
+	std::deque<std::pair<Label, std::function<void()>>> deferred;
+	s_exit = {linkable, cycles, buffer, 2 - ((cpuRegs.CP0.n.Config >> 18) & 1), &deferred};
 	s_gpr.Reset();
 	std::array<Label, MaxInstructions + 1> exits;
 	Label stale, copy;
@@ -2015,8 +2051,9 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 	{
 		if (IsBranch(words[i]))
 		{
-			EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]);
-			break;
+			if (!EmitBranch(a, words[i], words[i + 1], pc + i * 4, i, source, words.size_bytes(), &exits[i]))
+				break;
+			continue; // the untaken path runs the delay slot next
 		}
 		if (MemorySize(words[i]))
 			EmitMemory(a, words[i], source, words.size_bytes(), &exits[i], &exits[i + 1]);
@@ -2061,6 +2098,11 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		EmitReturn(a, completed, completed | EncodeExit(completed ? EEBlockExit::Continue : EEBlockExit::NotHandled), false);
 		if (!completed)
 			break;
+	}
+	for (auto& [label, emit] : deferred)
+	{
+		a.Bind(&label);
+		emit();
 	}
 	if (self_check)
 	{

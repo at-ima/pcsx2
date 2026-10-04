@@ -194,7 +194,9 @@ namespace
 				block.words[block.word_count++] = word;
 				block.cycles[block.word_count] = block.cycles[block.word_count - 1] + R5900::GetInstruction(word).cycles;
 			}
-			if (count == 2)
+			// The code generator goes on past an untaken conditional branch while
+			// chaining (see ContinuesAfterBranch), but only in linkable blocks.
+			if (count == 2 && (!Linkable() || !Arm64EE::CodeGenerator::ContinuesAfterBranch(block.words[block.word_count - 2])))
 				break;
 			const u32 last = block.words[block.word_count - 1];
 			if (Arm64EE::CodeGenerator::IsInterpreterCall(last) && Arm64EE::CodeGenerator::EndsBlockAfterCall(last))

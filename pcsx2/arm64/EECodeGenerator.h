@@ -75,6 +75,18 @@ namespace Arm64EE::CodeGenerator
 		return ((code >> 11) & 31) == 16;
 	}
 	bool SupportsDelaySlot(u32 branch, u32 code);
+	// A conditional branch that is not "likely" and can fall through: when it is
+	// not taken, its delay slot runs as an ordinary instruction at pc + 4, so a
+	// linkable block goes on past it instead of ending there.
+	constexpr bool ContinuesAfterBranch(u32 code)
+	{
+		const u32 op = code >> 26, rs = (code >> 21) & 31, rt = (code >> 16) & 31;
+		if (!IsBranch(code) || op == 0 || op == 2 || op == 3 || (op >= 20 && op <= 23))
+			return false;
+		if ((op == 1 || op == 16 || op == 17) && (rt & 2))
+			return false; // REGIMM, COP0 and COP1 likely forms
+		return !(op == 4 && rs == 0 && rt == 0); // BEQ $0, $0 is always taken
+	}
 	// Packed native return value: completed prefix in bits 0-7, exit action in
 	// bits 8-9 and the taken target in bits 32-63. No events run in generated code.
 	constexpr u32 CompletedMask = 0xff;

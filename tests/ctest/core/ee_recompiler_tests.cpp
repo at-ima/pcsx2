@@ -884,6 +884,82 @@ TEST_F(EERecompilerTest, ChainedBlocksMatchOneBlockPerCall)
 	}
 }
 
+// While chaining, a block goes on past an untaken BEQ/BNE/BLEZ and runs the
+// delay slot as an ordinary instruction (ContinuesAfterBranch). The loop below
+// takes and skips each branch in turn, loads in a delay slot, and rewrites one
+// of its own words (with the same value) after the first untaken branch, so
+// a mid-block self-modification exit runs too. It has to end exactly where
+// one block per TryExecute() call ends.
+TEST_F(EERecompilerTest, ChainedBlocksGoOnPastUntakenBranches)
+{
+	program.fill(Stop);
+	program[0] = (9u << 26) | (1 << 21) | (1 << 16) | 0xffffu; // ADDIU $1, $1, -1
+	program[1] = (12u << 26) | (1 << 21) | (5 << 16) | 1u; // ANDI $5, $1, 1
+	program[2] = (4u << 26) | (5 << 21) | (0 << 16) | 4u; // BEQ $5, $0, Base + 28
+	program[3] = (35u << 26) | (7 << 21) | (6 << 16) | 0u; // delay: LW $6, 0($7)
+	program[4] = (7 << 21) | (6 << 16) | (8 << 11) | 33; // ADDU $8, $7, $6
+	program[5] = (43u << 26) | (7 << 21) | (8 << 16) | 4u; // SW $8, 4($7)
+	program[6] = (43u << 26) | (12 << 21) | (11 << 16) | 32u; // SW $11, 32($12): word 8, unchanged
+	program[7] = (6u << 26) | (1 << 21) | 3u; // BLEZ $1, Base + 44
+	program[8] = (9u << 26) | (9 << 21) | (9 << 16) | 1u; // delay: ADDIU $9, $9, 1
+	program[9] = (5u << 26) | (1 << 21) | (0 << 16) | 0xfff6u; // BNE $1, $0, Base
+	program[10] = (9u << 26) | (10 << 21) | (10 << 16) | 3u; // delay: ADDIU $10, $10, 3
+	for (u32 seed : {0u, 1u})
+	{
+		for (u32 initial_t0 : {1u, 2u, 7u, 3000u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " initial_t0=" << initial_t0);
+			Arm64EE::Reset();
+			Init(seed);
+			memory.fill(0x81abcdef);
+			cpuRegs.GPR.r[1].UD[0] = initial_t0;
+			cpuRegs.GPR.r[7].UD[0] = Data;
+			cpuRegs.GPR.r[11].UD[0] = program[8];
+			cpuRegs.GPR.r[12].UD[0] = Base;
+			cpuRegs.nextEventCycle = u64(1) << 40; // keep events away, as in ChainedBlocksMatchOneBlockPerCall
+			const cpuRegisters initial = cpuRegs;
+			const auto initial_memory = memory;
+			auto run = [&](bool chained, u32& cycles) {
+				cpuRegs = initial;
+				memory = initial_memory;
+				cycles = 0;
+				EEBlockResult result;
+				u32 calls = 0;
+				do
+				{
+					result = chained ? Arm64EE::ExecuteChained(cycles) : Arm64EE::TryExecute(cycles);
+					if (result.exit == EEBlockExit::TakenBranch)
+					{
+						cpuRegs.branch = 1;
+						cpuRegs.pc = result.target;
+						cpuRegs.branch = 0;
+						cpuRegs.cycle += std::max(cycles >> 3, 1u);
+						cycles &= 7;
+					}
+					ASSERT_LT(++calls, 100000u);
+				} while (result);
+			};
+			u32 stepped_cycles, chained_cycles;
+			run(false, stepped_cycles);
+			if (HasFatalFailure())
+				return;
+			const cpuRegisters stepped = cpuRegs;
+			const auto stepped_memory = memory;
+			run(true, chained_cycles);
+			if (HasFatalFailure())
+				return;
+			EXPECT_EQ(cpuRegs.pc, Base + 44);
+			EXPECT_EQ(cpuRegs.GPR.r[9].UL[0], initial.GPR.r[9].UL[0] + initial_t0); // every BLEZ delay slot ran
+			EXPECT_EQ(chained_cycles, stepped_cycles);
+			EXPECT_EQ(cpuRegs.cycle, stepped.cycle);
+			EXPECT_EQ(std::memcmp(&cpuRegs, &stepped, sizeof(cpuRegisters)), 0);
+			EXPECT_EQ(memory, stepped_memory);
+			if (HasFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(EERecompilerTest, RegimmBranchesAndLinkSourceAliasing)
 {
 	for (u32 rt : {0u, 1u, 2u, 3u, 16u, 17u, 18u, 19u})
