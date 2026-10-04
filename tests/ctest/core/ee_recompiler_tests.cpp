@@ -1419,6 +1419,69 @@ TEST_F(EERecompilerTest, COP2RegisterTransfersMatchInterpreter)
 	}
 }
 
+// Transfers to and from VI registers with special cases (R, the clip flag,
+// read-only registers) and with r0/vf0/vi0, which the native copies handle
+// themselves.
+TEST_F(EERecompilerTest, COP2SpecialRegisterTransfersMatchInterpreter)
+{
+	constexpr u32 fs_values[] = {0, REG_STATUS_FLAG, REG_MAC_FLAG, REG_CLIP_FLAG, REG_R, REG_I, REG_Q, REG_TPC, REG_CMSAR0, REG_VPU_STAT};
+	for (u32 rs : {1u, 2u, 5u, 6u})
+	{
+		for (u32 fs : fs_values)
+		{
+			for (u32 rt : {0u, 3u})
+			{
+				SCOPED_TRACE(testing::Message() << "rs=" << rs << " fs=" << fs << " rt=" << rt);
+				Init(fs + rt);
+				InitVU0(fs * 3 + rt);
+				program[0] = (9u << 26) | (1u << 21) | (3u << 16) | 5; // ADDIU r3, r1, 5: cached rt
+				program[1] = (18u << 26) | (rs << 21) | (rt << 16) | ((fs & 31) << 11);
+				program[2] = (33u << 0) | (3u << 21) | (1u << 16) | (4u << 11); // ADDU r4, r3, r1
+				CompareWithVU0(3);
+				if (HasFailure())
+					return;
+			}
+		}
+	}
+}
+
+// While a microprogram runs, every COP2 op calls the interpreter (out of
+// line), with the block's cached registers saved. VU0 is set up as already
+// past an M bit and ahead of the EE, so the interlocked QMTC2/CTC2 only move
+// the EE cycle up to VU0's instead of running VU0: a native copy would leave
+// the cycle alone.
+TEST_F(EERecompilerTest, COP2WhileVU0RunsCallsTheInterpreter)
+{
+	const u32 cop2[] = {
+		(18u << 26) | (5u << 21) | (2u << 16) | (3u << 11) | 1, // QMTC2.I r2, vf3
+		(18u << 26) | (6u << 21) | (2u << 16) | (5u << 11) | 1, // CTC2.I r2, vi5
+		(18u << 26) | (1u << 21) | (2u << 16) | (3u << 11), // QMFC2 r2, vf3 (sync only)
+		(18u << 26) | (2u << 21) | (2u << 16) | (5u << 11), // CFC2 r2, vi5 (sync only)
+	};
+	for (u32 code : cop2)
+	{
+		for (u32 seed = 0; seed < 4; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "code=" << std::hex << code << " seed=" << seed);
+			Init(seed);
+			InitVU0(seed);
+			VU0.VI[REG_VPU_STAT].UL = 1;
+			VU0.flags |= VUFLAG_MFLAGSET;
+			cpuRegs.cycle = 1000;
+			VU0.cycle = 1000 + 37;
+			program[0] = (9u << 26) | (1u << 21) | (2u << 16) | 5; // ADDIU r2, r1, 5
+			program[1] = (9u << 26) | (3u << 21) | (4u << 16) | 7; // ADDIU r4, r3, 7
+			program[2] = code;
+			program[3] = (33u << 0) | (2u << 21) | (4u << 16) | (5u << 11); // ADDU r5, r2, r4
+			CompareWithVU0(4);
+			if (HasFailure())
+				return;
+			if (code & 1)
+				EXPECT_EQ(cpuRegs.cycle, 1037u);
+		}
+	}
+}
+
 TEST_F(EERecompilerTest, COP2MacroArithmeticMatchesInterpreter)
 {
 	// rs bit 4 (i.e. rs >= 16) reaches COP2_SPECIAL; funct 39 is VADD, an

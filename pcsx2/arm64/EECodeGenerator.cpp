@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <memory>
 #include <functional>
 
 namespace
@@ -1167,35 +1168,95 @@ namespace
 		a.Ldr(x21, MemOperand(x0, offsetof(cpuRegisters, nextEventCycle)));
 	}
 
-	// The FMAC macro ops run natively while VU0 is idle, which is when
-	// COP2_SPECIAL's _vu0FinishMicro() does nothing. Everything else, and every
-	// op while a microprogram runs, calls the interpreter's handler.
+	Label* Defer(std::function<void()> emit);
+
+	// QMFC2/CFC2/QMTC2/CTC2 while VU0 is idle (x9 = &VU0), when their
+	// vu0Sync() and interlock waits do nothing and each is a plain copy
+	// (VU0.cpp). GPRs are read and written in memory, not through s_gpr, so
+	// the interpreter-call path can join this one with the same cache state.
+	void EmitCOP2Transfer(MacroAssembler& a, u32 code)
+	{
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, fs = (code >> 11) & 31;
+		if (rs == 1) // QMFC2
+		{
+			if (rt)
+			{
+				a.Ldr(q0, MemOperand(x9, VF(fs)));
+				a.Str(q0, GPRWrite(rt));
+			}
+		}
+		else if (rs == 2) // CFC2
+		{
+			if (!rt)
+				return;
+			a.Ldr(w10, MemOperand(x9, VI(fs)));
+			if (fs == REG_R)
+			{
+				// Only the low word changes.
+				a.And(w10, w10, 0x7fffff);
+				a.Str(w10, GPRWrite(rt));
+			}
+			else
+			{
+				a.Sxtw(x10, w10);
+				a.Str(x10, GPRWrite(rt));
+			}
+		}
+		else if (rs == 5) // QMTC2
+		{
+			if (fs)
+			{
+				a.Ldr(q0, GPR(rt));
+				a.Str(q0, MemOperand(x9, VF(fs)));
+			}
+		}
+		else // CTC2; FBRST and CMSAR1 always call the interpreter
+		{
+			if (!fs || fs == REG_MAC_FLAG || fs == REG_TPC || fs == REG_VPU_STAT) // read-only
+				return;
+			a.Ldr(w10, GPR(rt));
+			if (fs == REG_R)
+			{
+				a.And(w10, w10, 0x7fffff);
+				a.Orr(w10, w10, 0x3f800000);
+			}
+			else if (fs == REG_CLIP_FLAG)
+				a.Str(w10, MemOperand(x9, offsetof(VURegs, clipflag)));
+			a.Str(w10, MemOperand(x9, VI(fs)));
+		}
+	}
+
+	// The FMAC macro ops and the register transfers run natively while VU0 is
+	// idle, which is when COP2_SPECIAL's _vu0FinishMicro() and the transfers'
+	// syncs do nothing. Everything else, and every op while a microprogram
+	// runs, calls the interpreter's handler, out of line.
 	// Needs proper testing across more games.
 	void EmitCOP2(MacroAssembler& a, u32 code, u32 pc)
 	{
-		const u32 rs = (code >> 21) & 31;
-		if (rs & 16)
+		const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, fs = (code >> 11) & 31;
+		void (*const handler)() = (rs & 16) ? &COP2_SPECIAL : rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2;
+		const MacroArithmetic m = (rs & 16) ? DecodeMacroArithmetic(code) : MacroArithmetic{};
+		const bool native = (rs & 16) ? m.op != MacroOp::None : !(rs == 6 && (fs == REG_FBRST || fs == REG_CMSAR1));
+		if (native)
 		{
-			const MacroArithmetic m = DecodeMacroArithmetic(code);
-			if (m.op == MacroOp::None)
-			{
-				EmitInterpreterCall(a, code, pc, &COP2_SPECIAL);
-				return;
-			}
-			Label slow, done;
+			// The deferred call jumps back here; the label outlives this frame.
+			const auto done = std::make_shared<Label>();
 			a.Mov(x9, reinterpret_cast<uintptr_t>(&VU0));
 			a.Ldr(w10, MemOperand(x9, VI(REG_VPU_STAT)));
-			a.Tbnz(w10, 0, &slow);
-			EmitMacroArithmetic(a, code, m);
-			a.B(&done);
-			a.Bind(&slow);
-			EmitInterpreterCall(a, code, pc, &COP2_SPECIAL);
-			a.Bind(&done);
-			return;
+			a.Tbnz(w10, 0, Defer([&a, code, pc, handler, done]() {
+				EmitInterpreterCall(a, code, pc, handler);
+				a.B(done.get());
+			}));
+			if (rs & 16)
+				EmitMacroArithmetic(a, code, m);
+			else
+				EmitCOP2Transfer(a, code);
+			a.Bind(done.get());
 		}
-		EmitInterpreterCall(a, code, pc, rs == 1 ? &QMFC2 : rs == 2 ? &CFC2 : rs == 5 ? &QMTC2 : &CTC2);
+		else
+			EmitInterpreterCall(a, code, pc, handler);
 		if (rs == 1 || rs == 2)
-			s_gpr.Invalidate((code >> 16) & 31);
+			s_gpr.Invalidate(rt);
 	}
 
 	// Natively compiles the COP1 (FPU) instructions accepted by SupportsCOP1().
