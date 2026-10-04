@@ -57,10 +57,10 @@ What this buys and costs:
   and rear wings are covered in speckled, noise-like shading in upstream
   PCSX2 and ARMSX2 but not in this fork (see below). Which difference causes
   it has not been pinned down.
-- **More CPU time.** Keeping flags and queues exact is why this fork uses
-  more CPU time and power than ARMSX2 (see the benchmarks). Skipping unread
-  VU1 flags under the flag hack was the first step; an EE register cache is
-  next.
+- **More CPU time.** Keeping flags and queues exact costs CPU time. For VU1
+  this is now mostly recovered: flags are computed only where they are read,
+  and VU1 thread time is level with ARMSX2's in most scenes. The EE thread
+  still takes more time than ARMSX2's (see the benchmarks).
 - **Incremental coverage.** Instructions can be added one at a time, each
   checked against the interpreter, and anything missing still runs.
 
@@ -73,10 +73,10 @@ identical in all three until about frame 700, so the frames match exactly.
 
 ## Benchmarks
 
-Measured on 2026-09-29 on an Apple M5 MacBook Air (fanless, 32 GB, macOS 27)
+Measured on 2026-10-04 on an Apple M5 MacBook Air (fanless, 32 GB, macOS 27)
 from the same save states, one emulator at a time:
 
-- **This fork** at `4db5c23da`, Release build.
+- **This fork** at `58f5c9597`, Release build.
 - **ARMSX2** macOS arm64 build `112cd677b4`,
   which ports the x86 recompilers (microVU and friends) to ARM64.
 - **Official PCSX2 2.8.2** x64 build, running under Rosetta 2.
@@ -87,60 +87,87 @@ accuracy. Each run loads the save state, waits 15 s, then samples for about
 12 s: FPS and per-thread times from six on-screen-display captures, and power
 and CPU time from `proc_pid_rusage` (the energy macOS attributes to the
 process). "CPU cores busy" is CPU time divided by wall time. Each run waited
-for the Mac to cool down to a nominal thermal state first.
+for the Mac to cool down to a nominal thermal state first. Runs whose window
+captures came out blank, and one ARMSX2 run with an implausible power reading
+(1.2 W at 1.9 busy cores), were repeated.
 
 **6x internal resolution (3072x2688, 4K class)**
 
 | Game | Emulator | FPS avg (min) | Speed | EE / GS / VU1 / GPU ms per frame | Power | CPU cores busy |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
-| Shadow of the Colossus | **This fork (native ARM64)** | 59.7 (58.0) | 100% | 13.12 / 7.55 / 12.32 / 16.15 | 5.28 W | 2.13 |
-|  | ARMSX2 | 42.7 (40.6) | 71% | 7.74 / 4.57 / 5.90 / 22.63 | 2.70 W | 0.88 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 38.7 (34.0) | 65% | 9.63 / 6.58 / 9.03 / 25.59 | 2.42 W | 1.06 |
-| Burnout 3: Takedown | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 9.45 / 5.15 / 5.19 / 13.50 | 4.82 W | 1.24 |
-|  | ARMSX2 | 60.0 (60.0) | 100% | 5.61 / 2.91 / 3.47 / 13.77 | 2.00 W | 0.78 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.9 (59.8) | 100% | 6.98 / 4.05 / 4.73 / 12.76 | 2.83 W | 1.01 |
-| Ridge Racer V | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 5.29 / 5.88 / 5.88 / 11.21 | 2.62 W | 1.06 |
-|  | ARMSX2 | 60.1 (59.9) | 100% | 4.08 / 3.13 / 4.14 / 14.25 | 1.96 W | 0.71 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.9 (59.9) | 100% | 4.46 / 4.05 / 5.41 / 10.09 | 2.18 W | 0.83 |
-| Ape Escape 3 (Saru! Get You! 3) | **This fork (native ARM64)** | 59.9 (59.8) | 100% | 8.25 / 3.10 / 3.71 / 9.90 | 3.23 W | 0.95 |
-|  | ARMSX2 | 60.0 (59.9) | 100% | 6.61 / 2.33 / 3.40 / 13.37 | 1.90 W | 0.75 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 61.0 (59.9) | 102% | 7.25 / 2.90 / 3.70 / 9.32 | 2.58 W | 0.86 |
+| Shadow of the Colossus | **This fork (native ARM64)** | 59.7 (58.4) | 100% | 8.60 / 3.96 / 6.77 / 16.36 | 3.51 W | 1.26 |
+|  | ARMSX2 | 45.8 (40.6) | 76% | 6.47 / 3.78 / 4.90 / 21.45 | 2.67 W | 0.82 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 40.2 (36.0) | 67% | 7.63 / 5.37 / 7.38 / 24.32 | 2.56 W | 0.89 |
+| Burnout 3: Takedown | **This fork (native ARM64)** | 60.0 (59.9) | 100% | 7.92 / 2.64 / 2.76 / 15.51 | 4.28 W | 0.86 |
+|  | ARMSX2 | 59.9 (59.9) | 100% | 4.60 / 2.26 / 2.81 / 13.68 | 3.38 W | 0.65 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 58.4 (50.4) | 97% | 7.33 / 4.12 / 4.88 / 12.63 | 3.04 W | 1.02 |
+| Ridge Racer V | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 4.32 / 4.26 / 4.04 / 12.26 | 2.97 W | 0.76 |
+|  | ARMSX2 | 60.0 (60.0) | 100% | 4.03 / 2.64 / 3.92 / 16.43 | 2.45 W | 0.63 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.3 (57.8) | 99% | 3.71 / 2.93 / 4.14 / 10.00 | 3.63 W | 0.67 |
+| Ape Escape 3 (Saru! Get You! 3) | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 6.68 / 2.58 / 2.55 / 10.54 | 3.71 W | 0.73 |
+|  | ARMSX2 | 59.9 (59.9) | 100% | 5.36 / 2.02 / 2.65 / 10.67 | 3.27 W | 0.64 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.8 (58.5) | 100% | 6.74 / 2.19 / 3.21 / 10.11 | 3.76 W | 0.77 |
 
 **1x internal resolution (native)**
 
 | Game | Emulator | FPS avg (min) | Speed | EE / GS / VU1 / GPU ms per frame | Power | CPU cores busy |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
-| Shadow of the Colossus | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 9.99 / 9.79 / 9.84 / 6.05 | 7.84 W | 1.77 |
-|  | ARMSX2 | 59.5 (57.2) | 99% | 8.53 / 5.65 / 8.03 / 6.34 | 4.88 W | 1.43 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 58.2 (49.6) | 97% | 8.44 / 5.50 / 8.59 / 4.33 | 6.21 W | 1.33 |
-| Burnout 3: Takedown | **This fork (native ARM64)** | 60.0 (59.9) | 100% | 9.60 / 4.93 / 5.33 / 9.21 | 4.68 W | 1.19 |
-|  | ARMSX2 | 60.0 (59.9) | 100% | 5.64 / 2.79 / 3.31 / 12.04 | 2.19 W | 0.73 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 56.6 (40.0) | 94% | 6.73 / 3.96 / 4.63 / 3.54 | 3.07 W | 0.94 |
-| Ridge Racer V | **This fork (native ARM64)** | 60.8 (59.9) | 100% | 5.62 / 5.96 / 5.87 / 7.01 | 2.76 W | 1.05 |
-|  | ARMSX2 | 60.0 (59.9) | 100% | 4.26 / 3.55 / 4.38 / 9.17 | 1.93 W | 0.75 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 60.0 (59.9) | 100% | 4.46 / 3.87 / 5.15 / 1.64 | 2.57 W | 0.80 |
-| Ape Escape 3 (Saru! Get You! 3) | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 8.16 / 3.10 / 3.77 / 5.21 | 3.42 W | 0.92 |
-|  | ARMSX2 | 59.9 (59.8) | 100% | 6.17 / 2.55 / 3.09 / 8.32 | 2.18 W | 0.73 |
-|  | PCSX2 2.8.2 x64 (Rosetta 2) | 60.0 (59.9) | 100% | 7.23 / 2.28 / 3.53 / 1.31 | 2.74 W | 0.82 |
+| Shadow of the Colossus | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 7.31 / 7.07 / 7.20 / 6.92 | 6.67 W | 1.34 |
+|  | ARMSX2 | 60.0 (59.9) | 100% | 6.70 / 4.59 / 6.87 / 10.52 | 6.30 W | 1.13 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 57.5 (51.7) | 96% | 7.76 / 5.64 / 8.48 / 4.31 | 6.62 W | 1.28 |
+| Burnout 3: Takedown | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 7.52 / 3.04 / 2.83 / 6.32 | 4.31 W | 0.85 |
+|  | ARMSX2 | 59.9 (59.8) | 100% | 5.02 / 2.82 / 3.41 / 6.99 | 2.98 W | 0.68 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.9 (59.9) | 100% | 5.86 / 3.33 / 4.06 / 3.10 | 4.07 W | 0.85 |
+| Ridge Racer V | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 4.46 / 4.38 / 4.28 / 4.40 | 2.78 W | 0.77 |
+|  | ARMSX2 | 59.9 (59.8) | 100% | 4.34 / 4.21 / 4.78 / 6.30 | 2.28 W | 0.78 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 59.9 (58.1) | 100% | 3.47 / 2.59 / 4.01 / 1.59 | 3.47 W | 0.63 |
+| Ape Escape 3 (Saru! Get You! 3) | **This fork (native ARM64)** | 59.9 (59.9) | 100% | 5.93 / 2.44 / 2.49 / 7.62 | 3.52 W | 0.68 |
+|  | ARMSX2 | 60.0 (59.9) | 100% | 5.06 / 2.07 / 2.60 / 7.67 | 3.21 W | 0.61 |
+|  | PCSX2 2.8.2 x64 (Rosetta 2) | 60.0 (60.0) | 100% | 6.20 / 2.69 / 3.21 / 1.29 | 3.73 W | 0.76 |
 
 How to read this:
 
 - With the frame limiter on, everything that keeps up shows 60 fps. The
   differences are in the thread times, power and busy cores.
 - **4K (6x) Shadow of the Colossus** is the only case where the emulators
-  differ in speed. ARMSX2 and the x64 build are GPU bound there (23-26 ms of
-  GPU time per frame); this fork's Metal changes bring that to 16 ms. A
-  repeat run gave ARMSX2 41.3 fps and x64 40.1 fps. A repeat of this fork run
-  straight after those two gave 50.6 fps, with the CPU clock down from
-  3.2 GHz to 2.2 GHz: on a fanless Mac, back-to-back 4K runs throttle.
-- **CPU efficiency is where this fork still loses.** In the same scenes it
-  uses about 1.1-2.1x ARMSX2's EE and VU1 thread time and about 1.3-2.4x its
-  power; the gap is widest in the VU1-heavy scenes (SotC, Burnout 3). ARMSX2 inherits microVU, which computes VU flags only where they
-  are read and keeps guest registers in host registers across a block.
+  differ in speed. ARMSX2 and the x64 build are GPU bound there (21-24 ms of
+  GPU time per frame); this fork's Metal changes bring that to 16 ms. On a
+  fanless Mac, back-to-back 4K runs throttle, so each run here started cool.
+- **VU1 is no longer the gap.** This fork's VU1 thread time is now level with
+  or below ARMSX2's in Burnout 3, Ape Escape 3 and Ridge Racer V, and within
+  5% of it in Shadow of the Colossus at 1x.
+- **The EE is where this fork still loses.** Its EE thread time is
+  1.0-1.7x ARMSX2's (widest in Burnout 3), and overall it uses about
+  1.0-1.5x ARMSX2's busy cores and power (1.5x busy cores in 4K Shadow of
+  the Colossus, where it also renders 14 fps more).
+- Against the x64 build under Rosetta 2, this fork now uses less power in
+  Ridge Racer V and slightly less in Ape Escape 3, about the same in Shadow
+  of the Colossus at 1x, and more in Burnout 3.
 - The x64 build's GPU times at 1x are much lower than both ARM64 builds'.
   This has not been investigated.
 - This fork's GS thread time includes a WFE spin while it waits for MTVU
   (see Known issues), so it overstates real GS work.
+
+**Change since the previous measurement (2026-09-29, `4db5c23da`).** The EE
+and VU1 work merged since then (PRs #2-#15: lazy VU1 flags, the EE GPR cache
+and leaner EE links, the VU1 per-pair and block-transition work, and others)
+cut this fork's CPU time:
+
+| Game (resolution) | EE ms per frame | VU1 ms per frame | CPU cores busy |
+| --- | ---: | ---: | ---: |
+| Shadow of the Colossus (6x) | 13.12 → 8.60 | 12.32 → 6.77 | 2.13 → 1.26 |
+| Shadow of the Colossus (1x) | 9.99 → 7.31 | 9.84 → 7.20 | 1.77 → 1.34 |
+| Burnout 3 (6x) | 9.45 → 7.92 | 5.19 → 2.76 | 1.24 → 0.86 |
+| Burnout 3 (1x) | 9.60 → 7.52 | 5.33 → 2.83 | 1.19 → 0.85 |
+| Ridge Racer V (6x) | 5.29 → 4.32 | 5.88 → 4.04 | 1.06 → 0.76 |
+| Ridge Racer V (1x) | 5.62 → 4.46 | 5.87 → 4.28 | 1.05 → 0.77 |
+| Ape Escape 3 (6x) | 8.25 → 6.68 | 3.71 → 2.55 | 0.95 → 0.73 |
+| Ape Escape 3 (1x) | 8.16 → 5.93 | 3.77 → 2.49 | 0.92 → 0.68 |
+
+Watts are not compared across the two days: in the same scenes, most runs
+of all three emulators read higher on 2026-10-04 than on 2026-09-29 (by up
+to about 70%, for example ARMSX2 in Burnout 3 at 6x: 2.00 W, then 3.38 W),
+so only same-day power comparisons are meaningful.
 
 ## Building on Apple Silicon
 
@@ -185,9 +212,8 @@ Xcode's `metal` tool, which the Command Line Tools do not include: if
    packages installed. If you copy the executable into another app bundle,
    re-sign it: `codesign --force --deep --sign - PCSX2.app`.
 
-4. Run the unit tests: `build-arm64/tests/ctest/core/core_test`. One test,
-   `VU1RecompilerTest.SpecialFloatsAndChangedFloatingPointOptions`, is a known
-   failure (see the ARM64 README).
+4. Run the unit tests: `build-arm64/tests/ctest/core/core_test`. All of them
+   should pass.
 
 ## Recommended settings
 
@@ -209,8 +235,8 @@ Xcode's `metal` tool, which the Command Line Tools do not include: if
   Burnout 3 and Shadow of the Colossus. Other games may break, run slowly, or
   hang. If a game misbehaves, try turning off the recompiler for one processor
   at a time to find which one is at fault.
-- CPU time and power are still about twice ARMSX2's in VU1-heavy scenes; see
-  the benchmarks above.
+- CPU time and power are still up to about 1.5x ARMSX2's, mostly in the EE
+  thread; see the benchmarks above.
 - The GS thread waits for MTVU with a WFE spin, so it looks busy in Activity
   Monitor even while it is idle.
 - See [Known issues](pcsx2/arm64/README.md#known-issues) in the ARM64 README.
