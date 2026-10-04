@@ -1665,6 +1665,16 @@ namespace
 		std::deque<std::pair<Label, std::function<void()>>>* deferred = nullptr;
 	} s_exit;
 
+	// Code that rarely runs goes after the block's last instruction, so the
+	// code that runs on stays dense in the instruction cache. `emit` may defer
+	// more code itself.
+	Label* Defer(std::function<void()> emit)
+	{
+		auto& [label, deferred_emit] = s_exit.deferred->emplace_back();
+		deferred_emit = std::move(emit);
+		return &label;
+	}
+
 	// While chaining, adds cycles[completed] (scaled by the same CP0.Config bit
 	// TryExecute uses) to w20, the block_cycles register (see EmitEnter). x1
 	// holds &g_link_state for the whole block. Branches to `off` when chaining
@@ -1742,23 +1752,29 @@ namespace
 	}
 
 	// The chaining path of an exit whose next pc is known at compile time.
-	// `code` is the last completed instruction. Jumps to `classic`, having
-	// stored nothing, when chaining is off; otherwise stores pc, does the
-	// driver's work for this exit and either jumps to the linked block or
-	// returns to C++.
-	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, u32 code, Label* classic)
+	// `code` is the last completed instruction. Runs `classic` (deferred),
+	// having stored nothing, when chaining is off; otherwise stores pc, does
+	// the driver's work for this exit and either jumps to the linked block or
+	// returns to C++. Only the jump to the linked block stays inline.
+	void EmitLinkedExit(MacroAssembler& a, LinkKind kind, u32 completed, u32 next, u32 code, std::function<void()> classic)
 	{
 		using namespace Arm64EE::CodeGenerator;
-		Label request, due;
-		EmitAddCycles(a, completed, classic);
+		EmitAddCycles(a, completed, Defer(std::move(classic)));
 		if (kind == LinkKind::Taken)
 			EmitCommitCycles(a);
 		if (kind != LinkKind::Continue)
-			EmitEventDue(a, &due);
+		{
+			EmitEventDue(a, Defer([&a, next, code]() {
+				EmitPosition(a, next, code);
+				a.Mov(x0, EventDue | CyclesCommitted);
+				a.Ret();
+			}));
+		}
 		// A link is only valid in the generation it was made in: any drop of
 		// compiled blocks bumps it, including one from a write fault taken
 		// inside the block that is running now.
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, generation)));
+		auto& [request, emit_request] = s_exit.deferred->emplace_back();
 		u64 slot;
 		{
 			vixl::ExactAssemblyScope scope(&a, 5 * kInstructionSize);
@@ -1772,51 +1788,43 @@ namespace
 		}
 		// pc is only stored on the paths that return to C++: the linked block
 		// stores it itself wherever it exits, and nothing reads it in between.
-		a.Bind(&request);
-		EmitPosition(a, next, code);
-		a.Mov(x0, (slot << 32) | LinkRequest | CyclesCommitted);
-		a.Ret();
-		if (kind != LinkKind::Continue)
-		{
-			a.Bind(&due);
+		emit_request = [&a, next, code, slot]() {
 			EmitPosition(a, next, code);
-			a.Mov(x0, EventDue | CyclesCommitted);
+			a.Mov(x0, (slot << 32) | LinkRequest | CyclesCommitted);
 			a.Ret();
-		}
+		};
 	}
 
 	// The chaining path of a JR/JALR, whose target is in w15: the driver's
 	// work for a taken branch, then a jump through g_indirect when the target
 	// block is there, or a return asking ExecuteChained() to look it up.
-	void EmitIndirectExit(MacroAssembler& a, u32 completed, u32 code, Label* classic)
+	void EmitIndirectExit(MacroAssembler& a, u32 completed, u32 code, std::function<void()> classic)
 	{
 		using namespace Arm64EE::CodeGenerator;
 		static_assert(sizeof(IndirectEntry) == 16);
-		Label due, miss;
-		EmitAddCycles(a, completed, classic);
+		const auto leave = [&a, code](u64 value) {
+			return [&a, code, value]() {
+				a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
+				EmitCode(a, code);
+				a.Mov(x0, value);
+				a.Ret();
+			};
+		};
+		Label* const miss = Defer(leave(NextBlock | CyclesCommitted));
+		EmitAddCycles(a, completed, Defer(std::move(classic)));
 		EmitCommitCycles(a);
-		EmitEventDue(a, &due);
+		EmitEventDue(a, Defer(leave(EventDue | CyclesCommitted)));
 		a.Mov(x10, reinterpret_cast<uintptr_t>(g_indirect.data()));
 		a.Ubfx(w9, w15, 2, IndirectBits);
 		a.Add(x10, x10, Operand(x9, LSL, 4));
 		a.Ldp(w9, w11, MemOperand(x10));
 		a.Cmp(w9, w15);
-		a.B(ne, &miss);
+		a.B(ne, miss);
 		a.Ldr(w9, MemOperand(x1, offsetof(LinkState, generation)));
 		a.Cmp(w11, w9);
-		a.B(ne, &miss);
+		a.B(ne, miss);
 		a.Ldr(x16, MemOperand(x10, 8));
 		a.Br(x16);
-		a.Bind(&miss);
-		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
-		EmitCode(a, code);
-		a.Mov(x0, NextBlock | CyclesCommitted);
-		a.Ret();
-		a.Bind(&due);
-		a.Str(w15, MemOperand(x0, offsetof(cpuRegisters, pc)));
-		EmitCode(a, code);
-		a.Mov(x0, EventDue | CyclesCommitted);
-		a.Ret();
 	}
 
 	u32 BranchLink(u32 code)
@@ -1909,24 +1917,24 @@ namespace
 			EmitCOP1(a, delay);
 		else
 			Emit(a, delay);
+		const auto taken_return = [&a, pc, delay, preceding]() {
+			EmitPosition(a, pc + 8, delay);
+			a.Lsl(x15, x15, 32);
+			EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
+		};
 		if (s_exit.linkable && op != 0)
 		{
 			const u32 target = (op == 2 || op == 3) ? (((pc + 4) & 0xf0000000u) | ((code & 0x03ffffffu) << 2)) :
 			                                          pc + 4 + static_cast<int16_t>(code) * 4;
-			Label classic;
-			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, delay, &classic);
-			a.Bind(&classic);
+			EmitLinkedExit(a, LinkKind::Taken, preceding + 2, target, delay, taken_return);
 		}
 		else if (s_exit.linkable)
 		{
 			// JR/JALR targets are only known at run time.
-			Label classic;
-			EmitIndirectExit(a, preceding + 2, delay, &classic);
-			a.Bind(&classic);
+			EmitIndirectExit(a, preceding + 2, delay, taken_return);
 		}
-		EmitPosition(a, pc + 8, delay);
-		a.Lsl(x15, x15, 32);
-		EmitReturn(a, preceding + 2, (preceding + 2) | EncodeExit(EEBlockExit::TakenBranch), true);
+		else
+			taken_return();
 		if (!conditional)
 			return false;
 		a.Bind(&untaken);
@@ -1934,14 +1942,14 @@ namespace
 		// cycles. Other untaken branches simply continue at the delay slot.
 		const bool event_test = likely || op == 4 || op == 5;
 		const auto exit = [&a, event_test, likely, preceding, pc, code]() {
+			const auto untaken_return = [&a, event_test, likely, preceding, pc, code]() {
+				EmitPosition(a, pc + (likely ? 8 : 4), code);
+				EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
+			};
 			if (s_exit.linkable)
-			{
-				Label classic;
-				EmitLinkedExit(a, event_test ? LinkKind::EventTest : LinkKind::Continue, preceding + 1, pc + (likely ? 8 : 4), code, &classic);
-				a.Bind(&classic);
-			}
-			EmitPosition(a, pc + (likely ? 8 : 4), code);
-			EmitReturn(a, preceding + 1, (preceding + 1) | EncodeExit(event_test ? EEBlockExit::EventTest : EEBlockExit::Continue), false);
+				EmitLinkedExit(a, event_test ? LinkKind::EventTest : LinkKind::Continue, preceding + 1, pc + (likely ? 8 : 4), code, untaken_return);
+			else
+				untaken_return();
 		};
 		if (!s_exit.linkable || !ContinuesAfterBranch(code))
 		{
@@ -2100,9 +2108,12 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		const bool handler_pc = completed && completed == words.size() && IsInterpreterCall(words[completed - 1]);
 		if (linkable && completed && completed == words.size() && !handler_pc)
 		{
-			Label classic;
-			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, words[completed - 1], &classic);
-			a.Bind(&classic);
+			const u32 code = words[completed - 1];
+			EmitLinkedExit(a, LinkKind::Continue, completed, pc + completed * 4, code, [&a, pc, completed, code]() {
+				EmitPosition(a, pc + completed * 4, code);
+				EmitReturn(a, completed, completed | EncodeExit(EEBlockExit::Continue), false);
+			});
+			continue;
 		}
 		if (completed && !handler_pc)
 			EmitPosition(a, pc + completed * 4, words[completed - 1]);
@@ -2117,10 +2128,12 @@ size_t Arm64EE::CodeGenerator::Compile(u8* buffer, size_t capacity, u32 pc, cons
 		if (!completed)
 			break;
 	}
-	for (auto& [label, emit] : deferred)
+	// Deferred code can defer more, which push_back allows: it keeps the
+	// elements (and their bound labels) where they are.
+	for (size_t i = 0; i < deferred.size(); i++)
 	{
-		a.Bind(&label);
-		emit();
+		a.Bind(&deferred[i].first);
+		deferred[i].second();
 	}
 	if (self_check)
 	{
