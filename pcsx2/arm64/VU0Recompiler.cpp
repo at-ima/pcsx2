@@ -77,6 +77,8 @@ namespace
 		std::array<u32, MaxInstructions> next_pc{};
 		std::array<bool, MaxInstructions> delay{};
 		bool has_branches = false;
+		// Pairs whose upper op computes no MAC/status flags (MarkHiddenFlags).
+		std::array<bool, MaxInstructions> hidden_flags{};
 		u32 count = 0;
 		VectorCache cache;
 		Function function = nullptr;
@@ -101,7 +103,7 @@ namespace
 	u32 Options()
 	{
 		return (CHECK_VU_OVERFLOW(0) ? 1 : 0) | (EmuConfig.Cpu.VU0FPCR.GetDenormalsAreZero() ? 2 : 0) |
-		       (CpuVU0 == &CpuArm64VU0 ? 4 : 0);
+		       (CpuVU0 == &CpuArm64VU0 ? 4 : 0) | (EmuConfig.Speedhacks.vuFlagHack ? 8 : 0);
 	}
 
 	void InvalidateAll()
@@ -503,10 +505,36 @@ namespace
 		a.Movi(v7.V4S(), 0xff7fffff);
 	}
 
+	// Set while emitting a pair whose flags nothing can see (MarkHiddenFlags).
+	bool s_hide_flags = false;
+
 	void StoreMAC(MacroAssembler& a, const VectorCache& cache, const Upper& op, u32 code, int mask_override = -1)
 	{
 		const u32 mask = mask_override >= 0 ? static_cast<u32>(mask_override) : (code >> 21) & 15;
 		const bool flush = EmuConfig.Cpu.VU0FPCR.GetFlushToZero();
+		if (s_hide_flags)
+		{
+			// Only the result's own denormal flush and clamp remain. A zero
+			// exponent lane becomes its sign, which leaves true zeros as they are.
+			if (!flush)
+			{
+				a.And(v17.V16B(), v0.V16B(), v24.V16B());
+				a.Cmeq(v19.V4S(), v17.V4S(), 0);
+				a.Movi(v22.V4S(), 0x80000000);
+				a.And(v22.V16B(), v0.V16B(), v22.V16B());
+				a.Bsl(v19.V16B(), v22.V16B(), v0.V16B());
+				a.Mov(v0.V16B(), v19.V16B());
+			}
+			if (CHECK_VU_OVERFLOW(0))
+			{
+				a.Smin(v0.V4S(), v0.V4S(), v6.V4S());
+				a.Umin(v0.V4S(), v0.V4S(), v7.V4S());
+			}
+			const u32 fd = (code >> 6) & 31;
+			if (op.acc || fd)
+				StoreVector(a, cache, v0, op.acc ? 32 : fd, mask);
+			return;
+		}
 		a.And(v17.V16B(), v0.V16B(), v24.V16B());
 		a.Fcmeq(v18.V4S(), v0.V4S(), 0.0);
 		if (!flush)
@@ -1353,6 +1381,87 @@ namespace
 		a.Str(w0, Field(offsetof(VURegs, ialucount)));
 	}
 
+	bool UpdatesFlags(u32 upper)
+	{
+		switch (DecodeUpper(upper).op)
+		{
+			case Op::Add:
+			case Op::Sub:
+			case Op::Mul:
+			case Op::Madd:
+			case Op::Msub:
+			case Op::Opmula:
+			case Op::Opmsub:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	// Under the VU flag hack (Speedhacks.vuFlagHack, on by default), an op
+	// computes no MAC/status flags that nothing can see, as microVU and
+	// VU1Recompiler.cpp do. Its flags stay hidden when a later flag op in the
+	// trace retires before any pair could read them: an FMAC result retires
+	// four cycles after it issues, and a pair takes at least one. Pairs that
+	// read the flags or the status scratch (the flag tests, FSSET, the divides)
+	// count as reads, and so do the pairs past the trace's end and after the
+	// fallthrough of a traced branch, which run code this block did not see.
+	// A block that stops early on its cycle budget resumes on the same trace.
+	// The hidden ops' sticky status bits are dropped.
+	// Needs proper testing on games that test VU0 flags.
+	void MarkHiddenFlags(Block& block)
+	{
+		block.hidden_flags.fill(false);
+		if (!EmuConfig.Speedhacks.vuFlagHack)
+			return;
+		constexpr u32 flag_regs = (1 << REG_STATUS_FLAG) | (1 << REG_MAC_FLAG);
+		std::array<bool, MaxInstructions + 4> reads{};
+		for (u32 p = 0; p < block.count; p++)
+		{
+			const Instruction& ins = block.instructions[p];
+			if ((ins.uregs.VIread | ins.lregs.VIread | ins.lregs.VIwrite) & flag_regs)
+				reads[p] = true;
+			if (ins.upper & 0x80000000)
+				continue;
+			const Lower op = DecodeLower(ins.lower);
+			switch (op)
+			{
+				case Lower::Fseq:
+				case Lower::Fsset:
+				case Lower::Fsand:
+				case Lower::Fsor:
+				case Lower::Fmeq:
+				case Lower::Fmand:
+				case Lower::Fmor:
+					reads[p] = true;
+					break;
+				default:
+					reads[p] |= IsFDIVPipe(op);
+					break;
+			}
+			if (IsIntegerBranch(op) && p + 1 < block.count)
+				reads[p + 1] = true;
+		}
+		for (u32 p = block.count; p < reads.size(); p++)
+			reads[p] = true;
+		u32 next = 0; // the next flag op, if any
+		bool have_next = false;
+		for (u32 i = block.count; i-- > 0;)
+		{
+			if (!UpdatesFlags(block.instructions[i].upper))
+				continue;
+			if (have_next)
+			{
+				bool hidden = true;
+				for (u32 p = i; p < next + 4 && hidden; p++)
+					hidden = !reads[p];
+				block.hidden_flags[i] = hidden;
+			}
+			next = i;
+			have_next = true;
+		}
+	}
+
 	// Builds a trace starting at pc, following static B and taken
 	// integer-branch edges. Stops one pair before anything this file does not
 	// natively compile: an unsupported upper or lower op, JR/JALR/BAL, a branch
@@ -1482,6 +1591,7 @@ namespace
 		if (block->count)
 		{
 			AssignVectorCache(*block);
+			MarkHiddenFlags(*block);
 			const VectorCache& cache = block->cache;
 			if (!s_pipeline.prepare[0])
 			{
@@ -1526,7 +1636,9 @@ namespace
 											reinterpret_cast<uintptr_t>(prepare[selected_prepare]));
 				a.Blr(x16);
 				a.Ldr(x26, Field(offsetof(VURegs, cycle)));
+				s_hide_flags = block->hidden_flags[i];
 				EmitPair(a, cache, ins, true);
+				s_hide_flags = false;
 				EmitFinish(a, ins);
 				EmitIntegerIssue(a, ins);
 				EmitControlFlow(a, *block, i);
