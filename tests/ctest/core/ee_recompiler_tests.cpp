@@ -11,6 +11,8 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
+#include <functional>
+#include <vector>
 
 // Deadline polling must remain correct across both the old 32-bit cycle boundary
 // and the full counter wrap, without postponing an execution-exit request.
@@ -94,6 +96,8 @@ namespace
 			Map(Base, program.data());
 			Map(Data, memory.data());
 			EmuConfig.Cpu.Recompiler.EnableEE = true;
+			// Test memory lies outside the fastmem area; FastmemAccesses* turn it on.
+			EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 			Arm64EE::Reset();
 			Init(0);
 		}
@@ -2169,6 +2173,103 @@ TEST_F(EERecompilerTest, COP0BranchesFollowDmacCondition)
 	}
 	psHu32(DMAC_STAT) = stat;
 	psHu32(DMAC_PCR) = pcr;
+}
+
+// With fastmem, RAM accesses go through the fastmem area. Data is mapped to
+// real EE RAM there, so its accesses succeed directly; Fault is mapped (to a
+// host buffer) only in the vtlb, so its load faults in the fastmem area. The
+// fault patches that load into a jump to the exit before it, the interpreter
+// performs it, and the recompiled block keeps it off fastmem. Both runs must
+// match the interpreter.
+TEST_F(EERecompilerTest, FastmemAccessesMatchInterpreterAndFallBackOnFaults)
+{
+	constexpr u32 Fault = 0x30000;
+	constexpr u32 RamOffset = 0x100000; // 16 KiB aligned, so the host page is coalesced
+	u8* const ram = eeMem->Main + RamOffset;
+	std::array<vtlb_private::VTLBVirtual, 5> saved;
+	for (u32 i = 0; i < 4; i++)
+		saved[i] = vtlb_private::vtlbdata.vmap[(Data >> 12) + i];
+	saved[4] = vtlb_private::vtlbdata.vmap[Fault >> 12];
+	// The fault handler first asks whether the faulting page is RAM holding
+	// code (PSM()); make it MMIO, which is what faults there in a game.
+	const vtlb_private::VTLBPhysical saved_physical = vtlb_private::vtlbdata.pmap[Fault >> 12];
+	R5900cpu* const saved_cpu = Cpu;
+	struct Restore
+	{
+		std::function<void()> f;
+		~Restore() { f(); }
+	} restore{[&]() {
+		for (u32 i = 0; i < 4; i++)
+			vtlb_private::vtlbdata.vmap[(Data >> 12) + i] = saved[i];
+		vtlb_private::vtlbdata.vmap[Fault >> 12] = saved[4];
+		vtlb_private::vtlbdata.pmap[Fault >> 12] = saved_physical;
+		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
+		vtlb_ResetFastmem(); // unmaps everything again
+		Cpu = saved_cpu;
+		Arm64EE::Reset();
+	}};
+	for (u32 i = 0; i < 4; i++)
+		Map(Data + i * 0x1000, reinterpret_cast<u32*>(ram + i * 0x1000));
+	Map(Fault, memory.data());
+	vtlb_private::vtlbdata.pmap[Fault >> 12] = vtlb_private::VTLBPhysical::fromHandler(0);
+	Cpu = &arm64Cpu; // a fault drops blocks through Cpu->Clear()
+	EmuConfig.Cpu.Recompiler.EnableFastmem = true;
+	vtlb_ResetFastmem();
+	Arm64EE::Reset();
+
+	program.fill(Stop);
+	program[0] = (35u << 26) | (1 << 21) | (2 << 16) | 0; // LW $2, 0($1)
+	program[1] = (43u << 26) | (1 << 21) | (3 << 16) | 4; // SW $3, 4($1)
+	program[2] = (55u << 26) | (1 << 21) | (4 << 16) | 8; // LD $4, 8($1)
+	program[3] = (31u << 26) | (1 << 21) | (5 << 16) | 16; // SQ $5, 16($1)
+	program[4] = (36u << 26) | (1 << 21) | (6 << 16) | 3; // LBU $6, 3($1)
+	program[5] = (35u << 26) | (8 << 21) | (7 << 16) | 4; // LW $7, 4($8): faults in fastmem
+	program[6] = (40u << 26) | (1 << 21) | (7 << 16) | 0x3001; // SB $7, 0x3001($1): last page of Data
+	program[7] = (9u << 26) | (7 << 21) | (9 << 16) | 1; // ADDIU $9, $7, 1
+	constexpr u32 count = 8;
+	for (u32 round = 0; round < 2; round++)
+	{
+		SCOPED_TRACE(testing::Message() << "round=" << round);
+		Init(round);
+		cpuRegs.GPR.r[1].UD[0] = Data;
+		cpuRegs.GPR.r[8].UD[0] = Fault;
+		for (u32 i = 0; i < 0x4000; i++)
+			ram[i] = static_cast<u8>(i * 7 + round);
+		for (u32 i = 0; i < memory.size(); i++)
+			memory[i] = 0x10203040u * (i + 1) + round;
+		const cpuRegisters initial = cpuRegs;
+		std::vector<u8> initial_ram(ram, ram + 0x4000);
+		const auto initial_memory = memory;
+
+		u32 native_cycles = 0;
+		u32 calls = 0;
+		while (Arm64EE::TryExecute(native_cycles))
+			ASSERT_LT(++calls, 16u);
+		const cpuRegisters actual = cpuRegs;
+		const std::vector<u8> actual_ram(ram, ram + 0x4000);
+		const auto actual_memory = memory;
+
+		cpuRegs = initial;
+		std::copy(initial_ram.begin(), initial_ram.end(), ram);
+		memory = initial_memory;
+		u32 expected_cycles = 0;
+		for (u32 i = 0; i < count; i++)
+		{
+			cpuRegs.code = program[i];
+			cpuRegs.pc += 4;
+			const auto& opcode = R5900::GetCurrentInstruction();
+			expected_cycles += opcode.cycles * (2 - ((cpuRegs.CP0.n.Config >> 18) & 1));
+			opcode.interpret();
+		}
+		EXPECT_EQ(actual.pc, Base + count * 4);
+		EXPECT_EQ(native_cycles, expected_cycles);
+		EXPECT_EQ(std::memcmp(&actual, &cpuRegs, sizeof(cpuRegs)), 0);
+		EXPECT_EQ(actual_ram, std::vector<u8>(ram, ram + 0x4000));
+		EXPECT_EQ(actual_memory, memory);
+		EXPECT_EQ(cpuRegs.GPR.r[2].UL[0], *reinterpret_cast<const u32*>(initial_ram.data())); // read RAM through fastmem
+		if (HasFailure())
+			return;
+	}
 }
 
 TEST_F(EERecompilerTest, LinkedAndRegisterJumpsMatchSteppedExecution)

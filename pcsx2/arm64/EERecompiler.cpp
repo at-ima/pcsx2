@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -40,6 +41,10 @@ namespace
 	// stay valid for as long as the deque itself lives -- exactly the
 	// property s_lookup/s_last_dispatch_block below rely on.
 	std::deque<Block> s_block_storage;
+	// Storage dropped while a block may still be running (a fastmem or write
+	// fault drops every block from inside one): RunBlock() still reads the
+	// running block's cycles after it returns. Freed at the next lookup.
+	std::vector<std::deque<Block>> s_retired_storage;
 	// Backing index for s_block_storage, keyed by pc: fixed-size, power-of-two,
 	// linear-probed open addressing. libc++'s std::unordered_map (used here
 	// until this commit) picks a prime bucket count, which needs a hardware
@@ -124,7 +129,8 @@ namespace
 		s_block_table_generation++;
 		DropLinks();
 		s_block_table_count = 0;
-		std::deque<Block>{}.swap(s_block_storage);
+		s_retired_storage.push_back(std::move(s_block_storage));
+		s_block_storage = {};
 	}
 	struct LookupEntry
 	{
@@ -150,6 +156,11 @@ namespace
 	u32 ConfigCycleBit() { return (cpuRegs.CP0.n.Config >> 18) & 1; }
 	// Native COP2 macro ops bake in VU0 overflow clamping and the Tri-Ace VADDi fix.
 	u32 s_vu0_options = 0;
+	// Whether blocks access RAM through the fastmem area, and for each such
+	// access compiled since the last Reset(), the exit a fault patches it to.
+	bool s_fastmem = false;
+	std::unordered_map<uptr, u8*> s_fastmem_exits;
+	bool FastmemEnabled() { return CHECK_FASTMEM && vtlb_private::vtlbdata.fastmem_base; }
 	u32 Vu0Options() { return EmuConfig.Cpu.Recompiler.vu0Overflow | (EmuConfig.Gamefixes.VuAddSubHack << 1); }
 	bool Linkable() { return s_cycle_rate == 0; }
 	// 1-entry "most recently dispatched" cache, checked before s_lookup. A
@@ -233,11 +244,18 @@ namespace
 		if (tracked && (page_type == ProtMode_None || page_type == ProtMode_Write))
 			mmap_MarkCountedRamPage(pc);
 		block.trusted = tracked ? page_type != ProtMode_Manual : s_trust_untracked_for_testing;
+		std::vector<Arm64EE::CodeGenerator::FastmemAccess> accesses;
 		HostSys::BeginCodeWrite();
 		const size_t size = Arm64EE::CodeGenerator::Compile(s_write, SysMemory::GetEERecEnd() - s_write,
 			pc, source, std::span(block.words.data(), block.word_count),
-			std::span(block.cycles.data(), block.word_count + 1), Linkable(), !block.trusted);
+			std::span(block.cycles.data(), block.word_count + 1), Linkable(), !block.trusted, s_fastmem ? &accesses : nullptr);
 		HostSys::EndCodeWrite();
+		for (const auto& access : accesses)
+		{
+			const uptr code = reinterpret_cast<uptr>(s_write + access.access);
+			vtlb_AddLoadStoreInfo(code, 4, access.pc, 0, 0, 0, 0, 0, false, false, false);
+			s_fastmem_exits[code] = s_write + access.exit;
+		}
 		HostSys::FlushInstructionCache(s_write, static_cast<u32>(size));
 		block.function = reinterpret_cast<Block::Function>(s_write);
 		s_write += (size + 15) & ~size_t(15);
@@ -265,6 +283,24 @@ __noinline void Arm64EE::Reset()
 	s_cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 	s_config_cycle_bit = ConfigCycleBit();
 	s_vu0_options = Vu0Options();
+	// The fault exits recorded so far lie in the code just rewound.
+	vtlb_ClearLoadStoreInfo();
+	s_fastmem_exits.clear();
+	s_fastmem = FastmemEnabled();
+}
+
+// A fastmem access faulted (unmapped, MMIO, or a host page the fastmem area
+// could not map): point it at the exit before its instruction, so the
+// interpreter performs it. vtlb_BackpatchLoadStore() then drops every block
+// and remembers the pc, so the block is recompiled without fastmem there.
+// Runs on the exception thread while the EE thread waits at the access.
+void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, u32 guest_addr, u32 gpr_bitmask,
+	u32 fpr_bitmask, u8 address_register, u8 data_register, u8 size_in_bits, bool is_signed, bool is_load, bool is_fpr)
+{
+	const auto it = s_fastmem_exits.find(code_address);
+	pxAssertRel(it != s_fastmem_exits.end(), "Fastmem access without an exit");
+	Arm64EE::CodeGenerator::PatchLink(reinterpret_cast<u8*>(code_address), it->second);
+	s_fastmem_exits.erase(it);
 }
 
 void Arm64EE::Shutdown()
@@ -289,6 +325,8 @@ namespace
 		const u32 pc = cpuRegs.pc;
 		if (!CHECK_EEREC || cpuRegs.branch || (pc & 3))
 			return nullptr;
+		if (!s_retired_storage.empty())
+			s_retired_storage.clear();
 		const auto mapping = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
 		// Never prefetch through MMIO or unmapped memory: the interpreter must
 		// perform that read with its original exception PC and handler semantics.
@@ -296,7 +334,7 @@ namespace
 			return nullptr;
 		const u32* source = reinterpret_cast<const u32*>(mapping.assumePtr(pc));
 		if (!s_write || s_goemon_tlb_hack != EmuConfig.Gamefixes.GoemonTlbHack || s_cycle_rate != EmuConfig.Speedhacks.EECycleRate ||
-			s_config_cycle_bit != ConfigCycleBit() || s_vu0_options != Vu0Options() || s_write > s_write_limit)
+			s_config_cycle_bit != ConfigCycleBit() || s_vu0_options != Vu0Options() || s_fastmem != FastmemEnabled() || s_write > s_write_limit)
 			Arm64EE::Reset();
 		// Checked before s_lookup: see the comment on its declaration. Reset() /
 		// ClearProvider() invalidate it alongside s_lookup and the block table.

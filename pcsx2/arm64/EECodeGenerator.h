@@ -7,6 +7,7 @@
 #include <array>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Arm64EE::CodeGenerator
 {
@@ -136,8 +137,8 @@ namespace Arm64EE::CodeGenerator
 	// chain of linked blocks never round-trips it through memory: x19 =
 	// cpuRegs.cycle (also stored at every commit, so memory stays current),
 	// w20 = *block_cycles, x21 = cpuRegs.nextEventCycle (reloaded after any
-	// call into C++), x22 = the LinkState, x23 = vtlbdata.vmap for memory
-	// accesses. EmitEnter() writes the stub C++
+	// call into C++), x22 = the LinkState, x23 = vtlbdata.vmap and x24 =
+	// vtlbdata.fastmem_base for memory accesses. EmitEnter() writes the stub C++
 	// calls blocks through: Enter(&cpuRegs, &g_link_state, block) loads them,
 	// runs the block and writes w20 back.
 	using Enter = u64 (*)(cpuRegisters*, LinkState*, const void*);
@@ -151,6 +152,16 @@ namespace Arm64EE::CodeGenerator
 	// `self_check` makes the block compare its source with `words` on entry
 	// and return NextBlock | CyclesCommitted, having run nothing, when they
 	// differ, so a block on a page that is not write-protected can be linked.
+	// With `fastmem`, RAM accesses go through the fastmem area, and each one
+	// is added there: `access` is its load/store and `exit` the early exit
+	// before its instruction, both offsets into `buffer`, for patching the
+	// access into a jump to the exit when it faults.
+	struct FastmemAccess
+	{
+		u32 access;
+		u32 exit;
+		u32 pc;
+	};
 	size_t Compile(u8* buffer, size_t capacity, u32 pc, const u32* source, std::span<const u32> words,
-		std::span<const u32> cycles, bool linkable, bool self_check);
+		std::span<const u32> cycles, bool linkable, bool self_check, std::vector<FastmemAccess>* fastmem = nullptr);
 } // namespace Arm64EE::CodeGenerator
