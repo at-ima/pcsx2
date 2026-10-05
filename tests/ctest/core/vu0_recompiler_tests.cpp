@@ -496,4 +496,39 @@ TEST_F(VU0RecompilerTest, FlagHackEmitsLessCode)
 	const size_t exact = committed(false);
 	EXPECT_LT(committed(true), exact);
 }
+// An FMAC result is already clamped, so a later FMAC skips clamping it again.
+// Everything else still clamps: registers from before the block, lanes the
+// result did not write, and values that ABS or LQ wrote since. x - x tells
+// them apart: a clamped infinity gives 0, an unclamped one NaN.
+TEST_F(VU0RecompilerTest, OperandsWrittenOutsideFmacResultsAreStillClamped)
+{
+	constexpr u32 kInf = 0x7f800000, kNegInf = 0xff800000;
+	constexpr u32 kSub = 0x2c;
+	for (u32 budget : {8u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		const u32 vf3[4] = {kInf, 0x40000000, kNegInf, 0x3f800000};
+		const u32 mem[4] = {kNegInf, kInf, kInf, kNegInf};
+		for (u32 lane = 0; lane < 4; lane++)
+		{
+			VU0.VF[1].UL[lane] = lane & 1 ? kNegInf : kInf;
+			VU0.VF[3].UL[lane] = vf3[lane];
+			VU0.VF[5].UL[lane] = kInf;
+		}
+		std::memcpy(VU0.Mem, mem, sizeof(mem));
+		Put(0, MakeUpper(kSub, 15, 12, 1, 1), kNopLower); // SUB vf12, vf1, vf1: block entry
+		Put(8, MakeUpper(0x2a, 12, 5, 3, 3), kNopLower); // MUL.xy vf5, vf3, vf3
+		Put(16, MakeUpper(kSub, 15, 6, 5, 5), kNopLower); // SUB vf6, vf5, vf5: zw from before
+		Put(24, MakeUpper(0x28, 15, 2, 0, 0), kNopLower); // ADD vf2, vf0, vf0
+		Put(32, (15u << 21) | (2u << 16) | (3u << 11) | (7u << 6) | 0x3d, kNopLower); // ABS vf2, vf3
+		Put(40, MakeUpper(kSub, 15, 9, 2, 2), kNopLower); // SUB vf9, vf2, vf2: ABS result
+		Put(48, MakeUpper(0x28, 15, 10, 0, 0), kNopLower); // ADD vf10, vf0, vf0
+		Put(56, kNopUpper, (15u << 21) | (10u << 16)); // LQ vf10, 0(vi0)
+		Put(64, MakeUpper(kSub, 15, 11, 10, 10), kNopLower); // SUB vf11, vf10, vf10: LQ result
+		Compare(budget);
+	}
+}
 #endif
