@@ -251,6 +251,16 @@ namespace Threading
 			return counter > 0;
 		}
 
+		/// Takes every pending post at once and returns how many there were,
+		/// so a consumer that is behind touches the counter once per batch.
+		u32 TryWaitAll()
+		{
+			int32_t counter = m_counter.load(std::memory_order_relaxed);
+			while (counter > 0 && !m_counter.compare_exchange_weak(counter, 0, std::memory_order_acquire, std::memory_order_relaxed))
+				;
+			return counter > 0 ? static_cast<u32>(counter) : 0;
+		}
+
 		/// Like TryWait(), but keeps trying for up to max_ns before giving up.
 		/// On ARM64 the core sleeps in WFE until another core writes the counter,
 		/// so a Post() in that window finds no sleeper and skips the kernel call,
