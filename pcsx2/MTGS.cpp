@@ -604,6 +604,7 @@ void MTGS::MainLoop()
 								s_sem_Vsync.Post();
 
 							AdjustCores();
+							GSApplyAutoUpscale();
 
 							// Do not StateCheckInThread() here
 							// Otherwise we could pause while there's still data in the queue

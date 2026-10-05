@@ -228,6 +228,12 @@ Xcode's `metal` tool, which the Command Line Tools do not include: if
   Upscale (Display Resolution, Metal)**. MetalFX scales the frame to the
   window size when it is presented, which costs far less GPU time than
   rendering at 6x.
+- **Power and heat:** add `AutoUpscaleToDisplay = true` under `[EmuCore/GS]`
+  in the ini. The upscale multiplier then becomes a maximum, and the
+  renderer uses the smallest whole multiplier that still covers the window.
+  On the fanless M5 Air, Shadow of the Colossus at 6x in a 2100x1278 window
+  took about 15 W of GPU power. The setting chose 4x and brought that down to
+  about 3 W, still at 60 fps.
 
 ## Status and known issues
 
