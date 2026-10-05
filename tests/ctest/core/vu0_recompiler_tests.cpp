@@ -67,6 +67,9 @@ namespace
 		void SetUp() override
 		{
 			m_cpu = EmuConfig.Cpu;
+			m_flag_hack = EmuConfig.Speedhacks.vuFlagHack;
+			// Exact comparisons need every flag; the flag hack tests turn it on.
+			EmuConfig.Speedhacks.vuFlagHack = false;
 			m_saved0 = VU0;
 			u8* micro = VU0.Micro;
 			u8* mem = VU0.Mem;
@@ -96,6 +99,7 @@ namespace
 			CpuArm64VU0.Reset();
 			VU0 = m_saved0;
 			EmuConfig.Cpu = m_cpu;
+			EmuConfig.Speedhacks.vuFlagHack = m_flag_hack;
 		}
 
 		// Rewinds to a coherent starting state. Resetting VU0.cycle without also
@@ -148,9 +152,57 @@ namespace
 			ASSERT_EQ(std::memcmp(VU0.Mem, expected_memory.data(), expected_memory.size()), 0);
 		}
 
+		// Runs the microprogram through its E bit in slices of `cycles`.
+		static void RunToEnd(BaseVUmicroCPU& cpu, u32 cycles)
+		{
+			for (u32 slice = 0; slice < 4096 && (VU0.VI[REG_VPU_STAT].UL & 1); slice++)
+				cpu.Execute(cycles);
+			ASSERT_FALSE(VU0.VI[REG_VPU_STAT].UL & 1);
+		}
+
+		// Under the flag hack, the program's results and the flags it reads
+		// match the interpreter. Sticky status bits of the ops whose flags
+		// nothing saw may be missing, and so may the queue entries those ops
+		// left behind.
+		void CompareWithFlagHack(u32 cycles)
+		{
+			VU0.VI[REG_VPU_STAT].UL |= 1;
+			const VURegs initial = VU0;
+			EmuConfig.Speedhacks.vuFlagHack = true;
+			RunToEnd(CpuIntVU0, cycles);
+			const VURegs expected = VU0;
+			VU0 = initial;
+			RunToEnd(CpuArm64VU0, cycles);
+			EmuConfig.Speedhacks.vuFlagHack = false;
+
+			ASSERT_EQ(std::memcmp(VU0.VF, expected.VF, sizeof(VU0.VF)), 0);
+			for (u32 reg = 0; reg < 32; reg++)
+			{
+				SCOPED_TRACE(testing::Message() << "vi" << reg);
+				const u32 actual = VU0.VI[reg].UL, wanted = expected.VI[reg].UL;
+				if (reg == REG_STATUS_FLAG)
+				{
+					EXPECT_EQ(actual & 0x3f, wanted & 0x3f);
+					EXPECT_EQ(actual & ~wanted, 0u);
+				}
+				else
+					EXPECT_EQ(actual, wanted);
+			}
+			EXPECT_EQ(VU0.cycle, expected.cycle);
+		}
+
 		Pcsx2Config::CpuOptions m_cpu;
+		bool m_flag_hack;
 		VURegs m_saved0;
 	};
+
+	constexpr u32 kEbit = 0x40000000;
+
+	// FMAND vit, vis.
+	constexpr u32 MakeFmand(u32 it, u32 is)
+	{
+		return (0x1au << 25) | (it << 16) | (is << 11);
+	}
 } // namespace
 
 // A divide stages its result in the FDIV pipe, and the block's own cycle-driven
@@ -325,6 +377,157 @@ TEST_F(VU0RecompilerTest, ADivideRetiresThePreviousQBeforeThePairedUpperReadsIt)
 		Put(8, kMulQ, MakeDiv(3, 0, 4, 1)); // reads the first divide's Q, issues a second
 		Put(16, kMulQ, kNopLower);
 
+		Compare(budget);
+	}
+}
+// Under the VU flag hack, an FMAC op whose flags a later one replaces before
+// anything reads them computes none. Run in slices, the program still leaves
+// every result and the flags it read as the interpreter does, including when
+// a slice ends between a hidden op and the one that replaces its flags.
+TEST_F(VU0RecompilerTest, FlagHackKeepsResultsAndTheFlagsThatAreRead)
+{
+	for (u32 budget : {1u, 2u, 3u, 5u, 8u, 16u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		VU0.VF[7].F[1] = -3.0f;
+		Put(0, MakeUpper(0x2a, 15, 9, 5, 6), kNopLower); // MUL
+		Put(8, MakeUpper(0x2c, 15, 10, 0, 7), kNopLower); // SUB, negative lanes
+		Put(16, MakeUpper(0x28, 15, 11, 3, 4), kNopLower); // ADD
+		Put(24, MakeUpper(0x2a, 15, 12, 1, 0), kNopLower); // MUL
+		Put(32, MakeUpper(0x2c, 15, 13, 5, 5), kNopLower); // SUB, zero
+		Put(64, kNopUpper, MakeFmand(1, 2));
+		Put(72, MakeUpper(0x28, 15, 14, 6, 7), kNopLower); // ADD
+		Put(80, MakeUpper(0x2c, 15, 15, 0, 7), kNopLower); // SUB, negative lanes
+		Put(120, kNopUpper | kEbit, kNopLower);
+		VU0.VI[2].UL = 0xffff;
+		CompareWithFlagHack(budget);
+	}
+}
+
+// An op without flags still flushes a denormal result to its sign when the
+// FPCR does not flush it.
+TEST_F(VU0RecompilerTest, FlagHackFlushesDenormalResultsLikeTheInterpreter)
+{
+	for (bool flush : {false, true})
+	{
+		SCOPED_TRACE(testing::Message() << "flush=" << flush);
+		EmuConfig.Cpu.VU0FPCR = FPControlRegister::GetDefault().DisableExceptions().SetFlushToZero(flush);
+		CpuArm64VU0.Reset();
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		VU0.VF[5] = {};
+		VU0.VF[5].F[0] = 1.5e-38f;
+		VU0.VF[5].F[1] = -1.5e-38f;
+		VU0.VF[5].F[2] = 0.0f;
+		VU0.VF[5].F[3] = 3.0f;
+		VU0.VF[6].F[0] = VU0.VF[6].F[1] = VU0.VF[6].F[2] = VU0.VF[6].F[3] = 0.25f;
+		Put(0, MakeUpper(0x2a, 15, 9, 5, 6), kNopLower); // MUL, denormal lanes
+		Put(8, MakeUpper(0x2a, 15, 10, 5, 6), kNopLower);
+		Put(16, MakeUpper(0x2a, 15, 11, 5, 6), kNopLower);
+		Put(64, kNopUpper | kEbit, kNopLower);
+		CompareWithFlagHack(64);
+	}
+}
+
+// A flag test that runs after an op's result retires but before the next
+// op's does reads that op's flags, so they are still computed.
+TEST_F(VU0RecompilerTest, FlagHackComputesFlagsATestCanRead)
+{
+	Rewind();
+	VU0.VF[7].F[2] = -2.0f;
+	Put(0, MakeUpper(0x2c, 15, 10, 0, 7), kNopLower); // SUB, a negative lane
+	Put(8, MakeUpper(0x2a, 15, 9, 5, 6), kNopLower); // MUL
+	Put(32, kNopUpper, MakeFmand(1, 2));
+	Put(64, kNopUpper | kEbit, kNopLower);
+	VU0.VI[2].UL = 0xffff;
+	CompareWithFlagHack(64);
+	EXPECT_NE(VU0.VI[1].UL, 0u);
+}
+
+// The E-bit pair runs on the interpreter after the block, and it may test the
+// flags of an op whose replacement has not retired yet.
+TEST_F(VU0RecompilerTest, FlagHackComputesFlagsCodeAfterTheBlockCanRead)
+{
+	Rewind();
+	VU0.VF[7].F[2] = -2.0f;
+	Put(0, MakeUpper(0x2c, 15, 10, 0, 7), kNopLower); // SUB, a negative lane
+	Put(8, MakeUpper(0x2a, 15, 9, 5, 6), kNopLower); // MUL
+	Put(32, kNopUpper | kEbit, MakeFmand(1, 2));
+	VU0.VI[2].UL = 0xffff;
+	CompareWithFlagHack(64);
+	EXPECT_NE(VU0.VI[1].UL, 0u);
+}
+
+// The trace follows a branch's taken edge, so the fallthrough leaves for code
+// the block did not see, which may test the flags.
+TEST_F(VU0RecompilerTest, FlagHackComputesFlagsTheFallthroughCanRead)
+{
+	Rewind();
+	VU0.VF[7].F[2] = -2.0f;
+	Put(0, MakeUpper(0x2c, 15, 10, 0, 7), kNopLower); // SUB, a negative lane
+	Put(8, kNopUpper, MakeBranch(0x29, 0, 0, 8, 40)); // IBNE vi0, vi0: never taken
+	Put(32, kNopUpper, MakeFmand(1, 2));
+	Put(40, MakeUpper(0x2a, 15, 9, 5, 6), kNopLower); // MUL on the taken edge
+	Put(80, kNopUpper | kEbit, kNopLower);
+	VU0.VI[2].UL = 0xffff;
+	CompareWithFlagHack(64);
+	EXPECT_NE(VU0.VI[1].UL, 0u);
+}
+
+// The flag hack drops the flag computation from the block, not just its use.
+TEST_F(VU0RecompilerTest, FlagHackEmitsLessCode)
+{
+	const auto committed = [this](bool hack) {
+		CpuArm64VU0.Reset();
+		Rewind();
+		for (u32 pc = 0; pc < 64; pc += 8)
+			Put(pc, MakeUpper(0x2a, 15, 9 + pc / 8, 5, 6), kNopLower);
+		Put(96, kNopUpper | kEbit, kNopLower);
+		EmuConfig.Speedhacks.vuFlagHack = hack;
+		VU0.VI[REG_VPU_STAT].UL |= 1;
+		CpuArm64VU0.Execute(16);
+		EmuConfig.Speedhacks.vuFlagHack = false;
+		return CpuArm64VU0.GetCommittedCache();
+	};
+	const size_t exact = committed(false);
+	EXPECT_LT(committed(true), exact);
+}
+// An FMAC result is already clamped, so a later FMAC skips clamping it again.
+// Everything else still clamps: registers from before the block, lanes the
+// result did not write, and values that ABS or LQ wrote since. x - x tells
+// them apart: a clamped infinity gives 0, an unclamped one NaN.
+TEST_F(VU0RecompilerTest, OperandsWrittenOutsideFmacResultsAreStillClamped)
+{
+	constexpr u32 kInf = 0x7f800000, kNegInf = 0xff800000;
+	constexpr u32 kSub = 0x2c;
+	for (u32 budget : {8u, 64u})
+	{
+		SCOPED_TRACE(testing::Message() << "budget=" << budget);
+		Rewind();
+		for (u32 pc = 0; pc < VU0_PROGSIZE; pc += 8)
+			Put(pc, kNopUpper, kNopLower);
+		const u32 vf3[4] = {kInf, 0x40000000, kNegInf, 0x3f800000};
+		const u32 mem[4] = {kNegInf, kInf, kInf, kNegInf};
+		for (u32 lane = 0; lane < 4; lane++)
+		{
+			VU0.VF[1].UL[lane] = lane & 1 ? kNegInf : kInf;
+			VU0.VF[3].UL[lane] = vf3[lane];
+			VU0.VF[5].UL[lane] = kInf;
+		}
+		std::memcpy(VU0.Mem, mem, sizeof(mem));
+		Put(0, MakeUpper(kSub, 15, 12, 1, 1), kNopLower); // SUB vf12, vf1, vf1: block entry
+		Put(8, MakeUpper(0x2a, 12, 5, 3, 3), kNopLower); // MUL.xy vf5, vf3, vf3
+		Put(16, MakeUpper(kSub, 15, 6, 5, 5), kNopLower); // SUB vf6, vf5, vf5: zw from before
+		Put(24, MakeUpper(0x28, 15, 2, 0, 0), kNopLower); // ADD vf2, vf0, vf0
+		Put(32, (15u << 21) | (2u << 16) | (3u << 11) | (7u << 6) | 0x3d, kNopLower); // ABS vf2, vf3
+		Put(40, MakeUpper(kSub, 15, 9, 2, 2), kNopLower); // SUB vf9, vf2, vf2: ABS result
+		Put(48, MakeUpper(0x28, 15, 10, 0, 0), kNopLower); // ADD vf10, vf0, vf0
+		Put(56, kNopUpper, (15u << 21) | (10u << 16)); // LQ vf10, 0(vi0)
+		Put(64, MakeUpper(kSub, 15, 11, 10, 10), kNopLower); // SUB vf11, vf10, vf10: LQ result
 		Compare(budget);
 	}
 }
