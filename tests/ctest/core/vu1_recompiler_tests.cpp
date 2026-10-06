@@ -3963,6 +3963,127 @@ TEST_F(VU1RecompilerTest, RegionBranchesSeeTheViBackup)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ViCopiesFollowEveryIntegerWriter)
+{
+	// Deferred regions read VI registers from host copies. Random programs
+	// over four VI registers mix the integer ops, loads and stores addressed
+	// by them, LQI/SQD updates, ILW/MTIR (which write VI another way) and
+	// signed branches, plus XTOP, ILWR and flag ops writing VI from memory,
+	// against the interpreter at several budgets.
+	const VURegs initial = VU1, initial0 = VU0;
+	u32 random = 0x2545f491;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	const auto vi = [&next]() { return 1 + next() % 4; };
+	constexpr u32 count = 40;
+	for (u32 seed = 0; seed < 64; seed++)
+	{
+		CpuArm64VU1.Reset();
+		VU0 = initial0;
+		VU1 = initial;
+		VU1.cycle = 1000;
+		for (u32 r = 1; r < 5; r++)
+			VU1.VI[r].UL = (next() % 2) ? next() % 8 : 0xfff8 + next() % 8;
+		for (u32 q = 0; q < 64; q++)
+			for (u32 lane = 0; lane < 4; lane++)
+				VU1.Mem[q * 16 + lane * 4] = static_cast<u8>(next());
+		for (u32 i = 0; i < count; i++)
+		{
+			const u32 fs = 5 + next() % 3, ft = 5 + next() % 3;
+			const u32 upper = (15 << 21) | (ft << 16) | (fs << 11) | ((5 + next() % 3) << 6) | 0x28; // ADD
+			const u32 dest = 1 + next() % 15;
+			u32 lower = 0x8000033c;
+			switch (next() % 20)
+			{
+				case 14: lower = (next() % 2 ? 0x800006bc : 0x800006bd) | (vi() << 16); break; // XTOP/XITOP
+				case 15: lower = 0x800003fe | ((1u << (next() % 4)) << 21) | (vi() << 16) | (vi() << 11); break; // ILWR
+				case 16: lower = 0x24000000 | (next() & 0xffffff); break; // FCAND VI1
+				case 17: lower = 0x38000000 | (vi() << 16); break; // FCGET
+				case 18: lower = 0x2c000000 | (vi() << 16) | (next() & 0x7ff); break; // FSAND
+				case 19: lower = 0x34000000 | (vi() << 16) | (vi() << 11); break; // FMAND
+				case 0: lower = 0x80000030 | (vi() << 16) | (vi() << 11) | (vi() << 6); break; // IADD
+				case 1: lower = 0x80000031 | (vi() << 16) | (vi() << 11) | (vi() << 6); break; // ISUB
+				case 2: lower = 0x80000034 | (vi() << 16) | (vi() << 11) | (vi() << 6); break; // IAND
+				case 3: lower = 0x80000035 | (vi() << 16) | (vi() << 11) | (vi() << 6); break; // IOR
+				case 4: lower = 0x80000032 | (vi() << 16) | (vi() << 11) | ((next() % 32) << 6); break; // IADDI
+				case 5: lower = (next() % 2 ? 0x10000000 : 0x12000000) | (vi() << 16) | (vi() << 11) | (next() % 6); break; // IADDIU/ISUBIU
+				case 6: lower = (dest << 21) | ((5 + next() % 3) << 16) | (vi() << 11) | (next() % 4); break; // LQ
+				case 7: lower = 0x02000000 | (dest << 21) | (vi() << 16) | ((5 + next() % 3) << 11) | (next() % 4); break; // SQ
+				case 8: lower = 0x08000000 | ((1u << (next() % 4)) << 21) | (vi() << 16) | (vi() << 11) | (next() % 4); break; // ILW
+				case 9: lower = 0x0a000000 | (dest << 21) | (vi() << 16) | (vi() << 11) | (next() % 4); break; // ISW
+				case 10: lower = 0x8000037c | (dest << 21) | ((5 + next() % 3) << 16) | (vi() << 11); break; // LQI
+				case 11: lower = 0x8000037f | (dest << 21) | (vi() << 16) | ((5 + next() % 3) << 11); break; // SQD
+				case 12: lower = 0x800003fc | ((next() % 4) << 21) | (vi() << 16) | ((5 + next() % 3) << 11); break; // MTIR
+				default:
+				{
+					constexpr u32 branches[] = {0x50000000, 0x52000000, 0x58000000, 0x5a000000, 0x5c000000, 0x5e000000};
+					lower = branches[next() % 6] | (vi() << 16) | (vi() << 11) | 1; // IBxx +1
+					break;
+				}
+			}
+			Put(i * 8, upper, lower);
+		}
+		Put(count * 8, 0x400002ff, 0x8000033c);
+		Put(count * 8 + 8, 0x2ff, 0x8000033c);
+		for (u32 pc = count * 8 + 16; pc < VU1_PROGSIZE; pc += 8)
+			Put(pc, 0x800002ff, 0x3f800000);
+		const VURegs state = VU1;
+		for (u32 budget : {12u, 40u, 400u})
+		{
+			SCOPED_TRACE(testing::Message() << "seed=" << seed << " budget=" << budget);
+			VU0 = initial0;
+			VU1 = state;
+			Compare(budget, 0, 2);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
+TEST_F(VU1RecompilerTest, ViCopiesDropValuesWrittenThroughMemory)
+{
+	// IADDIU leaves a copy of VI1, then XTOP, FCAND, ILW or ILWR replaces VI1
+	// in memory only, and a later IADD must read the new value.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 writers[] = {
+		0x800006bc | (1 << 16), // XTOP VI1
+		0x24000000 | 0x000fff, // FCAND VI1, 0xfff
+		0x08000000 | (8 << 21) | (1 << 16), // ILW.x VI1, 0(VI0)
+		0x800003fe | (8 << 21) | (1 << 16), // ILWR.x VI1, (VI0)
+	};
+	for (u32 writer : writers)
+	{
+		for (u32 gap = 0; gap < 4; gap++)
+		{
+			SCOPED_TRACE(testing::Message() << std::hex << writer << " gap=" << gap);
+			CpuArm64VU1.Reset();
+			VU0 = initial0;
+			VU1 = initial;
+			VU1.cycle = 1000;
+			VU1.clipflag = 0x123;
+			const u16 word = 0x77;
+			std::memcpy(VU1.Mem, &word, sizeof(word));
+			vif1Regs.top = 0x55;
+			vu1Thread.vifRegs.top = 0x55;
+			const u32 add = (15 << 21) | (6 << 16) | (5 << 11) | (7 << 6) | 0x28; // ADD VF7, VF5, VF6
+			u32 pc = 0;
+			for (u32 k = 0; k < 4; k++)
+				Put(pc++ * 8, add, 0x8000033c);
+			Put(pc++ * 8, add, 0x10000000 | (1 << 16) | 5); // IADDIU VI1, VI0, 5
+			Put(pc++ * 8, add, writer);
+			for (u32 k = 0; k < gap + 4; k++)
+				Put(pc++ * 8, add, 0x8000033c);
+			Put(pc++ * 8, add, 0x80000030 | (1 << 16) | (1 << 11) | (2 << 6)); // IADD VI2, VI1, VI1
+			for (u32 k = 0; k < 4; k++)
+				Put(pc++ * 8, add, 0x8000033c);
+			Put(pc++ * 8, 0x400002ff, 0x8000033c);
+			Put(pc++ * 8, 0x2ff, 0x8000033c);
+			Compare(400, 0, 2);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 TEST_F(VU1RecompilerTest, FlagQAndBranchReadersScheduleOutsideDeferredRegions)
 {
 	// Flag tests, Q readers and integer branches used to take the generic

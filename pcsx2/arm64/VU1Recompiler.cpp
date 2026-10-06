@@ -797,6 +797,48 @@ namespace
 	};
 	ClampedCopies s_clamped_copies;
 
+	// Copies of VI1..VI15 in w6-w8, which nothing else here or in the pipeline
+	// stubs uses, read instead of memory by the integer ops of a deferred
+	// region. Writes still go to memory too, so other readers and every exit
+	// see the same state as before. Copies are dropped by any C++ call (see
+	// EmitBlockConstants), an IALU retire, and any VI write that does not go
+	// through WriteVI. Loads must only be emitted on unconditional paths.
+	// Needs proper testing across more games.
+	struct ViCopies
+	{
+		std::array<int, 3> reg{-1, -1, -1};
+		u32 next = 0;
+		u8 pinned = 0; // copies the current instruction reads
+		int written = -1; // VI the current pair wrote through WriteVI
+		bool enabled = false;
+
+		void Forget() { reg = {-1, -1, -1}; }
+		void Forget(u32 vi)
+		{
+			for (int& r : reg)
+				if (r == static_cast<int>(vi))
+					r = -1;
+		}
+		int Find(u32 vi) const
+		{
+			for (u32 k = 0; k < 3; k++)
+				if (reg[k] == static_cast<int>(vi))
+					return static_cast<int>(k);
+			return -1;
+		}
+		u32 Claim(u32 vi)
+		{
+			u32 k = next;
+			while (pinned & (1 << k))
+				k = (k + 1) % 3;
+			next = (k + 1) % 3;
+			reg[k] = static_cast<int>(vi);
+			pinned |= 1 << k;
+			return k;
+		}
+	};
+	ViCopies s_vi_copies;
+
 	// An FMAC input: VF `reg` (or ACC) with `lane` broadcast (-1: none), clamped
 	// like ClampInput unless `clamped`. Returns the cache register itself when
 	// nothing has to change, else `temp` (or a clamped copy); `copy` forces `temp`.
@@ -864,8 +906,9 @@ namespace
 
 	void EmitBlockConstants(MacroAssembler& a)
 	{
-		// Called after every C++ call, which may clobber v26/v27.
+		// Called after every C++ call, which may clobber v26/v27 and w6-w8.
 		s_clamped_copies.Forget();
+		s_vi_copies.Forget();
 		a.Movi(v24.V4S(), 0x7f800000);
 		if (!CHECK_VU_OVERFLOW(0) && !CHECK_VU_OVERFLOW(1))
 			return;
@@ -1194,6 +1237,41 @@ namespace
 	};
 	StaticViBackup* s_vi_backup = nullptr;
 
+
+	// VI `reg` zero-extended, as LDRH reads it: a copy, or `temp`.
+	Register ReadVI(MacroAssembler& a, u32 reg, const Register& temp)
+	{
+		auto& copies = s_vi_copies;
+		// VI0 reads memory like the interpreter, which never writes it.
+		if (!copies.enabled || reg == 0 || reg >= 16)
+		{
+			a.Ldrh(temp, Field(VI(reg)));
+			return temp;
+		}
+		if (const int k = copies.Find(reg); k >= 0)
+		{
+			copies.pinned |= 1 << k;
+			return WRegister(6 + k);
+		}
+		const WRegister copy(6 + copies.Claim(reg));
+		a.Ldrh(copy, Field(VI(reg)));
+		return copy;
+	}
+
+	// Stores `value` (low 16 bits) to VI `reg` and keeps its copy current.
+	void WriteVI(MacroAssembler& a, u32 reg, const Register& value)
+	{
+		a.Strh(value, Field(VI(reg)));
+		auto& copies = s_vi_copies;
+		if (!copies.enabled || reg == 0 || reg >= 16)
+			return;
+		int k = copies.Find(reg);
+		if (k < 0)
+			k = static_cast<int>(copies.Claim(reg));
+		a.Uxth(WRegister(6 + k), value);
+		copies.written = static_cast<int>(reg);
+	}
+
 	void BackupVI(MacroAssembler& a, u32 reg)
 	{
 		if (s_vi_backup && s_vi_backup->known)
@@ -1202,8 +1280,7 @@ namespace
 			// Repeated writes keep the value from before the chain.
 			if (!(backup.left && backup.reg == static_cast<int>(reg)))
 			{
-				a.Ldrh(w9, Field(VI(reg)));
-				a.Str(w9, Field(offsetof(VURegs, VIOldValue)));
+				a.Str(ReadVI(a, reg, w9), Field(offsetof(VURegs, VIOldValue)));
 				backup.reg = static_cast<int>(reg);
 				backup.reg_dirty = true;
 			}
@@ -1721,12 +1798,14 @@ namespace
 		{
 			if (!it || !mask)
 				return;
-			a.Ldrh(w0, Field(VI(is)));
+			const Register base = ReadVI(a, is, w0);
 			if (op == Lower::Ilw)
 			{
 				const s32 imm = static_cast<s32>(code << 21) >> 21;
-				a.Add(w0, w0, imm);
+				a.Add(w0, base, imm);
 			}
+			else if (!base.Is(w0))
+				a.Mov(w0, base);
 			// ILWR has no immediate: VI[Is] is already the quadword index.
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
@@ -1759,13 +1838,11 @@ namespace
 			// independently (X/Y/Z/W are separate addresses), so it still writes
 			// when It == 0 and StoreMasked's usual broadcast-then-mask fits directly.
 			const s32 imm = static_cast<s32>(code << 21) >> 21;
-			a.Ldrh(w0, Field(VI(is)));
-			a.Add(w0, w0, imm);
+			a.Add(w0, ReadVI(a, is, w0), imm);
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
 			a.Add(x1, x1, Operand(x0, LSL, 4));
-			a.Ldrh(w0, Field(VI(it)));
-			a.Dup(v0.V4S(), w0);
+			a.Dup(v0.V4S(), ReadVI(a, it, w0));
 			StoreMasked(a, v0, MemOperand(x1), mask);
 			return;
 		}
@@ -1810,12 +1887,15 @@ namespace
 			// fields used by LQI/SQI/SQD. Even a suppressed update creates a backup.
 			const bool update = (load ? (decrement ? is : fs) : ft) != 0;
 			BackupVI(a, base);
-			a.Ldrh(w2, Field(VI(base)));
+			Register index = ReadVI(a, base, w2);
 			if (decrement && update)
-				a.Sub(w2, w2, 1);
+			{
+				a.Sub(w2, index, 1);
+				index = w2;
+			}
 			if (!load || ft)
 			{
-				a.And(w0, w2, 0x3ff);
+				a.And(w0, index, 0x3ff);
 				a.Ldr(x1, Field(offsetof(VURegs, Mem)));
 				if (load)
 					LoadQuad(a, cache, ft, mask);
@@ -1828,8 +1908,8 @@ namespace
 			if (update)
 			{
 				if (!decrement)
-					a.Add(w2, w2, 1);
-				a.Strh(w2, Field(VI(base)));
+					a.Add(w2, index, 1);
+				WriteVI(a, base, w2);
 			}
 			return;
 		}
@@ -1838,8 +1918,7 @@ namespace
 			if (op == Lower::Lq && !ft)
 				return;
 			const s32 imm = static_cast<s32>(code << 21) >> 21;
-			a.Ldrh(w0, Field(VI(op == Lower::Lq ? is : it)));
-			a.Add(w0, w0, imm);
+			a.Add(w0, ReadVI(a, op == Lower::Lq ? is : it, w0), imm);
 			a.And(w0, w0, 0x3ff);
 			a.Ldr(x1, Field(offsetof(VURegs, Mem)));
 			if (op == Lower::Lq)
@@ -1865,38 +1944,40 @@ namespace
 		}
 		else
 		{
-			a.Ldrh(w0, Field(VI(is)));
+			const Register vs = ReadVI(a, is, w0);
 			if (immediate)
 			{
 				const s32 imm = op == Lower::Iaddi ? static_cast<s32>(code << 21) >> 27 : ((code >> 10) & 0x7800) | (code & 0x7ff);
 				if (op == Lower::Isubiu)
-					a.Sub(w0, w0, imm);
+					a.Sub(w0, vs, imm);
 				else
-					a.Add(w0, w0, imm);
+					a.Add(w0, vs, imm);
 			}
 			else
 			{
-				a.Ldrh(w1, Field(VI(it)));
+				const Register vt = ReadVI(a, it, w1);
 				switch (op)
 				{
 					case Lower::Iadd:
-						a.Add(w0, w0, w1);
+						a.Add(w0, vs, vt);
 						break;
 					case Lower::Isub:
-						a.Sub(w0, w0, w1);
+						a.Sub(w0, vs, vt);
 						break;
 					case Lower::Iand:
-						a.And(w0, w0, w1);
+						a.And(w0, vs, vt);
 						break;
 					case Lower::Ior:
-						a.Orr(w0, w0, w1);
+						a.Orr(w0, vs, vt);
 						break;
 					default:
+						if (!vs.Is(w0))
+							a.Mov(w0, vs);
 						break;
 				}
 			}
 		}
-		a.Strh(w0, Field(VI(dest)));
+		WriteVI(a, dest, w0);
 	}
 
 	// q28..q31 and x25..x28 are reserved for deferred pipeline state.
@@ -1972,7 +2053,10 @@ namespace
 				if (s_vi_backup && s_vi_backup->known)
 				{
 					const bool old = s_vi_backup->left && s_vi_backup->reg == static_cast<int>(reg);
-					a.Ldrsh(dest, Field(old ? offsetof(VURegs, VIOldValue) : VI(reg)));
+					if (old)
+						a.Ldrsh(dest, Field(offsetof(VURegs, VIOldValue)));
+					else
+						a.Sxth(dest, ReadVI(a, reg, dest));
 					return;
 				}
 				Label current;
@@ -2748,6 +2832,8 @@ namespace
 	// Drop the IALU entries that are due at cycle x26, like VUPipeline::FlushIALU.
 	void EmitIALURetire(MacroAssembler& a)
 	{
+		// Writes a pending ILW result to its VI.
+		s_vi_copies.Forget();
 		Label loop, store, end;
 		a.Ldr(w11, Field(offsetof(VURegs, ialucount)));
 		a.Cbz(w11, &end);
@@ -3104,6 +3190,7 @@ namespace
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
 					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
 		s_clamped_copies.Forget();
+		s_vi_copies.Forget();
 		a.Ldr(w27, Field(offsetof(VURegs, fmacwritepos)));
 		a.Ldr(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Ldr(w28, Field(VI(REG_MAC_FLAG)));
@@ -3318,17 +3405,33 @@ namespace
 			// An EFU op or WAITP retired the slot above.
 			s_efu_idle = true;
 			s_div_clean_scratch = div_clean[i];
-			// Clamped copies survive only plain FMAC/IALU/load-store pairs.
+			// Clamped and VI copies survive only plain FMAC/IALU/load-store/branch pairs.
 			const bool plain = (ins.upper & 0x80000000) ||
-			                   ((ins.lregs.pipe == VUPIPE_NONE || ins.lregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_IALU) &&
+			                   ((ins.lregs.pipe == VUPIPE_NONE || ins.lregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_IALU ||
+			                        ins.lregs.pipe == VUPIPE_BRANCH) &&
 								   DecodeLower(ins.lower) != Lower::Unsupported);
 			if (!plain || DecodeUpper(ins.upper).op == Op::Unsupported)
+			{
 				s_clamped_copies.Forget();
+				s_vi_copies.Forget();
+			}
 			s_clamped_copies.enabled = plain && DecodeUpper(ins.upper).op != Op::Unsupported;
+			s_vi_copies.enabled = s_clamped_copies.enabled;
+			s_vi_copies.pinned = 0;
+			s_vi_copies.written = -1;
 			EmitPair(a, block.cache, ins, false);
 			if (!s_clamped_copies.enabled)
 				s_clamped_copies.Forget();
 			s_clamped_copies.enabled = false;
+			// Other VI writers (ILW/flag ops/...) went to memory only.
+			for (u32 vi = 1; vi < 16; vi++)
+			{
+				if (!(ins.upper & 0x80000000) && (ins.lregs.VIwrite & (1u << vi)) && static_cast<int>(vi) != s_vi_copies.written)
+					s_vi_copies.Forget(vi);
+			}
+			if (!s_vi_copies.enabled)
+				s_vi_copies.Forget();
+			s_vi_copies.pinned = 0;
 			s_div_clean_scratch = false;
 			s_fdiv_idle = false;
 			s_efu_idle = false;
@@ -3338,6 +3441,13 @@ namespace
 			pxAssertRel((s_store_mac_count != macs) == (HasFmac(ins) && UpdatesMacFlags(ins.upper)),
 				"UpdatesMacFlags() disagrees with EmitUpper");
 			EmitControlFlow(a, block, i);
+			// BAL/JALR write their link register in EmitControlFlow.
+			for (u32 vi = 1; vi < 16; vi++)
+			{
+				if (!(ins.upper & 0x80000000) && (ins.lregs.VIwrite & (1u << vi)) && static_cast<int>(vi) != s_vi_copies.written)
+					s_vi_copies.Forget(vi);
+			}
+			s_vi_copies.enabled = false;
 			s_vi_backup = nullptr;
 			// ILW/ILWR: the IALU entry goes to memory as on the generic path; the
 			// cycles were flushed above. Later pairs retire it (ialu_pending).
