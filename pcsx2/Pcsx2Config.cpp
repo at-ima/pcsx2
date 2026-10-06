@@ -750,6 +750,7 @@ Pcsx2Config::GSOptions::GSOptions()
 	HWSpinGPUForReadbacks = false;
 	HWSpinCPUForReadbacks = false;
 	GSThreadEfficiencyCores = true;
+	AutoUpscaleToDisplay = false;
 	GPUPaletteConversion = false;
 	AutoFlushSW = true;
 	PreloadFrameWithGSData = false;
@@ -991,6 +992,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 
 	SettingsWrapBitBool(HWSpinGPUForReadbacks);
 	SettingsWrapBitBool(GSThreadEfficiencyCores);
+	SettingsWrapBitBool(AutoUpscaleToDisplay);
 	SettingsWrapBitBool(HWSpinCPUForReadbacks);
 	SettingsWrapBitBoolEx(GPUPaletteConversion, "paltex");
 	SettingsWrapBitBoolEx(AutoFlushSW, "autoflush_sw");

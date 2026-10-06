@@ -666,6 +666,11 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				src_rect, current->GetSize(), s_display_alignment, g_gs_device->UsesLowerLeftOrigin(),
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
+			if (GSConfig.AutoUpscaleToDisplay && GSIsHardwareRenderer())
+			{
+				const GSVector2i resolution = PCRTCDisplays.GetResolution();
+				GSNoteDisplayRect(draw_rect.z - draw_rect.x, draw_rect.w - draw_rect.y, resolution.x, resolution.y);
+			}
 
 			if (GSConfig.CASMode == GSCASMode::MetalFXUpscale)
 			{

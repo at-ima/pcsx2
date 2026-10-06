@@ -110,6 +110,10 @@ void GSgetTitleStats(std::string& info);
 void GSTranslateWindowToDisplayCoordinates(float window_x, float window_y, float* display_x, float* display_y);
 
 void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
+/// With AutoUpscaleToDisplay, notes the window rect the frame is shown in (GS thread, every presented frame).
+void GSNoteDisplayRect(float width, float height, int resolution_x, int resolution_y);
+/// Applies a new automatic upscale multiplier once the display size has settled (GS thread, between commands).
+void GSApplyAutoUpscale();
 void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);
 bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels);

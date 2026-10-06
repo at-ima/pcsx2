@@ -183,6 +183,64 @@ static void CloseGSDevice(bool clear_state)
 	g_gs_device.reset();
 }
 
+// AutoUpscaleToDisplay: the configured multiplier becomes a maximum, and the
+// renderer uses the smallest whole multiplier whose frame covers the rect the
+// game is shown in. Rendering above the display only to downsample it costs a
+// lot of GPU power: SotC at 6x took 15 W of GPU against 3 W at 4x, shown in a
+// 2100x1278 window.
+static float s_configured_upscale = 0.0f; // the multiplier from the settings
+static float s_auto_upscale = 0.0f; // the multiplier in use; 0 until known
+static float s_auto_wanted = 0.0f;
+static u32 s_auto_wanted_frames = 0;
+static constexpr u32 AUTO_UPSCALE_SETTLE_FRAMES = 30;
+
+static void GSCapUpscaleMultiplier(Pcsx2Config::GSOptions& config)
+{
+	s_configured_upscale = config.UpscaleMultiplier;
+	if (config.AutoUpscaleToDisplay && s_auto_upscale > 0.0f && config.UpscaleMultiplier > s_auto_upscale)
+		config.UpscaleMultiplier = s_auto_upscale;
+}
+
+void GSNoteDisplayRect(float width, float height, int resolution_x, int resolution_y)
+{
+	if (resolution_x <= 0 || resolution_y <= 0 || width <= 0.0f || height <= 0.0f)
+		return;
+	// A little slack so a rect a hair over a whole multiple does not round up.
+	const float needed = std::max(width / resolution_x, height / resolution_y) - 0.02f;
+	const float wanted = std::max(1.0f, std::ceil(needed));
+	if (wanted != s_auto_wanted)
+	{
+		s_auto_wanted = wanted;
+		s_auto_wanted_frames = 0;
+	}
+	else if (s_auto_wanted_frames < AUTO_UPSCALE_SETTLE_FRAMES)
+	{
+		s_auto_wanted_frames++;
+	}
+}
+
+void GSApplyAutoUpscale()
+{
+	if (!g_gs_renderer || !GSIsHardwareRenderer() || !GSConfig.AutoUpscaleToDisplay)
+		return;
+	if (s_auto_wanted_frames < AUTO_UPSCALE_SETTLE_FRAMES || s_auto_wanted == s_auto_upscale)
+		return;
+	const float old_multiplier = GSConfig.UpscaleMultiplier;
+	s_auto_upscale = s_auto_wanted;
+	Pcsx2Config::GSOptions config = GSConfig;
+	config.UpscaleMultiplier = s_configured_upscale;
+	GSUpdateConfig(config);
+	if (GSConfig.UpscaleMultiplier != old_multiplier)
+	{
+		const GSVector2i resolution = g_gs_renderer->PCRTCDisplays.GetResolution();
+		Host::AddIconOSDMessage("UpscaleMultiplierChanged", ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE,
+			fmt::format(TRANSLATE_FS("GS", "Upscale multiplier set to {}x to match the display ({} x {})."),
+				GSConfig.UpscaleMultiplier, static_cast<int>(resolution.x * GSConfig.UpscaleMultiplier),
+				static_cast<int>(resolution.y * GSConfig.UpscaleMultiplier)),
+			Host::OSD_QUICK_DURATION);
+	}
+}
+
 static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
 {
 	const u32 max_upscale_multiplier = GSGetMaxUpscaleMultiplier(g_gs_device->GetMaxTextureSize());
@@ -214,6 +272,7 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 	}
 	else if (renderer != GSRendererType::SW)
 	{
+		GSCapUpscaleMultiplier(GSConfig);
 		GSClampUpscaleMultiplier(GSConfig);
 		g_gs_renderer = std::make_unique<GSRendererHW>();
 	}
@@ -838,6 +897,7 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 {
 	Pcsx2Config::GSOptions old_config(std::move(GSConfig));
 	GSConfig = new_config;
+	GSCapUpscaleMultiplier(GSConfig);
 	if (!g_gs_renderer)
 		return;
 

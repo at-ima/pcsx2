@@ -791,6 +791,7 @@ struct Pcsx2Config
 					HWSpinGPUForReadbacks : 1,
 					HWSpinCPUForReadbacks : 1,
 					GSThreadEfficiencyCores : 1,
+					AutoUpscaleToDisplay : 1,
 					GPUPaletteConversion : 1,
 					AutoFlushSW : 1,
 					PreloadFrameWithGSData : 1,
