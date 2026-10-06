@@ -89,6 +89,7 @@ namespace MTGS
 	static std::atomic<bool> s_VsyncSignalListener;
 
 	static std::mutex s_mtx_RingBufferBusy2; // Gets released on semaXGkick waiting...
+	static u32 s_xgkick_credit = 0; // semaXGkick posts taken but not used yet (GS thread only)
 	static Threading::WorkSema s_sem_event;
 	static Threading::UserspaceSemaphore s_sem_OnRingReset;
 	static Threading::UserspaceSemaphore s_sem_Vsync;
@@ -546,7 +547,14 @@ void MTGS::MainLoop()
 				case Command::MTVUGSPacket:
 				{
 					MTVU_LOG("MTGS - Waiting on semaXGkick!");
-					if (!vu1Thread.semaXGkick.TryWait())
+					// Posts this thread already took from semaXGkick. When it is
+					// behind VU1, taking them all at once keeps the counter's
+					// cache line on the VU thread's core between batches.
+					if (s_xgkick_credit)
+						s_xgkick_credit--;
+					else if ((s_xgkick_credit = vu1Thread.semaXGkick.TryWaitAll()) != 0)
+						s_xgkick_credit--;
+					else
 					{
 						mtvu_lock.unlock();
 						// Wait for MTVU to complete vu1 program. Many programs take
