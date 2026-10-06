@@ -774,18 +774,62 @@ namespace
 		ClampInputAlways(a, reg);
 	}
 
+	// Clamped copies of whole VF registers in v26/v27, reused by later pairs of
+	// a deferred region while the register is unchanged. Transform code reads
+	// one vertex in four pairs (MULAx/MADDAy/MADDAz/MADDw), so its clamp was
+	// repeated four times. Only deferred regions enable this; any C++ call
+	// (see EmitBlockConstants), any VF write and any pair that is not plain
+	// FMAC/IALU/load-store work forgets the copies. Needs proper testing
+	// across more games.
+	struct ClampedCopies
+	{
+		std::array<int, 2> reg{-1, -1};
+		u32 next = 0;
+		bool enabled = false;
+
+		void Forget() { reg = {-1, -1}; }
+		void Forget(u32 vf)
+		{
+			for (int& r : reg)
+				if (r == static_cast<int>(vf))
+					r = -1;
+		}
+	};
+	ClampedCopies s_clamped_copies;
+
 	// An FMAC input: VF `reg` (or ACC) with `lane` broadcast (-1: none), clamped
 	// like ClampInput unless `clamped`. Returns the cache register itself when
-	// nothing has to change, else `temp`; `copy` forces `temp`.
+	// nothing has to change, else `temp` (or a clamped copy); `copy` forces `temp`.
 	VRegister FetchInput(MacroAssembler& a, const VectorCache& cache, VRegister temp, u32 reg, int lane, bool clamped, bool copy = false)
 	{
+		const bool daz = EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero();
+		auto& copies = s_clamped_copies;
+		if (!clamped && daz && CHECK_VU_OVERFLOW(0) && copies.enabled && lane < 0 && !copy && reg > 0 && reg < 32)
+		{
+			for (u32 k = 0; k < 2; k++)
+			{
+				if (copies.reg[k] == static_cast<int>(reg))
+				{
+					copies.next = k ^ 1;
+					return VRegister(26 + k, 128);
+				}
+			}
+			// Alternate, so the other input of the same pair keeps its copy.
+			const u32 k = copies.next;
+			copies.next ^= 1;
+			const VRegister copy_reg(26 + k, 128);
+			const VRegister value = SourceVector(a, cache, copy_reg, reg);
+			a.Smin(copy_reg.V4S(), value.V4S(), v6.V4S());
+			a.Umin(copy_reg.V4S(), copy_reg.V4S(), v7.V4S());
+			copies.reg[k] = static_cast<int>(reg);
+			return copy_reg;
+		}
 		VRegister value = SourceVector(a, cache, temp, reg);
 		if (lane >= 0)
 		{
 			a.Dup(temp.V4S(), value.V4S(), lane);
 			value = temp;
 		}
-		const bool daz = EmuConfig.Cpu.VU1FPCR.GetDenormalsAreZero();
 		if (!clamped && daz && CHECK_VU_OVERFLOW(0))
 		{
 			a.Smin(temp.V4S(), value.V4S(), v6.V4S());
@@ -820,6 +864,8 @@ namespace
 
 	void EmitBlockConstants(MacroAssembler& a)
 	{
+		// Called after every C++ call, which may clobber v26/v27.
+		s_clamped_copies.Forget();
 		a.Movi(v24.V4S(), 0x7f800000);
 		if (!CHECK_VU_OVERFLOW(0) && !CHECK_VU_OVERFLOW(1))
 			return;
@@ -1862,8 +1908,14 @@ namespace
 		                           (ins.uregs.VFwrite == ins.lregs.VFread0 || ins.uregs.VFwrite == ins.lregs.VFread1) ?
 		                       ins.uregs.VFwrite :
 		                       0;
+		// The backup below uses v26/v27.
+		const bool copies_enabled = s_clamped_copies.enabled;
 		if (backup)
+		{
+			s_clamped_copies.Forget();
+			s_clamped_copies.enabled = false;
 			LoadVector(a, cache, q27, backup);
+		}
 		// Every FDIV-pipe op's stall-and-retire must land before the paired upper
 		// instruction runs: VU1microInterp.cpp calls _vuTestLowerStalls/
 		// _vuTestPipes ahead of _vu1ExecUpper, precisely so an upper op
@@ -1893,6 +1945,14 @@ namespace
 				EmitLower(a, cache, ins.lower);
 			if (backup)
 				StoreVector(a, cache, q26, backup);
+		}
+		s_clamped_copies.enabled = copies_enabled;
+		if (immediate || discard)
+			s_clamped_copies.Forget(ins.uregs.VFwrite);
+		else
+		{
+			s_clamped_copies.Forget(ins.uregs.VFwrite);
+			s_clamped_copies.Forget(ins.lregs.VFwrite);
 		}
 	}
 
@@ -3043,6 +3103,7 @@ namespace
 	{
 		static_assert(offsetof(VURegs, statusflag) == offsetof(VURegs, macflag) + 4 &&
 					  offsetof(VURegs, clipflag) == offsetof(VURegs, macflag) + 8);
+		s_clamped_copies.Forget();
 		a.Ldr(w27, Field(offsetof(VURegs, fmacwritepos)));
 		a.Ldr(w25, Field(VI(REG_STATUS_FLAG)));
 		a.Ldr(w28, Field(VI(REG_MAC_FLAG)));
@@ -3257,7 +3318,17 @@ namespace
 			// An EFU op or WAITP retired the slot above.
 			s_efu_idle = true;
 			s_div_clean_scratch = div_clean[i];
+			// Clamped copies survive only plain FMAC/IALU/load-store pairs.
+			const bool plain = (ins.upper & 0x80000000) ||
+			                   ((ins.lregs.pipe == VUPIPE_NONE || ins.lregs.pipe == VUPIPE_FMAC || ins.lregs.pipe == VUPIPE_IALU) &&
+								   DecodeLower(ins.lower) != Lower::Unsupported);
+			if (!plain || DecodeUpper(ins.upper).op == Op::Unsupported)
+				s_clamped_copies.Forget();
+			s_clamped_copies.enabled = plain && DecodeUpper(ins.upper).op != Op::Unsupported;
 			EmitPair(a, block.cache, ins, false);
+			if (!s_clamped_copies.enabled)
+				s_clamped_copies.Forget();
+			s_clamped_copies.enabled = false;
 			s_div_clean_scratch = false;
 			s_fdiv_idle = false;
 			s_efu_idle = false;

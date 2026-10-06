@@ -1753,6 +1753,76 @@ TEST_F(VU1RecompilerTest, InputClampsSkippedOnlyForClampedResults)
 	}
 }
 
+TEST_F(VU1RecompilerTest, ClampedCopiesFollowTransformsAndTheirWriters)
+{
+	// Deferred regions keep clamped copies of VF registers that later pairs
+	// read again (the broadcast vector of a MULAx/MADDAy/MADDAz/MADDw
+	// transform). Loads and moves into those registers in between, the same
+	// register as both inputs, and non-finite or denormal values must all
+	// still match the interpreter.
+	const VURegs initial = VU1, initial0 = VU0;
+	constexpr u32 edge[] = {0x7f800000, 0xff800000, 0x7fc12345, 0xff812345, 0x00000001, 0x80400000,
+		0x7f7fffff, 0x3f000000, 0xbf000000, 0x3e800000, 0xc0400000, 0x00000000};
+	u32 random = 4242;
+	auto next = [&random]() { random = random * 1664525 + 1013904223; return random >> 8; };
+	const auto reg = [&next]() { return 1 + next() % 5; };
+	for (u32 options = 0; options < 4; options++)
+	{
+		EmuConfig.Cpu.VU1FPCR = FPControlRegister::GetDefault().DisableExceptions().SetFlushToZero(options & 1).SetDenormalsAreZero(true);
+		EmuConfig.Cpu.Recompiler.vu1Overflow = true;
+		EmuConfig.Speedhacks.vuFlagHack = (options & 2) != 0;
+		for (u32 seed = 0; seed < 24; seed++)
+		{
+			SCOPED_TRACE(testing::Message() << "options=" << options << " seed=" << seed);
+			CpuArm64VU1.Reserve();
+			VU0 = initial0;
+			VU1 = initial;
+			for (u32 q = 0; q < 16; q++)
+				for (u32 lane = 0; lane < 4; lane++)
+					std::memcpy(VU1.Mem + q * 16 + lane * 4, &edge[(q * 7 + lane * 3 + seed) % std::size(edge)], 4);
+			for (u32 r = 1; r < 8; r++)
+				for (u32 lane = 0; lane < 4; lane++)
+					VU1.VF[r].UL[lane] = edge[(r * 5 + lane + seed) % std::size(edge)];
+			VU1.VI[1].UL = 0;
+			for (u32 i = 0; i < 44; i += 4)
+			{
+				// One transform: ACC = rows * v.xyzw, with v read four times.
+				const u32 v = reg();
+				for (u32 k = 0; k < 4; k++)
+				{
+					const u32 row = next() % 4 ? reg() : v;
+					u32 upper = (15 << 21) | (v << 16) | (row << 11) | k;
+					if (k == 0)
+						upper |= (6 << 6) | 0x3c; // MULAbc
+					else if (k < 3)
+						upper |= (2 << 6) | 0x3c; // MADDAbc
+					else
+						upper |= (reg() << 6) | 0x08; // MADDbc
+					u32 lower = 0x8000033c; // NOP
+					switch (next() % 6)
+					{
+						case 0:
+							lower = (15 << 21) | (reg() << 16) | (1 << 11) | (next() % 16);
+							break; // LQ
+						case 1:
+							lower = 0x8000033c | (15 << 21) | (reg() << 16) | (reg() << 11);
+							break; // MOVE
+						default:
+							break;
+					}
+					Put((i + k) * 8, upper, lower);
+				}
+			}
+			Put(44 * 8, 0x400002ff, 0x8000033c);
+			Put(45 * 8, 0x2ff, 0x8000033c);
+			const bool hack = EmuConfig.Speedhacks.vuFlagHack;
+			Compare(256, hack ? 0x3c0 : 0, 1, hack);
+			if (HasFatalFailure())
+				return;
+		}
+	}
+}
+
 namespace
 {
 	class VU1PacketXgkickTest : public VU1RecompilerTest
